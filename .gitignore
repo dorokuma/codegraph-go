@@ -2,6 +2,12 @@
 codegraph-go
 codegraph-go.bak
 
+# Go build/test artifacts
+*.test
+*.out
+*.prof
+vendor/
+
 # editor
 .idea/
 .vscode/
