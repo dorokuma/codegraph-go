@@ -1,0 +1,7 @@
+# binary
+codegraph-go
+codegraph-go.bak
+
+# editor
+.idea/
+.vscode/
