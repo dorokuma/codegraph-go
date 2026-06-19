@@ -453,8 +453,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		line   int
 	}
 	var allCalls []callInfo
-	seen := make(map[string]bool)
-
 	for _, d := range defs {
 		if len(allCalls) >= args.MaxResults {
 			break
@@ -463,6 +461,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		if err != nil {
 			continue
 		}
+		seen := make(map[string]bool)
 
 		bodyStart := d.line - 1 // 0-indexed
 		if bodyStart >= len(lines) {
