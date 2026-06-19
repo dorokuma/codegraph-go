@@ -23,6 +23,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -31,7 +33,11 @@ import (
 const maxFileSize = 10 * 1024 * 1024 // 10 MB — files larger than this are skipped in LOC stats
 
 type server struct {
-	workdir string
+	workdir     string
+	mu          sync.Mutex
+	lastScan    time.Time
+	cachedLoc   int
+	cachedFiles int
 }
 
 func main() {
@@ -295,6 +301,13 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 type statusArgs struct{}
 
 func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, _ statusArgs) (*mcp.CallToolResult, any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.lastScan.IsZero() && time.Since(s.lastScan) < 5*time.Minute {
+		return s.formatStatusResult(s.cachedFiles, s.cachedLoc)
+	}
+
 	files := 0
 	loc := 0
 	filepath.Walk(s.workdir, func(walkPath string, info os.FileInfo, err error) error {
@@ -312,6 +325,15 @@ func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, _ statu
 		}
 		return nil
 	})
+
+	s.cachedFiles = files
+	s.cachedLoc = loc
+	s.lastScan = time.Now()
+
+	return s.formatStatusResult(files, loc)
+}
+
+func (s *server) formatStatusResult(files, loc int) (*mcp.CallToolResult, any, error) {
 	out := map[string]any{
 		"version":   "0.1.0",
 		"workspace": s.workdir,
@@ -586,7 +608,7 @@ func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args tra
 		args.Depth = 1
 	}
 	root := s.workdir
-	rgArgs := []string{"--line-number", "--no-heading", "--color=never"}
+	rgArgs := []string{"--line-number", "--no-heading", "--color=never", "--max-count=100"}
 	if args.Depth == 1 {
 		rgArgs = append(rgArgs, "-C", "5") // 5 lines of surrounding context
 	}
@@ -594,6 +616,13 @@ func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args tra
 	rg := exec.CommandContext(ctx, "rg", rgArgs...)
 	out, _ := rg.Output()
 	result := string(out)
+	if len(result) > 50_000 {
+		truncAt := 50_000
+		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
+			truncAt--
+		}
+		result = result[:truncAt] + "\n... (truncated)"
+	}
 	if result == "" {
 		result = "no matches found for " + args.Name
 	}
@@ -643,6 +672,13 @@ func (s *server) resolvePath(p string) (string, error) {
 }
 
 func readLines(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > 10*1024*1024 {
+		return nil, fmt.Errorf("file %q is too large (> 10MB)", path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
