@@ -148,9 +148,31 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		rg.Args = append(rg.Args, "--glob", args.Glob)
 	}
 	rg.Args = append(rg.Args, args.Pattern, root)
-	out, err := rg.Output()
-	// rg exits 1 when no matches — that's fine, not an error.
-	if err != nil && len(out) == 0 {
+	stdout, err := rg.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := rg.Start(); err != nil {
+		return nil, nil, err
+	}
+
+	var buf bytes.Buffer
+	limit := 2 * 1024 * 1024 // 2 MB limit to prevent OOM
+	tmp := make([]byte, 8192)
+	for buf.Len() < limit {
+		n, err := stdout.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = rg.Process.Kill()
+	_ = rg.Wait()
+
+	out := buf.Bytes()
+	if len(out) == 0 {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
 		}, nil, nil
@@ -448,6 +470,22 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		}
 
 		// Find function body with brace matching (max 300 lines).
+		// First, check if there's an open brace '{' near the definition to avoid scanning non-function declarations.
+		hasBrace := false
+		searchLines := 3
+		if bodyStart+searchLines > len(lines) {
+			searchLines = len(lines) - bodyStart
+		}
+		for i := 0; i < searchLines; i++ {
+			if strings.Contains(lines[bodyStart+i], "{") {
+				hasBrace = true
+				break
+			}
+		}
+		if !hasBrace {
+			continue
+		}
+
 		// Skip braces inside string literals and comments for better accuracy.
 		braceCount := 0
 		foundOpen := false
