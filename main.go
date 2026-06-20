@@ -349,15 +349,18 @@ func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, _ statu
 	loc := 0
 	filepath.Walk(s.workdir, func(walkPath string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
-			if err == nil && info.IsDir() && (info.Name() == ".git" || info.Name() == "node_modules") {
-				return filepath.SkipDir
+			if err == nil && info.IsDir() {
+				name := info.Name()
+				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "go" || name == "rtk" || name == "qdrant_storage" {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
 		files++
 		if !isProbablyBinary(info.Name()) && info.Size() <= maxFileSize {
-			if data, err := os.ReadFile(walkPath); err == nil {
-				loc += strings.Count(string(data), "\n")
+			if count, err := countFileLines(walkPath); err == nil {
+				loc += count
 			}
 		}
 		return nil
@@ -368,6 +371,29 @@ func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, _ statu
 	s.lastScan = time.Now()
 
 	return s.formatStatusResult(files, loc)
+}
+
+func countFileLines(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, 32*1024)
+	count := 0
+	lineSep := []byte{'\n'}
+
+	for {
+		c, err := f.Read(buf)
+		if c > 0 {
+			count += bytes.Count(buf[:c], lineSep)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return count, nil
 }
 
 func (s *server) formatStatusResult(files, loc int) (*mcp.CallToolResult, any, error) {
