@@ -127,6 +127,9 @@ type searchArgs struct {
 }
 
 func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.Pattern == "" {
 		return nil, nil, fmt.Errorf("pattern is required")
 	}
@@ -198,6 +201,9 @@ type filesArgs struct {
 }
 
 func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args filesArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	pattern := args.Pattern
 	if pattern == "" {
 		pattern = "**/*"
@@ -382,10 +388,14 @@ func (s *server) formatStatusResult(files, loc int) (*mcp.CallToolResult, any, e
 type nameArgs struct {
 	Name       string `json:"name"                 jsonschema:"symbol name to look for"`
 	Path       string `json:"path,omitempty"        jsonschema:"optional subdirectory under workspace,optional"`
+	Glob       string `json:"glob,omitempty"        jsonschema:"optional file glob filter, e.g. \"*.go\",optional"`
 	MaxResults int    `json:"max_results,omitempty" jsonschema:"cap (default 100),optional"`
 }
 
 func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
@@ -406,9 +416,19 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		"-e", defPattern, root)
 	defOut, err := rgDef.Output()
 	if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "no definitions found for " + args.Name}},
-		}, nil, nil
+		// Fallback: broader pattern matching any symbol followed by '('
+		// catches C/C++/Java/TS/JS/etc. definitions the first pattern misses
+		fallbackPattern := fmt.Sprintf(`\b%s\s*\(`, quoted)
+		rgDefFallback := exec.CommandContext(ctx, "rg",
+			"--line-number", "--no-heading", "--color=never",
+			"--max-count=20",
+			"-e", fallbackPattern, root)
+		defOut, err = rgDefFallback.Output()
+		if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: "no definitions found for " + args.Name}},
+			}, nil, nil
+		}
 	}
 
 	// Parse file:line from matches
@@ -492,6 +512,77 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 			}
 		}
 		if !hasBrace {
+			// For Python (.py) files, use indentation-based body detection instead of brace matching
+			if strings.HasSuffix(d.file, ".py") {
+				// Find the line containing ':' (the def statement may span multiple lines)
+				colonLine := bodyStart
+				for colonLine < len(lines) && colonLine <= bodyStart+5 {
+					if strings.Contains(strings.TrimSpace(lines[colonLine]), ":") {
+						break
+					}
+					colonLine++
+				}
+				if colonLine >= len(lines) || colonLine > bodyStart+5 {
+					continue
+				}
+
+				// Skip blank / comment lines after def, find first body line
+				firstBodyLine := -1
+				for i := colonLine + 1; i < len(lines); i++ {
+					trimmed := strings.TrimSpace(lines[i])
+					if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+						continue
+					}
+					firstBodyLine = i
+					break
+				}
+				if firstBodyLine == -1 {
+					continue
+				}
+
+				baseIndent := countLeadingSpaces(lines[firstBodyLine])
+				if baseIndent == 0 {
+					// no indentation after def — likely a single-line stub
+					continue
+				}
+
+				// Scan body until indentation drops below baseIndent (or max scan lines)
+				bodyEnd := firstBodyLine
+				maxScan := bodyStart + 500 // increased from 300 to support larger function bodies
+				if maxScan > len(lines) {
+					maxScan = len(lines)
+				}
+				for i := firstBodyLine + 1; i < maxScan; i++ {
+					trimmed := strings.TrimSpace(lines[i])
+					if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+						continue
+					}
+					if countLeadingSpaces(lines[i]) < baseIndent {
+						break
+					}
+					bodyEnd = i
+				}
+
+				// Extract function calls from the body (same logic as the brace-based path)
+				for i := bodyStart; i <= bodyEnd && i < len(lines) && len(allCalls) < args.MaxResults; i++ {
+					line := lines[i]
+					clean := stripStringsAndComments(line)
+					matches := callRe.FindAllStringSubmatch(clean, -1)
+					for _, m := range matches {
+						name := m[1]
+						if name == args.Name || controlFlow[name] || seen[name] {
+							continue
+						}
+						seen[name] = true
+						allCalls = append(allCalls, callInfo{
+							callee: name,
+							file:   d.file,
+							line:   i + 1,
+						})
+					}
+				}
+				continue
+			}
 			continue
 		}
 
@@ -499,7 +590,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		braceCount := 0
 		foundOpen := false
 		bodyEnd := bodyStart
-		maxScan := bodyStart + 300
+		maxScan := bodyStart + 500 // increased from 300 to support larger function bodies
 		if maxScan > len(lines) {
 			maxScan = len(lines)
 		}
@@ -620,6 +711,9 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 }
 
 func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
@@ -635,11 +729,46 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		"--line-number", "--no-heading", "--color=never",
 		fmt.Sprintf("--max-count=%d", args.MaxResults),
 		"-w", args.Name, root)
+	if args.Glob != "" {
+		rg.Args = append(rg.Args, "--glob", args.Glob)
+	}
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found"}}}, nil, nil
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(out)}}}, nil, nil
+	// Filter out false positives (comments/strings) and definition lines.
+	quoted := regexp.QuoteMeta(args.Name)
+	defRe := regexp.MustCompile(`(func\s+(\([^)]*\)\s*)?|def\s+|function\s+|class\s+|fn\s+)` + quoted + `\b`)
+	var filtered []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		text := parts[2]
+		cleaned := stripStringsAndComments(text)
+		if !strings.Contains(cleaned, args.Name) {
+			// Only present in string literals or comments — skip
+			continue
+		}
+		if defRe.MatchString(cleaned) {
+			// This is a definition, not a call site — skip
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	if len(filtered) == 0 {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found"}}}, nil, nil
+	}
+	result := strings.Join(filtered, "\n")
+	if len(result) > 50_000 {
+		truncAt := 50_000
+		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
+			truncAt--
+		}
+		result = result[:truncAt] + "\n... (truncated)"
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 
 type traceArgs struct {
@@ -648,6 +777,9 @@ type traceArgs struct {
 }
 
 func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args traceArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
@@ -677,6 +809,9 @@ func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args tra
 }
 
 func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
+	// 30s timeout to prevent rg from hanging on large repos
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
@@ -695,7 +830,15 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(out)}}}, nil, nil
+	result := string(out)
+	if len(result) > 50_000 {
+		truncAt := 50_000
+		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
+			truncAt--
+		}
+		result = result[:truncAt] + "\n... (truncated)"
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 
 // ---------- helpers ----------
@@ -825,6 +968,14 @@ func stripStringsAndComments(line string) string {
 			continue
 		}
 		if ch == '"' || ch == '\'' || ch == '`' {
+			// Check for Python triple-quotes (''' or """)
+			if (ch == '\'' || ch == '"') && j+2 < len(line) && line[j+1] == ch && line[j+2] == ch {
+				// Triple quote — replace rest of line with spaces (may close on same line or span lines)
+				for ; j < len(line); j++ {
+					out.WriteByte(' ')
+				}
+				break
+			}
 			inString = true
 			stringChar = ch
 			out.WriteByte(' ')
@@ -833,4 +984,17 @@ func stripStringsAndComments(line string) string {
 		out.WriteByte(ch)
 	}
 	return out.String()
+}
+
+// countLeadingSpaces returns the number of leading space/tab characters in line.
+func countLeadingSpaces(line string) int {
+	n := 0
+	for _, ch := range line {
+		if ch == ' ' || ch == '\t' {
+			n++
+		} else {
+			break
+		}
+	}
+	return n
 }
