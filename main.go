@@ -198,15 +198,24 @@ type filesArgs struct {
 }
 
 func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args filesArgs) (*mcp.CallToolResult, any, error) {
-	if args.Pattern == "" {
-		args.Pattern = "**/*"
+	pattern := args.Pattern
+	if pattern == "" {
+		pattern = "**/*"
 	}
 	if args.Max == 0 {
 		args.Max = 500
 	}
 	root := s.workdir
+	fullPath := filepath.Join(root, pattern)
+	if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
+		if strings.HasSuffix(pattern, "/") {
+			pattern = pattern + "**/*"
+		} else {
+			pattern = pattern + "/**/*"
+		}
+	}
 	// Use rg --files for ** glob support + .gitignore awareness
-	rg := exec.CommandContext(ctx, "rg", "--files", "-g", args.Pattern, root)
+	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, root)
 	out, err := rg.Output()
 	if err != nil {
 		// rg exits 1 when no files match
