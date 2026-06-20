@@ -151,30 +151,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		rg.Args = append(rg.Args, "--glob", args.Glob)
 	}
 	rg.Args = append(rg.Args, args.Pattern, root)
-	stdout, err := rg.StdoutPipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := rg.Start(); err != nil {
-		return nil, nil, err
-	}
-
-	var buf bytes.Buffer
-	limit := 2 * 1024 * 1024 // 2 MB limit to prevent OOM
-	tmp := make([]byte, 8192)
-	for buf.Len() < limit {
-		n, err := stdout.Read(tmp)
-		if n > 0 {
-			buf.Write(tmp[:n])
-		}
-		if err != nil {
-			break
-		}
-	}
-	_ = rg.Process.Kill()
-	_ = rg.Wait()
-
-	out := buf.Bytes()
+	out, _ := rg.Output()
 	if len(out) == 0 {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
