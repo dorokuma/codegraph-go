@@ -485,7 +485,8 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 			searchLines = len(lines) - bodyStart
 		}
 		for i := 0; i < searchLines; i++ {
-			if strings.Contains(lines[bodyStart+i], "{") {
+			cleanLine := stripStringsAndComments(lines[bodyStart+i])
+			if strings.Contains(cleanLine, "{") {
 				hasBrace = true
 				break
 			}
