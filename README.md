@@ -11,15 +11,15 @@ Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github
 
 | Tool | What it does |
 |------|-------------|
-| `codegraph_search` | Text/regex search across the workspace (ripgrep, respects `.gitignore`) |
-| `codegraph_files` | Glob file listing with `**` support (ripgrep `--files`) |
-| `codegraph_context` | Read a window of lines around a file:line position |
-| `codegraph_explore` | Project overview — top-level dirs, READMEs, manifests |
-| `codegraph_status` | File count and LOC summary |
-| `codegraph_callees` | Extract function calls from a symbol's definition body |
-| `codegraph_callers` | Find all references to a symbol across the workspace |
-| `codegraph_trace` | Grep with optional ±5 lines of surrounding context |
-| `codegraph_impact` | Per-file match-count summary for a symbol |
+| `search` | Text/regex search across the workspace (ripgrep, respects `.gitignore`) |
+| `files` | Glob file listing with `**` support (ripgrep `--files`) |
+| `context` | Read a window of lines around a file:line position |
+| `explore` | Project overview — top-level dirs, READMEs, manifests |
+| `status` | File count and LOC summary |
+| `callees` | Extract function calls from a symbol's definition body |
+| `callers` | Find all references to a symbol across the workspace |
+| `trace` | Grep with optional ±5 lines of surrounding context |
+| `impact` | Per-file match-count summary for a symbol |
 
 ### Design decisions
 
@@ -78,7 +78,7 @@ The agent will discover all 9 tools on the next startup.
 
 ## Tools
 
-### `codegraph_search`
+### `search`
 
 ```json
 {
@@ -92,7 +92,7 @@ The agent will discover all 9 tools on the next startup.
 
 Returns matching lines with file:line prefix. All parameters except `pattern` are optional.
 
-### `codegraph_files`
+### `files`
 
 ```json
 {
@@ -103,7 +103,7 @@ Returns matching lines with file:line prefix. All parameters except `pattern` ar
 
 Lists files matching the glob, relative to workspace root. Respects `.gitignore`.
 
-### `codegraph_context`
+### `context`
 
 ```json
 {
@@ -117,7 +117,7 @@ Lists files matching the glob, relative to workspace root. Respects `.gitignore`
 Reads a window of lines centered on `line`. The target line is marked with `>>`.  
 Path traversal is rejected.
 
-### `codegraph_callees`
+### `callees`
 
 ```json
 {
@@ -130,7 +130,7 @@ Finds the definition of `name`, brace-matches its function body (up to 300 lines
 call — filtering out keywords, control flow statements, and the symbol itself. Handles strings, comments,
 and backtick literals correctly for most C-family languages.
 
-### `codegraph_callers`
+### `callers`
 
 ```json
 {
@@ -141,7 +141,7 @@ and backtick literals correctly for most C-family languages.
 
 Word-boundary grep for `name` across the workspace. Returns every line that references it.
 
-### `codegraph_trace`
+### `trace`
 
 ```json
 {
@@ -152,7 +152,7 @@ Word-boundary grep for `name` across the workspace. Returns every line that refe
 
 Grep with `-w`; `depth=1` adds ripgrep's `-C 5` (5 lines of surrounding context).
 
-### `codegraph_impact`
+### `impact`
 
 ```json
 {
@@ -163,7 +163,7 @@ Grep with `-w`; `depth=1` adds ripgrep's `-C 5` (5 lines of surrounding context)
 
 Per-file match count (`rg -c -w`). Answers "which files reference this symbol and how often?"
 
-### `codegraph_explore`
+### `explore`
 
 ```json
 { "max": 30 }
@@ -171,7 +171,7 @@ Per-file match count (`rg -c -w`). Answers "which files reference this symbol an
 
 Lists top-level non-dot entries in the workspace root, then finds README files.
 
-### `codegraph_status`
+### `status`
 
 ```json
 {}
@@ -184,7 +184,7 @@ Skips binary files (by extension) and files larger than 10 MB.
 
 ## Limitations
 
-- **No AST analysis.** `codegraph_callees` uses brace-matching + regex heuristics, not a parser. It works well for Go, Rust, C, JavaScript, Python, and similar brace-delimited languages, but will miss dynamic calls and may include false positives from string literals that look like function calls.
+- **No AST analysis.** `callees` uses brace-matching + regex heuristics, not a parser. It works well for Go, Rust, C, JavaScript, Python, and similar brace-delimited languages, but will miss dynamic calls and may include false positives from string literals that look like function calls.
 - **Project-local only.** Unlike the official codegraph, there is no persistent symbol index, no cross-project queries, and no incremental indexing.
 - **Language-agnostic heuristics.** The definition regex targets `func`, `function`, `def`, `defn`, `fn`, `class` — adequate for most common languages but not exhaustive.
 

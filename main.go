@@ -1,7 +1,6 @@
 // codegraph-go: a Go MCP server that mimics the official colbymchenry/codegraph
-// tool surface (codegraph_search, codegraph_files, codegraph_context,
-// codegraph_explore, codegraph_status, codegraph_callees, codegraph_callers,
-// codegraph_trace, codegraph_impact) so it can drop in as a [[plugins]] entry
+// tool surface (search, files, context, explore, status, callees, callers,
+// trace, impact) so it can drop in as a [[plugins]] entry
 // in reasonix.toml under the name "codegraph" and silence the
 // "(built-in, not installed)" stub.
 //
@@ -63,51 +62,50 @@ func main() {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: "0.1.0"}, nil)
 
 	// 9 tools mirroring the official codegraph surface (string-grepped from
-	// /usr/local/bin/reasonix: codegraph_search, codegraph_files,
-	// codegraph_context, codegraph_explore, codegraph_status,
-	// codegraph_callees, codegraph_callers, codegraph_trace, codegraph_impact)
+	// /usr/local/bin/reasonix: search, files, context, explore, status,
+	// callees, callers, trace, impact)
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_search",
+		Name:        "search",
 		Description: "ripgrep-style text/regex search across the workspace. Returns matching file paths with line numbers.",
 	}, s.toolSearch)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_files",
+		Name:        "files",
 		Description: "List files in the workspace matching a glob pattern (supports ** recursion). Uses ripgrep (respects .gitignore).",
 	}, s.toolFiles)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_context",
-		Description: "Read a window of lines around a given file:line position. Use after codegraph_search to grab surrounding code.",
+		Name:        "context",
+		Description: "Read a window of lines around a given file:line position. Use after search to grab surrounding code.",
 	}, s.toolContext)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_explore",
+		Name:        "explore",
 		Description: "List candidate entry points: top-level directories, README files, package manifests. Cheap first step on a new repo.",
 	}, s.toolExplore)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_status",
+		Name:        "status",
 		Description: "Report server version, workspace root, file count, and total LOC under the workspace.",
 	}, s.toolStatus)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_callees",
+		Name:        "callees",
 		Description: "List functions that <symbol> calls — extracts function names from the body of the matched definition.",
 	}, s.toolCallees)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_callers",
+		Name:        "callers",
 		Description: "Find references (call sites) to `name` across the workspace.",
 	}, s.toolCallers)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_trace",
+		Name:        "trace",
 		Description: "Grep for `name` across the workspace; depth=1 adds 5 lines of context per match.",
 	}, s.toolTrace)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "codegraph_impact",
+		Name:        "impact",
 		Description: "Reverse impact: which files reference `name`? Returns a sorted file list with match counts.",
 	}, s.toolImpact)
 
