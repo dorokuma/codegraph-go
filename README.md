@@ -3,7 +3,7 @@
 A lightweight **MCP server** that provides code intelligence tools for AI coding agents.  
 Built as a thin Go layer over [ripgrep](https://github.com/BurntSushi/ripgrep) — no AST analysis, no heavy indexes, just fast file-level operations.
 
-Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph) MCP surface, it registers the same 9 tools so agents like [Reasonix](https://github.com/dorokuma/DeepSeek-Reasonix) can use them without configuration changes.
+Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph) MCP surface (8 tools as of v0.2.0). Agents like [Reasonix](https://github.com/dorokuma/DeepSeek-Reasonix) register it under the name `codegraph`.
 
 ---
 
@@ -15,11 +15,12 @@ Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github
 | `files` | Glob file listing with `**` support (ripgrep `--files`) |
 | `context` | Read a window of lines around a file:line position |
 | `explore` | Project overview — top-level dirs, READMEs, manifests |
-| `status` | File count and LOC summary |
 | `callees` | Extract function calls from a symbol's definition body |
 | `callers` | Find all references to a symbol across the workspace |
 | `trace` | Grep with optional ±5 lines of surrounding context |
 | `impact` | Per-file match-count summary for a symbol |
+
+**v0.2.0** removes the `status` tool (full-tree file/LOC walk). Use `explore` or `search` to verify workspace and MCP health.
 
 ### Design decisions
 
@@ -35,14 +36,14 @@ Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github
 ```bash
 # Prerequisites
 which rg        # ripgrep must be on PATH
-go version      # Go 1.25+ (or build with your version)
+go version      # Go 1.25+ (see go.mod)
 
 # Build from source
-cd /opt/codegraph-go
-go build -o /usr/local/bin/codegraph-go .
+cd codegraph-go
+go build -o codegraph-go .
 
-# Or just grab the binary if you have one
-cp codegraph-go /usr/local/bin/
+# Install
+cp codegraph-go /usr/local/bin/codegraph-go
 ```
 
 ## Usage
@@ -54,7 +55,7 @@ codegraph-go -workdir /path/to/project
 ```
 
 The server speaks the [MCP protocol](https://modelcontextprotocol.io) over stdio.  
-Connect any MCP client — or add it as a Reasonix plugin.
+Connect any MCP client — or add it as a Reasonix / Grok MCP server.
 
 ### Reasonix plugin
 
@@ -66,7 +67,14 @@ name    = "codegraph"
 command = "/usr/local/bin/codegraph-go"
 ```
 
-The agent will discover all 9 tools on the next startup.
+The agent discovers all 8 tools on the next startup.
+
+### Grok
+
+```toml
+[mcp_servers.codegraph]
+command = "/path/to/codegraph-go"
+```
 
 ### Options
 
@@ -170,15 +178,6 @@ Per-file match count (`rg -c -w`). Answers "which files reference this symbol an
 ```
 
 Lists top-level non-dot entries in the workspace root, then finds README files.
-
-### `status`
-
-```json
-{}
-```
-
-Returns JSON with file count, LOC, version, and workspace root.  
-Skips binary files (by extension) and files larger than 10 MB.
 
 ---
 

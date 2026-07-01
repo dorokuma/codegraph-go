@@ -1,5 +1,5 @@
 // codegraph-go: a Go MCP server that mimics the official colbymchenry/codegraph
-// tool surface (search, files, context, explore, status, callees, callers,
+// tool surface (search, files, context, explore, callees, callers,
 // trace, impact) so it can drop in as a [[plugins]] entry
 // in reasonix.toml under the name "codegraph" and silence the
 // "(built-in, not installed)" stub.
@@ -12,7 +12,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -22,21 +21,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const maxFileSize = 10 * 1024 * 1024 // 10 MB — files larger than this are skipped in LOC stats
-
 type server struct {
-	workdir     string
-	mu          sync.Mutex
-	lastScan    time.Time
-	cachedLoc   int
-	cachedFiles int
+	workdir string
 }
 
 func main() {
@@ -59,11 +51,10 @@ func main() {
 
 	s := &server{workdir: workdir}
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: "0.1.0"}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: "0.2.0"}, nil)
 
-	// 9 tools mirroring the official codegraph surface (string-grepped from
-	// /usr/local/bin/reasonix: search, files, context, explore, status,
-	// callees, callers, trace, impact)
+	// 8 tools: search, files, context, explore, callees, callers, trace, impact.
+	// (status removed — full-tree file/LOC count; agents should use explore/search instead.)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "search",
 		Description: "ripgrep-style text/regex search across the workspace. Returns matching file paths with line numbers.",
@@ -73,7 +64,6 @@ func main() {
 		Name:        "files",
 		Description: "List files in the workspace matching a glob pattern (supports ** recursion). Uses ripgrep (respects .gitignore).",
 	}, s.toolFiles)
-
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "context",
 		Description: "Read a window of lines around a given file:line position. Use after search to grab surrounding code.",
@@ -83,11 +73,6 @@ func main() {
 		Name:        "explore",
 		Description: "List candidate entry points: top-level directories, README files, package manifests. Cheap first step on a new repo.",
 	}, s.toolExplore)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "status",
-		Description: "Report server version, workspace root, file count, and total LOC under the workspace.",
-	}, s.toolStatus)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "callees",
@@ -307,82 +292,6 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
-	}, nil, nil
-}
-
-type statusArgs struct{}
-
-func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, _ statusArgs) (*mcp.CallToolResult, any, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.lastScan.IsZero() && time.Since(s.lastScan) < 5*time.Minute {
-		return s.formatStatusResult(s.cachedFiles, s.cachedLoc)
-	}
-
-	files := 0
-	loc := 0
-	filepath.Walk(s.workdir, func(walkPath string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			if err == nil && info.IsDir() {
-				name := info.Name()
-				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "go" || name == "rtk" || name == "qdrant_storage" {
-					return filepath.SkipDir
-				}
-			}
-			return nil
-		}
-		files++
-		if !isProbablyBinary(info.Name()) && info.Size() <= maxFileSize {
-			if count, err := countFileLines(walkPath); err == nil {
-				loc += count
-			}
-		}
-		return nil
-	})
-
-	s.cachedFiles = files
-	s.cachedLoc = loc
-	s.lastScan = time.Now()
-
-	return s.formatStatusResult(files, loc)
-}
-
-func countFileLines(path string) (int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	buf := make([]byte, 32*1024)
-	count := 0
-	lineSep := []byte{'\n'}
-
-	for {
-		c, err := f.Read(buf)
-		if c > 0 {
-			count += bytes.Count(buf[:c], lineSep)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return count, nil
-}
-
-func (s *server) formatStatusResult(files, loc int) (*mcp.CallToolResult, any, error) {
-	out := map[string]any{
-		"version":   "0.1.0",
-		"workspace": s.workdir,
-		"files":     files,
-		"loc":       loc,
-		"server":    "codegraph-go",
-		"note":      "implementation: grep + line reads (no AST); drop-in for reasonix.toml [[plugins]] name=codegraph",
-	}
-	js, _ := json.MarshalIndent(out, "", "  ")
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(js)}},
 	}, nil, nil
 }
 
@@ -880,25 +789,7 @@ func readLines(path string) ([]string, error) {
 	return strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n"), nil
 }
 
-func isProbablyBinary(name string) bool {
-	for _, ext := range []string{
-		".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
-		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".zip", ".tar", ".gz", ".bz2", ".xz", ".zst", ".7z", ".rar",
-		".exe", ".bin", ".dll", ".so", ".dylib", ".wasm",
-		".o", ".a", ".lib", ".obj",
-		".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac", ".ogg",
-		".ttf", ".otf", ".woff", ".woff2",
-		".pyc", ".pyo", ".class", ".jar",
-		".db", ".sqlite", ".sqlite3",
-		".iso", ".dmg", ".img",
-	} {
-		if strings.HasSuffix(strings.ToLower(name), ext) {
-			return true
-		}
-	}
-	return false
-}
+
 
 // stripStringsAndComments replaces string literals and comments with spaces,
 // so regex matching on the result doesn't falsely match inside them.
