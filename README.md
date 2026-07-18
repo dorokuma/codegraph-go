@@ -1,44 +1,30 @@
 # codegraph-go
 
-A lightweight **MCP server** that provides code intelligence tools for AI coding agents.  
-Built as a thin Go layer over [ripgrep](https://github.com/BurntSushi/ripgrep) — no AST analysis, no heavy indexes, just fast file-level operations.
+A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
-Designed as a drop-in for the official [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph) MCP surface (8 tools as of v0.2.0). Agents like [Reasonix](https://github.com/dorokuma/DeepSeek-Reasonix) register it under the name `codegraph`.
-
----
+Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — provides 12 tools for AI coding agents.
 
 ## Features
 
-| Tool | What it does |
-|------|-------------|
-| `search` | Text/regex search across the workspace (ripgrep, respects `.gitignore`) |
-| `files` | Glob file listing with `**` support (ripgrep `--files`) |
-| `context` | Read a window of lines around a file:line position |
-| `explore` | Project overview — top-level dirs, READMEs, manifests |
-| `callees` | Extract function calls from a symbol's definition body |
-| `callers` | Find all references to a symbol across the workspace |
-| `trace` | Grep with optional ±5 lines of surrounding context |
-| `impact` | Per-file match-count summary for a symbol |
-
-**v0.2.0** removes the `status` tool (full-tree file/LOC walk). Use `explore` or `search` to verify workspace and MCP health.
-
-### Design decisions
-
-- **No AST.** All tools work via ripgrep + `os.ReadFile`. This keeps the binary small (~8 MB), startup instant, and the index nonexistent. It handles multi-language codebases with zero configuration.
-- **Token-aware.** All text output is truncated at 50 KB — agents (and their context windows) stay healthy.
-- **Path-safe.** Every tool resolves user-supplied paths against a workspace root; path traversal is rejected with a clear error.
-- **`.gitignore`-aware.** Tools that scan files use ripgrep, which respects `.gitignore` by default.
-
----
+- **12 MCP tools:** search, search_fts, files, context, explore, callees, callers, trace, impact, node, status, affected
+- **SQLite indexing:** symbols, edges, and files stored in `.codegraph/codegraph.db`
+- **FTS5 full-text search:** fast symbol search using SQLite FTS5
+- **Tree-sitter AST parsing:** accurate symbol extraction for Go, TypeScript, JavaScript, Python
+- **Regex fallback:** for other languages (Rust, Java, C#, Ruby, PHP, C, C++, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Objective-C, Svelte, Vue, Astro, Liquid, Pascal/Delphi)
+- **Framework route detection:** Gin, chi, gorilla/mux, Express, NestJS, Flask, FastAPI, Django, Laravel, Rails, Spring, ASP.NET, Axum, actix, Rocket, Vapor, Play
+- **Cross-language bridging:** CGo (Go↔C), Python ctypes/cffi/Cython, React Native/Expo, Swift↔ObjC
+- **Auto-sync:** file watcher with 2-second debounce, index stays fresh as you code
+- **Staleness warning:** warns when referenced files are pending sync
+- **Respects .gitignore:** uses ripgrep for file operations
 
 ## Installation
 
 ```bash
 # Prerequisites
 which rg        # ripgrep must be on PATH
-go version      # Go 1.25+ (see go.mod)
+go version      # Go 1.25+
 
-# Build from source
+# Build
 cd codegraph-go
 go build -o codegraph-go .
 
@@ -54,140 +40,91 @@ cp codegraph-go /usr/local/bin/codegraph-go
 codegraph-go -workdir /path/to/project
 ```
 
-The server speaks the [MCP protocol](https://modelcontextprotocol.io) over stdio.  
-Connect any MCP client — or add it as a Reasonix / Grok MCP server.
-
-### Reasonix plugin
-
-Add to `reasonix.toml`:
-
-```toml
-[[plugins]]
-name    = "codegraph"
-command = "/usr/local/bin/codegraph-go"
-```
-
-The agent discovers all 8 tools on the next startup.
-
-### Grok
-
-```toml
-[mcp_servers.codegraph]
-command = "/path/to/codegraph-go"
-```
-
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-workdir` | current directory | Workspace root; all paths are resolved relative to this |
+| `-workdir` | current directory | Workspace root |
+| `-no-sync` | false | Disable auto-sync file watcher |
 
----
+## MCP Tools
 
-## Tools
+| Tool | Purpose |
+|------|---------|
+| `search` | Text/regex search across the workspace (ripgrep) |
+| `search_fts` | Full-text search over indexed symbols (SQLite FTS5) |
+| `files` | List files matching a glob pattern |
+| `context` | Read code around a file:line position |
+| `explore` | Project overview: top-level dirs, READMEs, manifests |
+| `callees` | List functions that a symbol calls |
+| `callers` | Find all references to a symbol |
+| `trace` | Grep with optional ±5 lines of context |
+| `impact` | Per-file match count for a symbol |
+| `node` | Get symbol details: source, callers, callees |
+| `status` | Index health: node/edge/file counts, pending sync |
+| `affected` | Find test files affected by changed source files |
 
-### `search`
+## Indexing
 
-```json
-{
-  "pattern": "func main",
-  "path": "src/",
-  "glob": "*.go",
-  "max_results": 50,
-  "ignore_case": false
-}
+On first run, codegraph-go indexes the entire project. The index includes:
+- **Nodes:** functions, methods, classes, structs, interfaces, variables, constants
+- **Edges:** calls, imports, extends, implements
+
+The file watcher automatically re-indexes changed files within 2 seconds.
+
+### Tree-sitter vs Regex
+
+For Go, TypeScript, JavaScript, and Python, codegraph-go uses tree-sitter for accurate AST-based extraction. This provides:
+- Better method detection (including struct methods with receivers)
+- More accurate call graph (handles method calls, selector expressions)
+- Proper handling of nested functions and closures
+
+For other languages, regex-based extraction is used as a fallback.
+
+### Framework Route Detection
+
+codegraph-go detects web framework routing patterns and creates `route` nodes:
+
+- **Go:** Gin, chi, gorilla/mux
+- **JavaScript:** Express
+- **Python:** Flask, FastAPI, Django
+
+Routes are stored as nodes with kind `route`, where the name is `METHOD /path` and the body is the handler function name.
+
+### Cross-language Bridging
+
+codegraph-go detects cross-language calls and creates bridge edges:
+
+- **CGo:** Go ↔ C via `import "C"` and `C.functionName()`
+- **Python ctypes:** Python → C via `ctypes.CDLL()`
+- **Python cffi:** Python → C via `ffi.cdef()` and `ffi.dlopen()`
+- **Python Cython:** Python → C via `cdef extern from`
+- **React Native:** JS → Native via `NativeModules` and TurboModules
+- **Expo:** JS → Native via `requireNativeModule()`
+
+## Architecture
+
 ```
-
-Returns matching lines with file:line prefix. All parameters except `pattern` are optional.
-
-### `files`
-
-```json
-{
-  "pattern": "src/**/*.go",
-  "max": 100
-}
+codegraph-go/
+├── main.go              # MCP server + 12 tools
+├── db/
+│   ├── schema.sql       # SQLite schema
+│   ├── connection.go    # Database connection
+│   └── query.go         # Query layer (nodes, edges, files)
+├── extraction/
+│   ├── common.go        # Language detection
+│   ├── extractor.go     # Regex-based symbol extraction (fallback)
+│   ├── treesitter.go    # Tree-sitter AST extraction (Go, TS, JS, Python)
+│   ├── frameworks.go    # Framework route detection
+│   ├── bridge.go        # Cross-language bridging
+│   └── orchestrator.go  # Index builder
+├── sync/
+│   └── watcher.go       # File watcher with debounce
+└── tools/
+    ├── node.go          # Symbol details tool
+    ├── status.go        # Index status tool
+    └── affected.go      # Affected test files tool
 ```
-
-Lists files matching the glob, relative to workspace root. Respects `.gitignore`.
-
-### `context`
-
-```json
-{
-  "file": "main.go",
-  "line": 42,
-  "before": 15,
-  "after": 15
-}
-```
-
-Reads a window of lines centered on `line`. The target line is marked with `>>`.  
-Path traversal is rejected.
-
-### `callees`
-
-```json
-{
-  "name": "handleMessage",
-  "max_results": 50
-}
-```
-
-Finds the definition of `name`, brace-matches its function body (up to 300 lines), and extracts every `symbol()`
-call — filtering out keywords, control flow statements, and the symbol itself. Handles strings, comments,
-and backtick literals correctly for most C-family languages.
-
-### `callers`
-
-```json
-{
-  "name": "handleMessage",
-  "max_results": 100
-}
-```
-
-Word-boundary grep for `name` across the workspace. Returns every line that references it.
-
-### `trace`
-
-```json
-{
-  "name": "handleMessage",
-  "depth": 0
-}
-```
-
-Grep with `-w`; `depth=1` adds ripgrep's `-C 5` (5 lines of surrounding context).
-
-### `impact`
-
-```json
-{
-  "name": "handleMessage",
-  "max_results": 100
-}
-```
-
-Per-file match count (`rg -c -w`). Answers "which files reference this symbol and how often?"
-
-### `explore`
-
-```json
-{ "max": 30 }
-```
-
-Lists top-level non-dot entries in the workspace root, then finds README files.
-
----
-
-## Limitations
-
-- **No AST analysis.** `callees` uses brace-matching + regex heuristics, not a parser. It works well for Go, Rust, C, JavaScript, Python, and similar brace-delimited languages, but will miss dynamic calls and may include false positives from string literals that look like function calls.
-- **Project-local only.** Unlike the official codegraph, there is no persistent symbol index, no cross-project queries, and no incremental indexing.
-- **Language-agnostic heuristics.** The definition regex targets `func`, `function`, `def`, `defn`, `fn`, `class` — adequate for most common languages but not exhaustive.
-
----
 
 ## License
 

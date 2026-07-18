@@ -11,3 +11,6 @@ vendor/
 # editor
 .idea/
 .vscode/
+
+# index database
+.codegraph/

@@ -1,12 +1,6 @@
-// codegraph-go: a Go MCP server that mimics the official colbymchenry/codegraph
-// tool surface (search, files, context, explore, callees, callers,
-// trace, impact) so it can drop in as a [[plugins]] entry
-// in reasonix.toml under the name "codegraph" and silence the
-// "(built-in, not installed)" stub.
+// codegraph-go: a Go MCP server with SQLite indexing, auto-sync, and code intelligence.
 //
-// This is intentionally a thin layer: file glob + ripgrep + line-window reads.
-// It does NOT do real AST analysis; the goal is to match tool *shape*, not to
-// rival the official code search quality.
+// Tools: search, search_fts, files, context, explore, callees, callers, trace, impact, node, status, affected.
 package main
 
 import (
@@ -21,20 +15,76 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
+
+	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/sync"
+	"github.com/dorokuma/codegraph-go/tools"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type server struct {
-	workdir string
+	workdir      string
+	database     *db.DB
+	orchestrator *extraction.Orchestrator
+	// watcher is set from the background index goroutine after auto-sync starts.
+	watcher atomic.Pointer[sync.Watcher]
+}
+
+// runInit implements `codegraph-go init <root>` for hosts that pre-warm the
+// index directory (e.g. reasonix). It only ensures the DB layout exists and
+// returns quickly — full indexing happens when the MCP server starts.
+func runInit(root string) error {
+	if root == "" {
+		root = "."
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("not a directory: %s", abs)
+	}
+	database, err := db.Open(abs)
+	if err != nil {
+		return err
+	}
+	if err := database.Close(); err != nil {
+		return err
+	}
+	log.Printf("init ok workdir=%s db=%s", abs, filepath.Join(abs, ".codegraph", "codegraph.db"))
+	return nil
 }
 
 func main() {
+	// Never block forever writing logs into an unread stderr pipe.
+	setupSafeLog()
+
+	// Subcommand: init <root>  (must be handled before flag.Parse)
+	if len(os.Args) >= 2 && os.Args[1] == "init" {
+		root := "."
+		if len(os.Args) >= 3 {
+			root = os.Args[2]
+		}
+		if err := runInit(root); err != nil {
+			log.Fatalf("init: %v", err)
+		}
+		return
+	}
+
 	var workdir string
+	var noSync bool
 	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
+	flag.BoolVar(&noSync, "no-sync", false, "disable auto-sync file watcher")
 	flag.Parse()
+
 	if workdir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -49,21 +99,66 @@ func main() {
 	workdir = absWd
 	log.Printf("codegraph-go starting, workdir=%s", workdir)
 
-	s := &server{workdir: workdir}
+	// Open database
+	database, err := db.Open(workdir)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: "0.2.0"}, nil)
+	// Create orchestrator
+	orch := extraction.NewOrchestrator(database, workdir)
 
-	// 8 tools: search, files, context, explore, callees, callers, trace, impact.
-	// (status removed — full-tree file/LOC count; agents should use explore/search instead.)
+	s := &server{
+		workdir:      workdir,
+		database:     database,
+		orchestrator: orch,
+	}
+
+	// Index + watcher in the background so MCP initialize is never blocked
+	// by a multi-minute cold scan of a large workspace.
+	go func() {
+		log.Printf("indexing project in background...")
+		files, nodes, err := orch.IndexAll()
+		if err != nil {
+			log.Printf("index warning: %v", err)
+		}
+		log.Printf("indexed %d files, %d nodes", files, nodes)
+
+		if noSync {
+			return
+		}
+		watcher, err := sync.NewWatcher(orch, workdir)
+		if err != nil {
+			log.Printf("watcher warning: %v", err)
+			return
+		}
+		if err := watcher.Start(); err != nil {
+			log.Printf("watcher start warning: %v", err)
+			return
+		}
+		s.watcher.Store(watcher)
+		log.Printf("auto-sync enabled")
+	}()
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: "0.4.0"}, nil)
+
+	// 12 tools: search, search_fts, files, context, explore, callees, callers, trace, impact, node, status, affected.
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "search",
 		Description: "ripgrep-style text/regex search across the workspace. Returns matching file paths with line numbers.",
 	}, s.toolSearch)
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "search_fts",
+		Description: "Full-text search over indexed symbols using SQLite FTS5. Faster for symbol/name lookups than ripgrep.",
+	}, s.toolSearchFTS)
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "files",
 		Description: "List files in the workspace matching a glob pattern (supports ** recursion). Uses ripgrep (respects .gitignore).",
 	}, s.toolFiles)
+
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "context",
 		Description: "Read a window of lines around a given file:line position. Use after search to grab surrounding code.",
@@ -94,8 +189,28 @@ func main() {
 		Description: "Reverse impact: which files reference `name`? Returns a sorted file list with match counts.",
 	}, s.toolImpact)
 
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "node",
+		Description: "Get detailed information about a symbol: source code, callers, callees. Use after search to get full context.",
+	}, s.toolNode)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "status",
+		Description: "Check index health and statistics: node count, edge count, file count, pending sync files.",
+	}, s.toolStatus)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "affected",
+		Description: "Find test files affected by changed source files. Traces import dependencies transitively.",
+	}, s.toolAffected)
+
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)
+	}
+
+	// Clean up watcher on exit
+	if w := s.watcher.Load(); w != nil {
+		w.Stop()
 	}
 }
 
@@ -105,12 +220,48 @@ type searchArgs struct {
 	Pattern    string `json:"pattern"      jsonschema:"regex or literal pattern (ripgrep syntax)"`
 	Path       string `json:"path,omitempty" jsonschema:"optional subdirectory under workspace,optional"`
 	Glob       string `json:"glob,omitempty" jsonschema:"optional file glob filter, e.g. \"*.go\",optional"`
-	MaxResults int    `json:"max_results,omitempty" jsonschema:"cap on number of matches per file (default 200),optional"`
+	MaxResults int    `json:"max_results,omitempty" jsonschema:"global match cap (default 70; per-file also capped),optional"`
 	IgnoreCase bool   `json:"ignore_case,omitempty" jsonschema:"case-insensitive search,optional"`
 }
 
+type searchFTSArgs struct {
+	Query string `json:"query" jsonschema:"full-text query (FTS5 syntax; plain words work)"`
+	Max   int    `json:"max,omitempty" jsonschema:"result cap (default 50),optional"`
+}
+
+func (s *server) toolSearchFTS(ctx context.Context, _ *mcp.CallToolRequest, args searchFTSArgs) (*mcp.CallToolResult, any, error) {
+	if args.Query == "" {
+		return nil, nil, fmt.Errorf("query is required")
+	}
+	if args.Max == 0 {
+		args.Max = 50
+	}
+	nodes, err := s.database.FullTextSearch(args.Query, args.Max)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fts search: %w", err)
+	}
+	if len(nodes) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
+		}, nil, nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "FTS matches for %q (%d):\n", args.Query, len(nodes))
+	for _, n := range nodes {
+		rel := n.File
+		if r, err := filepath.Rel(s.workdir, n.File); err == nil {
+			rel = r
+		}
+		fmt.Fprintf(&b, "%s:%d  %s (%s)\n", rel, n.Line, n.Name, n.Kind)
+	}
+	text := truncateOutput(b.String(), defaultOutputChars)
+	text = s.addStalenessWarning(text)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}, nil, nil
+}
+
 func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.Pattern == "" {
@@ -121,11 +272,12 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		return nil, nil, err
 	}
 	if args.MaxResults == 0 {
-		args.MaxResults = 200
+		args.MaxResults = defaultSearchGlobal
 	}
+	perFile := searchPerFileCap(args.MaxResults)
 	rg := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
-		fmt.Sprintf("--max-count=%d", args.MaxResults),
+		fmt.Sprintf("--max-count=%d", perFile),
 	)
 	if args.IgnoreCase {
 		rg.Args = append(rg.Args, "-i")
@@ -140,16 +292,10 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
 		}, nil, nil
 	}
-	// truncate to keep token cost low — safe at rune boundary
-	text := string(out)
-	if len(text) > 50_000 {
-		// find the last valid rune boundary at or before 50_000
-		truncAt := 50_000
-		for truncAt > 0 && !utf8.ValidString(text[:truncAt]) {
-			truncAt--
-		}
-		text = text[:truncAt] + "\n... (truncated)"
-	}
+	text := limitLines(string(out), args.MaxResults)
+	text = truncateOutput(text, defaultOutputChars)
+	// Add staleness warning
+	text = s.addStalenessWarning(text)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
@@ -157,11 +303,10 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 
 type filesArgs struct {
 	Pattern string `json:"pattern,omitempty" jsonschema:"glob pattern relative to workspace, e.g. \"src/**/*.go\",optional"`
-	Max     int    `json:"max,omitempty"     jsonschema:"cap (default 500),optional"`
+	Max     int    `json:"max,omitempty"     jsonschema:"cap (default 100),optional"`
 }
 
 func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args filesArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	pattern := args.Pattern
@@ -169,7 +314,7 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 		pattern = "**/*"
 	}
 	if args.Max == 0 {
-		args.Max = 500
+		args.Max = defaultFilesMax
 	}
 	root := s.workdir
 	fullPath := filepath.Join(root, pattern)
@@ -180,11 +325,9 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 			pattern = pattern + "/**/*"
 		}
 	}
-	// Use rg --files for ** glob support + .gitignore awareness
 	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, root)
 	out, err := rg.Output()
 	if err != nil {
-		// rg exits 1 when no files match
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "no files matched"}},
 		}, nil, nil
@@ -193,7 +336,6 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	if len(lines) > args.Max {
 		lines = lines[:args.Max]
 	}
-	// strip root prefix for readability
 	var b strings.Builder
 	for _, l := range lines {
 		rel, err := filepath.Rel(root, l)
@@ -201,8 +343,9 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 			fmt.Fprintln(&b, rel)
 		}
 	}
+	text := truncateOutput(b.String(), defaultOutputChars)
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
 }
 
@@ -223,7 +366,6 @@ func (s *server) toolContext(ctx context.Context, _ *mcp.CallToolRequest, args c
 	if args.After < 0 {
 		args.After = 0
 	}
-	// Resolve to absolute path and verify it's under workspace root
 	fullPath, err := s.resolvePath(args.File)
 	if err != nil {
 		return nil, nil, err
@@ -261,7 +403,6 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if args.Max == 0 {
 		args.Max = 30
 	}
-	// cheap "where do I start" view: top-level dirs + README + manifests
 	entries, err := os.ReadDir(s.workdir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading workspace: %w", err)
@@ -273,7 +414,6 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 		}
 		fmt.Fprintf(&b, "%s/\n", e.Name())
 	}
-	// README hunt (1 level deep)
 	rg := exec.CommandContext(ctx, "rg", "--files", "-g", "README*", "-g", "*.md", s.workdir)
 	if out, err := rg.Output(); err == nil {
 		text := strings.TrimSpace(string(out))
@@ -299,26 +439,23 @@ type nameArgs struct {
 	Name       string `json:"name"                 jsonschema:"symbol name to look for"`
 	Path       string `json:"path,omitempty"        jsonschema:"optional subdirectory under workspace,optional"`
 	Glob       string `json:"glob,omitempty"        jsonschema:"optional file glob filter, e.g. \"*.go\",optional"`
-	MaxResults int    `json:"max_results,omitempty" jsonschema:"cap (default 100),optional"`
+	MaxResults int    `json:"max_results,omitempty" jsonschema:"cap (default 40),optional"`
 }
 
 func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	if args.MaxResults == 0 {
-		args.MaxResults = 100
+		args.MaxResults = defaultSymbolMax
 	}
 	root, err := s.resolvePath(args.Path)
 	if err != nil {
 		return nil, nil, err
 	}
 	quoted := regexp.QuoteMeta(args.Name)
-
-	// Step 1: find definition locations (function/method definitions)
 	defPattern := fmt.Sprintf(`(func\s+(\([^)]*\)\s*)?|def |defn |function |async function |fn |class )%s\b`, quoted)
 	rgDef := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
@@ -326,8 +463,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		"-e", defPattern, root)
 	defOut, err := rgDef.Output()
 	if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
-		// Fallback: broader pattern matching any symbol followed by '('
-		// catches C/C++/Java/TS/JS/etc. definitions the first pattern misses
 		fallbackPattern := fmt.Sprintf(`\b%s\s*\(`, quoted)
 		rgDefFallback := exec.CommandContext(ctx, "rg",
 			"--line-number", "--no-heading", "--color=never",
@@ -341,7 +476,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		}
 	}
 
-	// Parse file:line from matches
 	type defMatch struct {
 		file string
 		line int
@@ -364,7 +498,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		}, nil, nil
 	}
 
-	// Step 2+3: read each definition body and extract function calls via brace matching
 	callRe := regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 	controlFlow := map[string]bool{
 		"if": true, "for": true, "while": true, "switch": true, "case": true,
@@ -402,13 +535,11 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		}
 		seen := make(map[string]bool)
 
-		bodyStart := d.line - 1 // 0-indexed
+		bodyStart := d.line - 1
 		if bodyStart >= len(lines) {
 			continue
 		}
 
-		// Find function body with brace matching (max 300 lines).
-		// First, check if there's an open brace '{' near the definition to avoid scanning non-function declarations.
 		hasBrace := false
 		searchLines := 3
 		if bodyStart+searchLines > len(lines) {
@@ -422,9 +553,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 			}
 		}
 		if !hasBrace {
-			// For Python (.py) files, use indentation-based body detection instead of brace matching
 			if strings.HasSuffix(d.file, ".py") {
-				// Find the line containing ':' (the def statement may span multiple lines)
 				colonLine := bodyStart
 				for colonLine < len(lines) && colonLine <= bodyStart+5 {
 					if strings.Contains(strings.TrimSpace(lines[colonLine]), ":") {
@@ -436,7 +565,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 					continue
 				}
 
-				// Skip blank / comment lines after def, find first body line
 				firstBodyLine := -1
 				for i := colonLine + 1; i < len(lines); i++ {
 					trimmed := strings.TrimSpace(lines[i])
@@ -452,13 +580,11 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 
 				baseIndent := countLeadingSpaces(lines[firstBodyLine])
 				if baseIndent == 0 {
-					// no indentation after def — likely a single-line stub
 					continue
 				}
 
-				// Scan body until indentation drops below baseIndent (or max scan lines)
 				bodyEnd := firstBodyLine
-				maxScan := bodyStart + 500 // increased from 300 to support larger function bodies
+				maxScan := bodyStart + 500
 				if maxScan > len(lines) {
 					maxScan = len(lines)
 				}
@@ -473,7 +599,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 					bodyEnd = i
 				}
 
-				// Extract function calls from the body (same logic as the brace-based path)
 				for i := bodyStart; i <= bodyEnd && i < len(lines) && len(allCalls) < args.MaxResults; i++ {
 					line := lines[i]
 					clean := stripStringsAndComments(line)
@@ -496,11 +621,10 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 			continue
 		}
 
-		// Skip braces inside string literals and comments for better accuracy.
 		braceCount := 0
 		foundOpen := false
 		bodyEnd := bodyStart
-		maxScan := bodyStart + 500 // increased from 300 to support larger function bodies
+		maxScan := bodyStart + 500
 		if maxScan > len(lines) {
 			maxScan = len(lines)
 		}
@@ -517,27 +641,23 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 					continue
 				}
 				if !inString && ch == '/' && j+1 < len(line) {
-					// single-line comment — rest of line is ignored
 					if line[j+1] == '/' {
 						break
 					}
-					// possible start of block comment
 					if line[j+1] == '*' {
 						inString = true
-						stringChar = 0 // mark as block-comment mode
+						stringChar = 0
 						j++
 						continue
 					}
 				}
 				if inString {
 					if stringChar == 0 {
-						// block comment mode
 						if ch == '*' && j+1 < len(line) && line[j+1] == '/' {
 							inString = false
 							j++
 						}
 					} else {
-						// backtick strings (raw) don't process escape sequences
 						if stringChar != '`' {
 							if ch == '\\' {
 								skip = true
@@ -550,7 +670,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 					}
 					continue
 				}
-				// not in string/comment
 				if ch == '"' || ch == '\'' || ch == '`' {
 					inString = true
 					stringChar = ch
@@ -569,10 +688,8 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 			}
 		}
 
-		// Extract function calls from the body (skip strings/comments)
 		for i := bodyStart; i <= bodyEnd && i < len(lines) && len(allCalls) < args.MaxResults; i++ {
 			line := lines[i]
-			// Strip single-line comments and string contents before matching
 			clean := stripStringsAndComments(line)
 			matches := callRe.FindAllStringSubmatch(clean, -1)
 			for _, m := range matches {
@@ -596,7 +713,6 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		}, nil, nil
 	}
 
-	// Format output: group by file
 	var b strings.Builder
 	fmt.Fprintf(&b, "Functions called by %s (%d callees):\n", args.Name, len(allCalls))
 	currentFile := ""
@@ -616,28 +732,34 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
+		Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(b.String(), defaultOutputChars)}},
 	}, nil, nil
 }
 
 func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	if args.MaxResults == 0 {
-		args.MaxResults = 100
+		args.MaxResults = defaultSymbolMax
 	}
 	root, err := s.resolvePath(args.Path)
 	if err != nil {
 		return nil, nil, err
 	}
-	// word-boundary regex
+	// Fetch more than we return so filtering defs still leaves enough call sites.
+	rgCap := args.MaxResults * 3
+	if rgCap < args.MaxResults {
+		rgCap = args.MaxResults
+	}
+	if rgCap > 200 {
+		rgCap = 200
+	}
 	rg := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
-		fmt.Sprintf("--max-count=%d", args.MaxResults),
+		fmt.Sprintf("--max-count=%d", rgCap),
 		"-w", args.Name, root)
 	if args.Glob != "" {
 		rg.Args = append(rg.Args, "--glob", args.Glob)
@@ -646,7 +768,6 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found"}}}, nil, nil
 	}
-	// Filter out false positives (comments/strings) and definition lines.
 	quoted := regexp.QuoteMeta(args.Name)
 	defRe := regexp.MustCompile(`(func\s+(\([^)]*\)\s*)?|def\s+|function\s+|class\s+|fn\s+)` + quoted + `\b`)
 	var filtered []string
@@ -658,26 +779,24 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		text := parts[2]
 		cleaned := stripStringsAndComments(text)
 		if !strings.Contains(cleaned, args.Name) {
-			// Only present in string literals or comments — skip
 			continue
 		}
 		if defRe.MatchString(cleaned) {
-			// This is a definition, not a call site — skip
 			continue
 		}
 		filtered = append(filtered, line)
+		if len(filtered) >= args.MaxResults {
+			break
+		}
 	}
 	if len(filtered) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found"}}}, nil, nil
 	}
 	result := strings.Join(filtered, "\n")
-	if len(result) > 50_000 {
-		truncAt := 50_000
-		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
-			truncAt--
-		}
-		result = result[:truncAt] + "\n... (truncated)"
+	if len(filtered) >= args.MaxResults {
+		result += fmt.Sprintf("\n... (max %d; narrow path/glob or raise max_results)", args.MaxResults)
 	}
+	result = truncateOutput(result, defaultOutputChars)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 
@@ -687,7 +806,6 @@ type traceArgs struct {
 }
 
 func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args traceArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.Name == "" {
@@ -697,36 +815,31 @@ func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args tra
 		args.Depth = 1
 	}
 	root := s.workdir
-	rgArgs := []string{"--line-number", "--no-heading", "--color=never", "--max-count=100"}
+	rgArgs := []string{"--line-number", "--no-heading", "--color=never", fmt.Sprintf("--max-count=%d", defaultTraceMax)}
 	if args.Depth == 1 {
-		rgArgs = append(rgArgs, "-C", "5") // 5 lines of surrounding context
+		rgArgs = append(rgArgs, "-C", "5")
 	}
 	rgArgs = append(rgArgs, "-w", args.Name, root)
 	rg := exec.CommandContext(ctx, "rg", rgArgs...)
 	out, _ := rg.Output()
 	result := string(out)
-	if len(result) > 50_000 {
-		truncAt := 50_000
-		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
-			truncAt--
-		}
-		result = result[:truncAt] + "\n... (truncated)"
-	}
 	if result == "" {
 		result = "no matches found for " + args.Name
+	} else {
+		result = limitLines(result, defaultTraceMax)
+		result = truncateOutput(result, defaultOutputChars)
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 
 func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
-	// 30s timeout to prevent rg from hanging on large repos
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	if args.MaxResults == 0 {
-		args.MaxResults = 100
+		args.MaxResults = defaultSymbolMax
 	}
 	root, err := s.resolvePath(args.Path)
 	if err != nil {
@@ -734,27 +847,89 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	}
 	rg := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
-		"-c", // count per file
+		"-c",
 		"-w", args.Name, root)
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
 	}
-	result := string(out)
-	if len(result) > 50_000 {
-		truncAt := 50_000
-		for truncAt > 0 && !utf8.ValidString(result[:truncAt]) {
-			truncAt--
-		}
-		result = result[:truncAt] + "\n... (truncated)"
-	}
+	result := limitLines(string(out), args.MaxResults)
+	result = truncateOutput(result, defaultOutputChars)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
+}
+
+// ---------- new tools: node, status ----------
+
+type nodeArgs struct {
+	Name string `json:"name" jsonschema:"symbol name to look for"`
+	File string `json:"file,omitempty" jsonschema:"optional file path to narrow search,optional"`
+	Line int    `json:"line,omitempty" jsonschema:"optional line number to find exact symbol,optional"`
+}
+
+func (s *server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args nodeArgs) (*mcp.CallToolResult, any, error) {
+	result, err := tools.ToolNode(ctx, s.database, tools.NodeArgs{
+		Name: args.Name,
+		File: args.File,
+		Line: args.Line,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if result == nil || len(result.Content) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no symbols found"}},
+		}, nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: result.Content[0].Text}},
+	}, nil, nil
+}
+
+type statusArgs struct {
+	Path string `json:"path,omitempty" jsonschema:"optional path to check specific file status,optional"`
+}
+
+func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
+	var pendingFiles []string
+	if w := s.watcher.Load(); w != nil {
+		pendingFiles = w.PendingFiles()
+	}
+
+	result, err := tools.ToolStatus(ctx, s.database, s.workdir, tools.StatusArgs{
+		Path: args.Path,
+	}, pendingFiles)
+	if err != nil {
+		return nil, nil, err
+	}
+	if result == nil || len(result.Content) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "error getting status"}},
+		}, nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: result.Content[0].Text}},
+	}, nil, nil
 }
 
 // ---------- helpers ----------
 
-// resolvePath converts a user-supplied path into an absolute path within the workspace.
-// It guarantees the result is inside s.workdir, preventing path traversal.
+// addStalenessWarning adds a warning about pending sync files.
+func (s *server) addStalenessWarning(text string) string {
+	if w := s.watcher.Load(); w != nil {
+		pending := w.PendingFiles()
+		if len(pending) > 0 {
+			var warning strings.Builder
+			warning.WriteString("\n\n⚠️ **Warning**: The following files have been modified but not yet synced to the index:\n")
+			for _, f := range pending {
+				warning.WriteString(fmt.Sprintf("- %s\n", f))
+			}
+			warning.WriteString("\nThe index may be stale for these files. Consider reading them directly for the latest content.")
+			text += warning.String()
+		}
+	}
+	return text
+}
+
 func (s *server) resolvePath(p string) (string, error) {
 	if p == "" {
 		return s.workdir, nil
@@ -789,10 +964,6 @@ func readLines(path string) ([]string, error) {
 	return strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n"), nil
 }
 
-
-
-// stripStringsAndComments replaces string literals and comments with spaces,
-// so regex matching on the result doesn't falsely match inside them.
 func stripStringsAndComments(line string) string {
 	var out strings.Builder
 	out.Grow(len(line))
@@ -808,14 +979,12 @@ func stripStringsAndComments(line string) string {
 		}
 		if !inString && ch == '/' && j+1 < len(line) {
 			if line[j+1] == '/' {
-				// rest of line is comment — replace with spaces
 				for ; j < len(line); j++ {
 					out.WriteByte(' ')
 				}
 				break
 			}
 			if line[j+1] == '*' {
-				// block comment start — replace with spaces until */
 				out.WriteByte(' ')
 				out.WriteByte(' ')
 				j++
@@ -834,7 +1003,6 @@ func stripStringsAndComments(line string) string {
 		}
 		if inString {
 			if stringChar == 0 {
-				// block comment
 				if ch == '*' && j+1 < len(line) && line[j+1] == '/' {
 					out.WriteByte(' ')
 					out.WriteByte(' ')
@@ -847,7 +1015,6 @@ func stripStringsAndComments(line string) string {
 			}
 			if ch == '\\' {
 				out.WriteByte(' ')
-				// backtick strings (raw) don't process escape sequences
 				if stringChar != '`' {
 					skip = true
 					continue
@@ -860,9 +1027,7 @@ func stripStringsAndComments(line string) string {
 			continue
 		}
 		if ch == '"' || ch == '\'' || ch == '`' {
-			// Check for Python triple-quotes (''' or """)
 			if (ch == '\'' || ch == '"') && j+2 < len(line) && line[j+1] == ch && line[j+2] == ch {
-				// Triple quote — replace rest of line with spaces (may close on same line or span lines)
 				for ; j < len(line); j++ {
 					out.WriteByte(' ')
 				}
@@ -878,7 +1043,6 @@ func stripStringsAndComments(line string) string {
 	return out.String()
 }
 
-// countLeadingSpaces returns the number of leading space/tab characters in line.
 func countLeadingSpaces(line string) int {
 	n := 0
 	for _, ch := range line {
@@ -889,4 +1053,33 @@ func countLeadingSpaces(line string) int {
 		}
 	}
 	return n
+}
+
+// ---------- affected tool ----------
+
+type affectedArgs struct {
+	Files  []string `json:"files"                jsonschema:"list of changed source files"`
+	Stdin  bool     `json:"stdin,omitempty"      jsonschema:"read file list from stdin,optional"`
+	Depth  int      `json:"depth,omitempty"      jsonschema:"max dependency traversal depth (default 5),optional"`
+	Filter string   `json:"filter,omitempty"     jsonschema:"custom glob to identify test files,optional"`
+}
+
+func (s *server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args affectedArgs) (*mcp.CallToolResult, any, error) {
+	result, err := tools.ToolAffected(ctx, s.database, s.workdir, tools.AffectedArgs{
+		Files:  args.Files,
+		Stdin:  args.Stdin,
+		Depth:  args.Depth,
+		Filter: args.Filter,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if result == nil || len(result.Content) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no affected test files found"}},
+		}, nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: result.Content[0].Text}},
+	}, nil, nil
 }
