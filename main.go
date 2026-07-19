@@ -390,6 +390,11 @@ func (s *server) toolSearchFTS(ctx context.Context, _ *mcp.CallToolRequest, args
 	if args.Max == 0 {
 		args.Max = 50
 	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Query); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -501,6 +506,11 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	}
 	if args.MaxResults == 0 {
 		args.MaxResults = defaultSearchGlobal
+	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Pattern); p != "" {
+			args.ProjectPath = p
+		}
 	}
 	projRoot, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
@@ -695,6 +705,11 @@ type exploreArgs struct {
 }
 
 func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args exploreArgs) (*mcp.CallToolResult, any, error) {
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Query); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -733,6 +748,11 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if args.MaxResults == 0 {
 		args.MaxResults = defaultSymbolMax
 	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Name); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -763,6 +783,11 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 	if args.MaxResults == 0 {
 		args.MaxResults = defaultSymbolMax
+	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Name); p != "" {
+			args.ProjectPath = p
+		}
 	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
@@ -877,6 +902,11 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	if args.MaxResults == 0 {
 		args.MaxResults = defaultSymbolMax
 	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Name); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	projRoot, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -923,6 +953,11 @@ type nodeArgs struct {
 }
 
 func (s *server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args nodeArgs) (*mcp.CallToolResult, any, error) {
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Name); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -960,6 +995,7 @@ func (s *server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args node
 	}
 	text := truncateOutput(result.Content[0].Text, outCap)
 	text = s.addStalenessWarning(text)
+
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
@@ -1095,6 +1131,79 @@ func recoverableProjectErr(err error) (*mcp.CallToolResult, any, error) {
 
 // resolveProject picks the DB + root for a tool call.
 // Empty projectPath → session default. Non-empty → walk up to nearest .codegraph/.
+// isWordIn reports whether word appears as a standalone word in text.
+// Word boundaries are: start/end of string, space, slash, dot, dash, underscore.
+func isWordIn(word, text string) bool {
+	idx := strings.Index(text, word)
+	if idx < 0 {
+		return false
+	}
+	end := idx + len(word)
+	leftOK := idx == 0 || isWordSep(text[idx-1])
+	rightOK := end == len(text) || isWordSep(text[end])
+	return leftOK && rightOK
+}
+
+func isWordSep(b byte) bool {
+	switch b {
+	case ' ', '/', '.', '-', '_', ',', ':', '\t', '\n', '(', ')', '[', ']', '{', '}':
+		return true
+	}
+	return false
+}
+
+// detectProject tries to find which project the user is asking about
+// by matching query/args against project directory names under workdir.
+// Returns the project dir name (relative to workdir) or empty string.
+func (s *server) detectProject(queries ...string) string {
+	if !extraction.IsBroadWorkdir(s.workdir) {
+		return ""
+	}
+	entries, err := os.ReadDir(s.workdir)
+	if err != nil {
+		return ""
+	}
+	for _, q := range queries {
+		q = strings.ToLower(strings.TrimSpace(q))
+		if q == "" {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			projectDir := filepath.Join(s.workdir, e.Name())
+			if !extraction.HasProjectMarker(projectDir) {
+				continue
+			}
+			if strings.ToLower(e.Name()) == q {
+				return e.Name()
+			}
+		}
+	}
+	// Fuzzy: check if any project name appears as a word in the query
+	for _, q := range queries {
+		q = strings.ToLower(strings.TrimSpace(q))
+		if q == "" {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			projectDir := filepath.Join(s.workdir, e.Name())
+			if !extraction.HasProjectMarker(projectDir) {
+				continue
+			}
+			name := strings.ToLower(e.Name())
+			if isWordIn(name, q) {
+				return e.Name()
+			}
+		}
+	}
+	return ""
+}
+
 func (s *server) resolveProject(projectPath string) (root string, database *db.DB, err error) {
 	if strings.TrimSpace(projectPath) == "" {
 		return s.workdir, s.database, nil

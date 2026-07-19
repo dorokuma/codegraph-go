@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/dorokuma/codegraph-go/db"
@@ -56,8 +57,13 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 	if args.Path != "" {
 		files, _ := database.ListFiles()
 		found := false
+		// Normalize: try exact, suffix, and prefix (for project-level queries like "codegraph-go")
+		norm := filepath.Clean(args.Path)
+		if !strings.HasSuffix(norm, string(filepath.Separator)) {
+			norm += string(filepath.Separator)
+		}
 		for _, f := range files {
-			if f == args.Path || strings.HasSuffix(f, args.Path) {
+			if f == args.Path || strings.HasSuffix(f, args.Path) || strings.HasPrefix(f, norm) {
 				b.WriteString(fmt.Sprintf("%s: indexed\n", args.Path))
 				found = true
 				break
