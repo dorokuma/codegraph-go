@@ -76,7 +76,9 @@ func (d *Daemon) Start() error {
 			}
 			continue
 		}
-		_ = os.Chmod(path, 0o600)
+		if err := os.Chmod(path, 0o600); err != nil {
+			log.Printf("chmod socket %s: %v", path, err)
+		}
 		d.listener = ln
 		d.socketPath = path
 		break
@@ -93,7 +95,9 @@ func (d *Daemon) Start() error {
 	}
 	// Rewrite pidfile if we relocated off candidate 0.
 	if pref := PreferredSocket(d.root); pref != "" && d.socketPath != pref {
-		_ = RewriteLock(d.pidPath, lock)
+		if err := RewriteLock(d.pidPath, lock); err != nil {
+			log.Printf("rewrite lock %s: %v", d.pidPath, err)
+		}
 	}
 
 	Register(Record{

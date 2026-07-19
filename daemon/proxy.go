@@ -54,7 +54,9 @@ func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) ProxyResult {
 	if truthy(os.Getenv(EnvLogAttach)) {
 		log.Printf("attached to shared daemon on %s (pid %d, v%s)", hello.SocketPath, hello.PID, hello.Codegraph)
 	}
-	_ = WriteClientHello(conn)
+	if err := WriteClientHello(conn); err != nil {
+		log.Printf("write client hello: %v", err)
+	}
 
 	// PPID watchdog closes the socket (daemon refcount--) then we exit.
 	stopWD := StartPPIDWatchdog(PPIDPollInterval(), func() {

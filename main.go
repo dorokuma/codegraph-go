@@ -115,12 +115,16 @@ func main() {
 	//  2. CODEGRAPH_NO_DAEMON=1 → direct embedded mode
 	//  3. else try proxy to shared daemon (spawn if needed); fallback direct
 	if daemon.Internal() {
-		runDaemonProcess(workdir, noSync)
+		if err := runDaemonProcess(workdir, noSync); err != nil {
+			log.Fatalf("%v", err)
+		}
 		return
 	}
 	if daemon.OptOut() {
 		log.Printf("mode=direct (CODEGRAPH_NO_DAEMON)")
-		runDirect(workdir, noSync)
+		if err := runDirect(workdir, noSync); err != nil {
+			log.Fatalf("%v", err)
+		}
 		return
 	}
 
@@ -146,11 +150,13 @@ func main() {
 		return
 	}
 	log.Printf("mode=direct (daemon unavailable)")
-	runDirect(workdir, noSync)
+	if err := runDirect(workdir, noSync); err != nil {
+		log.Fatalf("%v", err)
+	}
 }
 
 // runDirect is the pre-daemon single-process MCP server (stdio).
-func runDirect(workdir string, noSync bool) {
+func runDirect(workdir string, noSync bool) error {
 	s, cleanup := openServerState(workdir, noSync)
 	defer cleanup()
 
@@ -161,12 +167,13 @@ func runDirect(workdir string, noSync bool) {
 	defer stopWD()
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		log.Fatalf("server exited: %v", err)
+		return fmt.Errorf("server exited: %w", err)
 	}
+	return nil
 }
 
 // runDaemonProcess is CODEGRAPH_DAEMON_INTERNAL: single writer, N socket clients.
-func runDaemonProcess(workdir string, noSync bool) {
+func runDaemonProcess(workdir string, noSync bool) error {
 	var (
 		stateOnce stdsync.Once
 		s         *server
@@ -199,11 +206,15 @@ func runDaemonProcess(workdir string, noSync bool) {
 		return nil
 	}
 	if err := daemon.RunAsDaemon(workdir, handler, onReady); err != nil {
-		log.Fatalf("daemon: %v", err)
+		if cleanup != nil {
+			cleanup()
+		}
+		return fmt.Errorf("daemon: %w", err)
 	}
 	if cleanup != nil {
 		cleanup()
 	}
+	return nil
 }
 
 // onceRWC closes the underlying ReadWriteCloser at most once.
