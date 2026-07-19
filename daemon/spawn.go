@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +25,7 @@ func SpawnDetached(root string) error {
 		}
 	}
 
-	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+	if err := os.MkdirAll(CodeGraphDir(root), 0o700); err != nil {
 		return err
 	}
 	logPath := filepath.Join(CodeGraphDir(root), "daemon.log")
@@ -66,6 +67,8 @@ func SpawnDetached(root string) error {
 		return err
 	}
 	// Detach: don't keep a zombie; child is session leader.
-	_ = cmd.Process.Release()
+	if err := cmd.Process.Release(); err != nil {
+		log.Printf("release daemon process pid=%d: %v", cmd.Process.Pid, err)
+	}
 	return nil
 }

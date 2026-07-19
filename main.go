@@ -21,7 +21,6 @@ import (
 	"github.com/dorokuma/codegraph-go/daemon"
 	"github.com/dorokuma/codegraph-go/db"
 	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/search"
 	"github.com/dorokuma/codegraph-go/sync"
 	"github.com/dorokuma/codegraph-go/tools"
 
@@ -377,127 +376,6 @@ type searchArgs struct {
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
-type searchFTSArgs struct {
-	Query       string `json:"query" jsonschema:"full-text query (FTS5 syntax; plain words work)"`
-	Max         int    `json:"max,omitempty" jsonschema:"result cap (default 50),optional"`
-	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
-}
-
-func (s *server) toolSearchFTS(ctx context.Context, _ *mcp.CallToolRequest, args searchFTSArgs) (*mcp.CallToolResult, any, error) {
-	if args.Query == "" {
-		return nil, nil, fmt.Errorf("query is required")
-	}
-	if args.Max == 0 {
-		args.Max = 50
-	}
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Query); p != "" {
-			args.ProjectPath = p
-		}
-	}
-	root, database, err := s.resolveProject(args.ProjectPath)
-	if err != nil {
-		return recoverableProjectErr(err)
-	}
-
-	// Parse field filters: kind:function name:auth path:src/api lang:go
-	parsed := search.ParseQuery(args.Query)
-
-	// Build effective query: use parsed.Text for FTS, or raw if no filters
-	ftsQuery := parsed.Text
-	if ftsQuery == "" && (len(parsed.Kinds) > 0 || len(parsed.NameFilters) > 0) {
-		if len(parsed.NameFilters) > 0 {
-			ftsQuery = parsed.NameFilters[0]
-		} else {
-			ftsQuery = args.Query
-		}
-	}
-	if ftsQuery == "" {
-		ftsQuery = args.Query
-	}
-
-	nodes, err := database.FullTextSearch(ftsQuery, args.Max*2)
-	if err != nil {
-		return nil, nil, fmt.Errorf("fts search: %w", err)
-	}
-
-	// Apply field filters
-	if len(parsed.Kinds) > 0 || len(parsed.Languages) > 0 || len(parsed.PathFilters) > 0 || len(parsed.NameFilters) > 0 {
-		nodes = filterNodes(nodes, parsed, root)
-	}
-
-	// Rank: hand-written first, generated last
-	nodes = rankByGenerated(nodes)
-
-	if len(nodes) > args.Max {
-		nodes = nodes[:args.Max]
-	}
-
-	if len(nodes) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
-		}, nil, nil
-	}
-
-	text := tools.FormatSearchResults(root, args.Query, nodes, args.Max)
-	text = truncateOutput(text, defaultOutputChars)
-	text = s.addStalenessWarning(text)
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: text}},
-	}, nil, nil
-}
-
-// filterNodes applies parsed query filters to node list.
-func filterNodes(nodes []db.Node, parsed search.ParsedQuery, workdir string) []db.Node {
-	var out []db.Node
-	for _, n := range nodes {
-		if len(parsed.Kinds) > 0 {
-			match := false
-			for _, k := range parsed.Kinds {
-				if n.Kind == k { match = true; break }
-			}
-			if !match { continue }
-		}
-		if len(parsed.Languages) > 0 {
-			match := false
-			for _, l := range parsed.Languages {
-				if n.Language == l { match = true; break }
-			}
-			if !match { continue }
-		}
-		if len(parsed.PathFilters) > 0 {
-			match := false
-			rel := db.RelPath(workdir, n.File)
-			for _, p := range parsed.PathFilters {
-				if strings.Contains(strings.ToLower(rel), strings.ToLower(p)) { match = true; break }
-			}
-			if !match { continue }
-		}
-		if len(parsed.NameFilters) > 0 {
-			match := false
-			for _, nf := range parsed.NameFilters {
-				if strings.Contains(strings.ToLower(n.Name), strings.ToLower(nf)) { match = true; break }
-			}
-			if !match { continue }
-		}
-		out = append(out, n)
-	}
-	return out
-}
-
-// rankByGenerated sorts nodes: hand-written first, generated last.
-func rankByGenerated(nodes []db.Node) []db.Node {
-	var gen, hand []db.Node
-	for _, n := range nodes {
-		if extraction.IsGeneratedFile(n.File) {
-			gen = append(gen, n)
-		} else {
-			hand = append(hand, n)
-		}
-	}
-	return append(hand, gen...)
-}
-
 func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -642,57 +520,6 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	text := truncateOutput(b.String(), defaultOutputChars)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
-	}, nil, nil
-}
-
-type contextArgs struct {
-	File        string `json:"file"               jsonschema:"file path (absolute or workspace-relative)"`
-	Line        int    `json:"line"               jsonschema:"1-based line number to center on"`
-	Before      int    `json:"before,omitempty"   jsonschema:"lines of context before (default 20),optional"`
-	After       int    `json:"after,omitempty"    jsonschema:"lines of context after (default 20),optional"`
-	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
-}
-
-func (s *server) toolContext(ctx context.Context, _ *mcp.CallToolRequest, args contextArgs) (*mcp.CallToolResult, any, error) {
-	if args.File == "" || args.Line <= 0 {
-		return nil, nil, fmt.Errorf("file and line (>0) are required")
-	}
-	if args.Before < 0 {
-		args.Before = 0
-	}
-	if args.After < 0 {
-		args.After = 0
-	}
-	projRoot, _, err := s.resolveProject(args.ProjectPath)
-	if err != nil {
-		return recoverableProjectErr(err)
-	}
-	fullPath, err := s.resolvePathIn(projRoot, args.File)
-	if err != nil {
-		return nil, nil, err
-	}
-	all, err := readLines(fullPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	start := args.Line - 1 - args.Before
-	if start < 0 {
-		start = 0
-	}
-	end := args.Line - 1 + args.After + 1
-	if end > len(all) {
-		end = len(all)
-	}
-	var b strings.Builder
-	for i := start; i < end; i++ {
-		marker := "  "
-		if i+1 == args.Line {
-			marker = ">>"
-		}
-		fmt.Fprintf(&b, "%s%5d  %s\n", marker, i+1, all[i])
-	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: b.String()}},
 	}, nil, nil
 }
 
@@ -854,42 +681,6 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		result += fmt.Sprintf("\n... (max %d; narrow path/glob or raise max_results)", args.MaxResults)
 	}
 	result = truncateOutput(result, defaultOutputChars)
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
-}
-
-type traceArgs struct {
-	Name        string `json:"name"`
-	Depth       int    `json:"depth,omitempty" jsonschema:"follow-up grep depth, 0 or 1 (default 0),optional"`
-	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
-}
-
-func (s *server) toolTrace(ctx context.Context, _ *mcp.CallToolRequest, args traceArgs) (*mcp.CallToolResult, any, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if args.Name == "" {
-		return nil, nil, fmt.Errorf("name is required")
-	}
-	if args.Depth > 1 {
-		args.Depth = 1
-	}
-	root, _, err := s.resolveProject(args.ProjectPath)
-	if err != nil {
-		return recoverableProjectErr(err)
-	}
-	rgArgs := []string{"--line-number", "--no-heading", "--color=never", fmt.Sprintf("--max-count=%d", defaultTraceMax)}
-	if args.Depth == 1 {
-		rgArgs = append(rgArgs, "-C", "5")
-	}
-	rgArgs = append(rgArgs, "-w", args.Name, root)
-	rg := exec.CommandContext(ctx, "rg", rgArgs...)
-	out, _ := rg.Output()
-	result := string(out)
-	if result == "" {
-		result = "no matches found for " + args.Name
-	} else {
-		result = limitLines(result, defaultTraceMax)
-		result = truncateOutput(result, defaultOutputChars)
-	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 

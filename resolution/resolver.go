@@ -2,7 +2,6 @@ package resolution
 
 import (
 	"log"
-	"strings"
 
 	"github.com/dorokuma/codegraph-go/db"
 )
@@ -30,10 +29,6 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 	// Retry failed refs when a candidate name now exists.
 	var retry []db.UnresolvedRef
 	for _, r := range failed {
-		tail := r.NameTail
-		if tail == "" {
-			tail = nameTail(r.ReferenceName)
-		}
 		cands, err := CollectCandidates(database, r.ReferenceName)
 		if err != nil || len(cands) == 0 {
 			continue
@@ -221,10 +216,4 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		}
 	}
 	return st, nil
-}
-
-// preferCallKind reports whether a reference kind wants call-target filtering.
-func preferCallKind(kind string) bool {
-	return kind == db.EdgeCalls || kind == db.EdgeReferences || kind == "bridge" ||
-		strings.EqualFold(kind, "calls")
 }

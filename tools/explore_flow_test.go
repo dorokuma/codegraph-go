@@ -88,10 +88,6 @@ func TestExploreFlowThreeHop(t *testing.T) {
 	if !strings.Contains(text, "Flow") {
 		t.Fatalf("expected Flow:\n%s", text)
 	}
-	// Order: main then foo then bar along the chain.
-	iMain := strings.Index(text, "main")
-	iFoo := strings.Index(text, "foo")
-	iBar := strings.Index(text, "bar")
 	// Find within the Flow block specifically
 	flowIdx := strings.Index(text, "Flow")
 	if flowIdx < 0 {
@@ -101,9 +97,9 @@ func TestExploreFlowThreeHop(t *testing.T) {
 	if end := strings.Index(flowPart, "## "); end > 0 {
 		flowPart = flowPart[:end]
 	}
-	iMain = strings.Index(flowPart, "main")
-	iFoo = strings.Index(flowPart, "foo")
-	iBar = strings.Index(flowPart, "bar")
+	iMain := strings.Index(flowPart, "main")
+	iFoo := strings.Index(flowPart, "foo")
+	iBar := strings.Index(flowPart, "bar")
 	if iMain < 0 || iFoo < 0 || iBar < 0 || !(iMain < iFoo && iFoo < iBar) {
 		t.Fatalf("expected main→foo→bar order in Flow, got:\n%s", flowPart)
 	}

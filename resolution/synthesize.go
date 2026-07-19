@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/dorokuma/codegraph-go/db"
@@ -92,7 +93,7 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 			Provenance: ProvHeuristic,
 			Metadata:   string(meta),
 		}); err != nil {
-			log.Printf("synthesis upsert edge: %v", err)
+			log.Printf("synthesis upsert edge %d->%d [%s] %s:%d: %v", e.SourceID, e.TargetID, e.Kind, e.File, e.Line, err)
 			continue
 		}
 		st.Written++
@@ -107,26 +108,9 @@ func edgeKey(src, tgt int64, kind string) string {
 }
 
 func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
+	return strconv.FormatInt(n, 10)
 }
+
 
 type synthEdge struct {
 	SourceID int64

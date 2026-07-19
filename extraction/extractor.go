@@ -267,7 +267,6 @@ func (e *Extractor) extractGo(source string, filePath string) ([]ExtractedNode, 
 var (
 	jsFuncRe   = regexp.MustCompile(`(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(`)
 	jsClassRe  = regexp.MustCompile(`(?:export\s+)?class\s+(\w+)`)
-	jsMethodRe = regexp.MustCompile(`^\s+(?:async\s+)?(\w+)\s*\(`)
 	jsCallRe   = regexp.MustCompile(`\b(\w+)\s*\(`)
 	jsImportRe = regexp.MustCompile(`(?:from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))`)
 )

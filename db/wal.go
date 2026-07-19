@@ -19,6 +19,7 @@ type WALCheckpoint struct {
 	interval time.Duration
 	stop     chan struct{}
 	done     sync.WaitGroup
+	stopOnce sync.Once
 }
 
 // NewWALCheckpoint creates a checkpoint manager that runs PRAGMA wal_checkpoint(PASSIVE)
@@ -63,7 +64,9 @@ func (w *WALCheckpoint) Stop() {
 	if w == nil {
 		return
 	}
-	close(w.stop)
+	w.stopOnce.Do(func() {
+		close(w.stop)
+	})
 	w.done.Wait()
 }
 

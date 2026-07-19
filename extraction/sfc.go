@@ -173,7 +173,7 @@ func findSFCScripts(source string) []sfcScriptBlock {
 
 func findAstroFrontmatter(source string) (sfcScriptBlock, bool) {
 	m := astroFMRe.FindStringSubmatchIndex(source)
-	if m == nil || len(m) < 4 {
+	if len(m) < 4 {
 		return sfcScriptBlock{}, false
 	}
 	body := source[m[2]:m[3]]

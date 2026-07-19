@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -22,7 +23,7 @@ type AcquireResult struct {
 // when the filesystem has no hard links.
 func TryAcquireLock(projectRoot string) (AcquireResult, error) {
 	pidPath := PidPath(projectRoot)
-	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o700); err != nil {
 		return AcquireResult{}, err
 	}
 
@@ -150,23 +151,5 @@ func isEExist(err error) bool {
 }
 
 func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
+	return strconv.Itoa(n)
 }

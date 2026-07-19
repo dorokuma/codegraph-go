@@ -236,69 +236,6 @@ func renderNodeSection(database *db.DB, workdir string, node db.Node, includeCod
 	return b.String()
 }
 
-func formatTrail(database *db.DB, workdir string, node db.Node) string {
-	callers, _ := database.GetCallersWithKind(node.ID)
-	callees, _ := database.GetCalleesWithKind(node.ID)
-	if len(callers) == 0 && len(callees) == 0 {
-		return ""
-	}
-
-	fmtOne := func(c db.NodeRef) string {
-		base := fmt.Sprintf("%s (%s:%d)", c.Name, db.RelPath(workdir, c.File), c.Line)
-		if c.EdgeKind != "" && c.EdgeKind != db.EdgeCalls {
-			return base + " [" + c.EdgeKind + "]"
-		}
-		return base
-	}
-
-	dedupe := func(in []db.NodeRef) []db.NodeRef {
-		seen := map[int64]bool{node.ID: true}
-		var out []db.NodeRef
-		for _, c := range in {
-			if seen[c.ID] {
-				continue
-			}
-			seen[c.ID] = true
-			out = append(out, c)
-		}
-		return out
-	}
-	callers = dedupe(callers)
-	callees = dedupe(callees)
-
-	var lines []string
-	lines = append(lines, "", "**Trail — node any of these to follow it (no Read needed)**")
-	if len(callees) > 0 {
-		parts := make([]string, 0, min(len(callees), nodeTrailCap))
-		for i, c := range callees {
-			if i >= nodeTrailCap {
-				break
-			}
-			parts = append(parts, fmtOne(c))
-		}
-		s := "**Calls →** " + strings.Join(parts, ", ")
-		if len(callees) > nodeTrailCap {
-			s += fmt.Sprintf(", +%d more", len(callees)-nodeTrailCap)
-		}
-		lines = append(lines, s)
-	}
-	if len(callers) > 0 {
-		parts := make([]string, 0, min(len(callers), nodeTrailCap))
-		for i, c := range callers {
-			if i >= nodeTrailCap {
-				break
-			}
-			parts = append(parts, fmtOne(c))
-		}
-		s := "**Called by ←** " + strings.Join(parts, ", ")
-		if len(callers) > nodeTrailCap {
-			s += fmt.Sprintf(", +%d more", len(callers)-nodeTrailCap)
-		}
-		lines = append(lines, s)
-	}
-	return strings.Join(lines, "\n")
-}
-
 func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (string, error) {
 	resolved, candidates, err := resolveIndexedFile(database, workdir, fileArg)
 	if err != nil {

@@ -450,10 +450,7 @@ func extractPythonHandler(lines []string, decoratorLine int) string {
 	}
 	nextLine := strings.TrimSpace(lines[decoratorLine+1])
 	if strings.HasPrefix(nextLine, "def ") || strings.HasPrefix(nextLine, "async def ") {
-		defLine := nextLine
-		if strings.HasPrefix(defLine, "async ") {
-			defLine = defLine[6:]
-		}
+		defLine := strings.TrimPrefix(nextLine, "async ")
 		parts := strings.SplitN(defLine[4:], "(", 2)
 		if len(parts) > 0 {
 			return strings.TrimSpace(parts[0])

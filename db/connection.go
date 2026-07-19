@@ -24,7 +24,7 @@ type DB struct {
 // Open opens (or creates) the SQLite database at .codegraph/codegraph.db under workdir.
 func Open(workdir string) (*DB, error) {
 	dir := filepath.Join(workdir, ".codegraph")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create .codegraph dir: %w", err)
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")

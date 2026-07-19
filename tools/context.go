@@ -2,7 +2,6 @@ package tools
 
 import (
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -198,16 +197,4 @@ func FormatSearchResults(workdir string, query string, nodes []db.Node, limit in
 	}
 
 	return b.String()
-}
-
-// RelPath is a helper to get relative path from workdir.
-func relPath(workdir, path string) string {
-	if workdir == "" {
-		return path
-	}
-	rel, err := filepath.Rel(workdir, path)
-	if err != nil {
-		return path
-	}
-	return rel
 }

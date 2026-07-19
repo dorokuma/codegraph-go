@@ -24,8 +24,6 @@ type Orchestrator struct {
 	db      *db.DB
 	workdir string
 	force   bool // when true, indexIfNeeded always reindexes
-
-	mu sync.Mutex // reserved for future concurrent index workers
 }
 
 // NewOrchestrator creates a new extraction orchestrator.

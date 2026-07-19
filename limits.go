@@ -21,9 +21,6 @@ const (
 
 	// callers / callees / impact style tools
 	defaultSymbolMax = 40
-
-	// trace: rg match cap (global-ish via --max-count)
-	defaultTraceMax = 70
 )
 
 // truncateOutput cuts text to max bytes on a UTF-8 boundary and appends a hint.

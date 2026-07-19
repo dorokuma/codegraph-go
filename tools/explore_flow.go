@@ -306,10 +306,7 @@ func containerMatches(n db.Node, segPool map[string]bool) bool {
 	if qn == "" {
 		// fall back: file base / parent dir name as weak container signal
 		base := strings.TrimSuffix(filepath.Base(n.File), filepath.Ext(n.File))
-		if segPool[strings.ToLower(base)] {
-			return true
-		}
-		return false
+		return segPool[strings.ToLower(base)]
 	}
 	segs := tokenSegments(qn)
 	if len(segs) < 2 {

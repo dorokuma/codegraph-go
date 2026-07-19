@@ -54,13 +54,6 @@ var tsLangRegistry = map[string]treeSitterLangFactory{
 	"lua":       {get: lua.GetLanguage},
 }
 
-// registerTreeSitterLanguages adds language factories from extended init() calls.
-func registerTreeSitterLanguages(langs map[string]treeSitterLangFactory) {
-	for k, v := range langs {
-		tsLangRegistry[k] = v
-	}
-}
-
 // NewTreeSitterExtractor creates a tree-sitter extractor for the given language.
 func NewTreeSitterExtractor(language string) *TreeSitterExtractor {
 	factory, ok := tsLangRegistry[language]

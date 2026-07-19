@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -58,7 +59,9 @@ func Register(rec Record) {
 	if werr := os.WriteFile(tmp, payload, 0o600); werr != nil {
 		return
 	}
-	_ = os.Rename(tmp, target)
+	if err := os.Rename(tmp, target); err != nil {
+		log.Printf("registry rename %s -> %s: %v", tmp, target, err)
+	}
 	// Best-effort cleanup of stale tmp file on rename failure (e.g. cross-device).
 	_ = os.Remove(tmp)
 }
