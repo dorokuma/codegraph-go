@@ -15,7 +15,8 @@ import (
 var schemaSQL string
 
 type DB struct {
-	mu   sync.Mutex
+	// RWMutex: readers (search/callers) don't block each other; writers still exclusive.
+	mu   sync.RWMutex
 	conn *sql.DB
 	path string
 }
@@ -44,14 +45,34 @@ func Open(workdir string) (*DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("set busy timeout: %w", err)
 	}
+	// Enforce FK so unresolved_refs / edges cascade when nodes are deleted.
+	if _, err := conn.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("enable foreign_keys: %w", err)
+	}
 
-	// Apply schema
+	// Apply schema (CREATE IF NOT EXISTS — does not ALTER existing tables).
 	if _, err := conn.Exec(schemaSQL); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// Older DBs may predate meta; ensure it exists even if schema embed was cached.
+	if _, err := conn.Exec(`
+		CREATE TABLE IF NOT EXISTS meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ensure meta: %w", err)
+	}
 
 	db := &DB{conn: conn, path: dbPath}
+	// Bring pre-v7 tables up to current columns/indexes without wiping data here.
+	// Logic-version mismatch still triggers Wipe+Rebuild separately.
+	if err := db.ensureSchema(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ensure schema: %w", err)
+	}
 	// Old indexes created before FTS need a one-time backfill; triggers only
 	// cover rows written after the FTS table exists.
 	if err := db.ensureFTSBackfill(); err != nil {

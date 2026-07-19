@@ -48,9 +48,13 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 		}
 	}
 
-	// Database location
-	b.WriteString(fmt.Sprintf("\n## Database\n"))
+	// Database location + logic version (rebuild trigger)
+	b.WriteString("\n## Database\n")
 	b.WriteString(fmt.Sprintf("- Path: %s\n", database.Path()))
+	b.WriteString(fmt.Sprintf("- Index logic: %s\n", db.LogicVersion()))
+	if need, old, err := database.NeedsRebuild(); err == nil && need {
+		b.WriteString(fmt.Sprintf("- Rebuild pending: on-disk=%s → want=%s (next start will full-reindex)\n", old, db.LogicVersion()))
+	}
 
 	// Pending sync
 	if len(pendingFiles) > 0 {

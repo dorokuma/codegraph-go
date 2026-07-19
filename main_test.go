@@ -1,8 +1,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dorokuma/codegraph-go/db"
 )
 
 func TestResolvePath(t *testing.T) {
@@ -135,5 +139,52 @@ func TestAddStalenessWarning(t *testing.T) {
 	// no watcher
 	if got := s.addStalenessWarning("ok"); got != "ok" {
 		t.Fatalf("expected unchanged without watcher, got %q", got)
+	}
+}
+
+func TestResolveProjectDefaultAndNearest(t *testing.T) {
+	base := t.TempDir()
+	// default session index
+	def := filepath.Join(base, "default")
+	os.MkdirAll(def, 0o755)
+	defDB, err := db.Open(def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer defDB.Close()
+
+	// separate project with its own index
+	other := filepath.Join(base, "other")
+	os.MkdirAll(filepath.Join(other, "pkg"), 0o755)
+	otherDB, err := db.Open(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDB.Close()
+
+	s := &server{workdir: def, database: defDB}
+
+	root, database, err := s.resolveProject("")
+	if err != nil || root != def || database != defDB {
+		t.Fatalf("default: root=%q err=%v", root, err)
+	}
+
+	root, database, err = s.resolveProject(filepath.Join(other, "pkg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != other {
+		t.Fatalf("nearest other = %q want %q", root, other)
+	}
+	if database == defDB {
+		t.Fatal("should open a different DB for other project")
+	}
+	s.closeProjectCache()
+
+	// unindexed path
+	lonely := filepath.Join(base, "lonely")
+	os.MkdirAll(lonely, 0o755)
+	if _, _, err := s.resolveProject(lonely); err == nil {
+		t.Fatal("expected error for unindexed projectPath")
 	}
 }

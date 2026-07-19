@@ -21,6 +21,7 @@ type Watcher struct {
 	pending      map[string]time.Time
 	debounce     time.Duration
 	done         chan struct{}
+	stopOnce     sync.Once
 }
 
 // NewWatcher creates a new file watcher.
@@ -48,7 +49,7 @@ func (w *Watcher) Start() error {
 			return nil
 		}
 		if info.IsDir() {
-			if extraction.ShouldSkipDir(path, info.Name()) {
+			if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
 				return filepath.SkipDir
 			}
 			return w.watcher.Add(path)
@@ -63,10 +64,12 @@ func (w *Watcher) Start() error {
 	return nil
 }
 
-// Stop stops the watcher.
+// Stop stops the watcher. Safe to call multiple times.
 func (w *Watcher) Stop() {
-	close(w.done)
-	w.watcher.Close()
+	w.stopOnce.Do(func() {
+		close(w.done)
+		_ = w.watcher.Close()
+	})
 }
 
 func (w *Watcher) loop() {
@@ -88,14 +91,22 @@ func (w *Watcher) loop() {
 				continue
 			}
 
-			// Check if it's a supported file
 			path := event.Name
+
+			// New directories must be watched recursively (official watcher behavior).
+			if event.Op&fsnotify.Create != 0 {
+				if info, err := os.Stat(path); err == nil && info.IsDir() {
+					w.watchTree(path)
+					continue
+				}
+			}
+
+			// Supported source files only
 			lang := extraction.DetectLanguage(path)
 			if lang == "" || !extraction.IsSupportedLanguage(lang) {
 				continue
 			}
 
-			// Add to pending with debounce
 			w.mu.Lock()
 			w.pending[path] = time.Now()
 			w.mu.Unlock()
@@ -110,6 +121,32 @@ func (w *Watcher) loop() {
 			w.processPending()
 		}
 	}
+}
+
+// watchTree recursively adds a newly created directory tree to the watch list.
+func (w *Watcher) watchTree(root string) {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			// Queue source files that appeared with the new tree
+			lang := extraction.DetectLanguage(path)
+			if lang != "" && extraction.IsSupportedLanguage(lang) {
+				w.mu.Lock()
+				w.pending[path] = time.Now()
+				w.mu.Unlock()
+			}
+			return nil
+		}
+		if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
+			return filepath.SkipDir
+		}
+		if err := w.watcher.Add(path); err != nil {
+			log.Printf("watcher add %s: %v", path, err)
+		}
+		return nil
+	})
 }
 
 func (w *Watcher) processPending() {
@@ -135,7 +172,9 @@ func (w *Watcher) processPending() {
 			existing = append(existing, path)
 		} else {
 			// File was deleted, remove from index
-			w.orchestrator.DeleteFile(path)
+			if err := w.orchestrator.DeleteFile(path); err != nil {
+				log.Printf("delete index %s: %v", path, err)
+			}
 		}
 	}
 

@@ -9,9 +9,11 @@ import (
 type RouteNode struct {
 	Method  string // GET, POST, PUT, DELETE, etc.
 	Path    string // /api/users/:id
-	Handler string // handler function name
+	Handler string // handler function name (empty for reflective frameworks)
 	File    string
 	Line    int
+	// QualifiedName optional join key (e.g. GoFrame ::goframe-route:pkg.Type).
+	QualifiedName string
 }
 
 // FrameworkDetector detects web framework routes in source code.
@@ -62,9 +64,23 @@ var (
 	muxRouteRe2 = regexp.MustCompile(`(\w+)\.Methods\s*\(\s*"(\w+)"\s*\)\.Path\s*\(\s*"([^"]+)"\s*\)\.HandlerFunc\s*\(\s*(\w+)`)
 )
 
+// GoFrame route marker embedded in route.qualified_name for synthesizer join.
+const GoFrameRouteMarker = "::goframe-route:"
+
+var (
+	// type SignInReq struct { g.Meta `path:"/x" method:"post"` ...
+	goframeMetaRe   = regexp.MustCompile("(?s)\\btype\\s+([A-Z]\\w*)\\s+struct\\s*\\{\\s*g\\.Meta\\s+`([^`]*)`")
+	goframePathRe   = regexp.MustCompile(`\bpath:"([^"]+)"`)
+	goframeMethodRe = regexp.MustCompile(`\bmethod:"([^"]+)"`)
+	goPackageRe     = regexp.MustCompile(`(?m)^\s*package\s+(\w+)`)
+)
+
 func (d *FrameworkDetector) detectGoRoutes(source string, filePath string) []RouteNode {
 	lines := strings.Split(source, "\n")
 	var routes []RouteNode
+
+	// GoFrame reflective routes (g.Meta tags) — no static handler name.
+	routes = append(routes, d.detectGoFrameRoutes(source, filePath)...)
 
 	for i, line := range lines {
 		lineNum := i + 1
@@ -141,6 +157,47 @@ func (d *FrameworkDetector) detectGoRoutes(source string, filePath string) []Rou
 	return routes
 }
 
+// detectGoFrameRoutes finds request types with routable g.Meta tags.
+// Handler is empty; synthesizer joins on request type in QualifiedName.
+func (d *FrameworkDetector) detectGoFrameRoutes(source, filePath string) []RouteNode {
+	if !strings.Contains(source, "g.Meta") {
+		return nil
+	}
+	pkg := ""
+	if m := goPackageRe.FindStringSubmatch(source); len(m) > 1 {
+		pkg = m[1]
+	}
+	var routes []RouteNode
+	for _, match := range goframeMetaRe.FindAllStringSubmatchIndex(source, -1) {
+		if len(match) < 6 {
+			continue
+		}
+		reqType := source[match[2]:match[3]]
+		tag := source[match[4]:match[5]]
+		pm := goframePathRe.FindStringSubmatch(tag)
+		if len(pm) < 2 {
+			continue // response mime-only g.Meta
+		}
+		method := "ANY"
+		if mm := goframeMethodRe.FindStringSubmatch(tag); len(mm) > 1 {
+			method = strings.ToUpper(mm[1])
+		}
+		line := 1 + strings.Count(source[:match[0]], "\n")
+		joinKey := reqType
+		if pkg != "" {
+			joinKey = pkg + "." + reqType
+		}
+		routes = append(routes, RouteNode{
+			Method:        method,
+			Path:          pm[1],
+			File:          filePath,
+			Line:          line,
+			QualifiedName: filePath + GoFrameRouteMarker + joinKey,
+		})
+	}
+	return routes
+}
+
 // ---------- JS frameworks: Express, NestJS ----------
 
 var (
@@ -152,6 +209,16 @@ var (
 	nestjsRouteRe = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch|Options|Head|All)\s*\(\s*['"]?([^'")\s]+)['"]?\s*\)`)
 	// NestJS Controller prefix
 	nestjsControllerRe = regexp.MustCompile(`@Controller\s*\(\s*['"]([^'"]+)['"]\s*\)`)
+	// React Router v5/v6 JSX: <Route path="/x" component={Comp}/> or element={<Comp/>}
+	reactRouteTagRe = regexp.MustCompile(`<Route\b`)
+	reactRoutePathRe = regexp.MustCompile(`\bpath\s*=\s*["']([^"']+)["']`)
+	reactRouteCompRe = regexp.MustCompile(`\bcomponent\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)`)
+	reactRouteElemRe = regexp.MustCompile(`\belement\s*=\s*\{\s*<\s*([A-Z][A-Za-z0-9_]*)`)
+	// React Router data API: path: '/x', element: <Comp/> / Component: Comp
+	reactDataRouterAPIRe = regexp.MustCompile(`\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements)\b`)
+	reactDataPathRe      = regexp.MustCompile(`\bpath\s*:\s*['"]([^'"]*)['"]`)
+	reactDataElemRe      = regexp.MustCompile(`\belement\s*:\s*<\s*([A-Z][A-Za-z0-9_]*)`)
+	reactDataCompRe      = regexp.MustCompile(`\bComponent\s*:\s*([A-Z][A-Za-z0-9_]*)`)
 )
 
 func (d *FrameworkDetector) detectJSRoutes(source string, filePath string) []RouteNode {
@@ -209,6 +276,75 @@ func (d *FrameworkDetector) detectJSRoutes(source string, filePath string) []Rou
 		}
 	}
 
+	// React Router JSX + data-router objects (whole-file scan; multi-line tags).
+	routes = append(routes, detectReactRouterRoutes(source, filePath)...)
+
+	return routes
+}
+
+// detectReactRouterRoutes extracts React Router route nodes (GET-style) linked to components.
+func detectReactRouterRoutes(source, filePath string) []RouteNode {
+	var routes []RouteNode
+	// <Route …>
+	for _, idx := range reactRouteTagRe.FindAllStringIndex(source, -1) {
+		end := idx[0] + 400
+		if end > len(source) {
+			end = len(source)
+		}
+		window := source[idx[0]:end]
+		pm := reactRoutePathRe.FindStringSubmatch(window)
+		if pm == nil {
+			continue
+		}
+		handler := ""
+		if cm := reactRouteCompRe.FindStringSubmatch(window); cm != nil {
+			handler = cm[1]
+		} else if em := reactRouteElemRe.FindStringSubmatch(window); em != nil {
+			handler = em[1]
+		}
+		line := strings.Count(source[:idx[0]], "\n") + 1
+		routes = append(routes, RouteNode{
+			Method:  "GET",
+			Path:    pm[1],
+			Handler: handler,
+			File:    filePath,
+			Line:    line,
+		})
+	}
+	// createBrowserRouter([{ path, element }])
+	if reactDataRouterAPIRe.MatchString(source) {
+		for _, m := range reactDataPathRe.FindAllStringSubmatchIndex(source, -1) {
+			if len(m) < 4 {
+				continue
+			}
+			end := m[0] + 300
+			if end > len(source) {
+				end = len(source)
+			}
+			win := source[m[0]:end]
+			handler := ""
+			if em := reactDataElemRe.FindStringSubmatch(win); em != nil {
+				handler = em[1]
+			} else if cm := reactDataCompRe.FindStringSubmatch(win); cm != nil {
+				handler = cm[1]
+			}
+			if handler == "" {
+				continue // require component → real route object
+			}
+			path := source[m[2]:m[3]]
+			if path == "" {
+				path = "/"
+			}
+			line := strings.Count(source[:m[0]], "\n") + 1
+			routes = append(routes, RouteNode{
+				Method:  "GET",
+				Path:    path,
+				Handler: handler,
+				File:    filePath,
+				Line:    line,
+			})
+		}
+	}
 	return routes
 }
 

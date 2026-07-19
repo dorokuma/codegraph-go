@@ -66,7 +66,7 @@ func IsSupportedLanguage(lang string) bool {
 	switch lang {
 	case "go", "typescript", "javascript", "python", "rust", "java", "csharp",
 		"ruby", "php", "c", "cpp", "swift", "kotlin", "scala", "dart", "lua", "luau", "r",
-		"objective-c", "svelte", "vue", "astro", "liquid", "pascal":
+		"objective-c", "svelte", "vue", "astro", "liquid", "pascal", "nix", "erlang":
 		return true
 	}
 	return false

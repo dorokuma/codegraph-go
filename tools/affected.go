@@ -58,11 +58,16 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 		}
 	}
 
-	// Resolve all files to absolute paths
+	// Resolve all files to absolute paths; reject escapes outside workdir.
 	var absFiles []string
+	wd := filepath.Clean(workdir)
 	for _, f := range files {
 		if !filepath.IsAbs(f) {
-			f = filepath.Join(workdir, f)
+			f = filepath.Join(wd, f)
+		}
+		f = filepath.Clean(f)
+		if f != wd && !strings.HasPrefix(f, wd+string(filepath.Separator)) {
+			continue // skip paths outside workspace
 		}
 		absFiles = append(absFiles, f)
 	}
@@ -140,28 +145,87 @@ func findImporters(database *db.DB, targetFile string) []string {
 }
 
 // fileToPackage converts a file path to its likely package/import path.
+// For Go: walk up to go.mod and return modulePath + relative dir.
+// For JS/TS: prefer package.json "name" + relative path when present.
+// Fallback: directory basename (weak but better than empty).
 func fileToPackage(file string) string {
 	dir := filepath.Dir(file)
 
-	// Try to read go.mod for Go projects
-	gomod := filepath.Join(dir, "go.mod")
-	if _, err := os.Stat(gomod); err == nil {
-		// Read the module line from go.mod
-		f, err := os.Open(gomod)
-		if err == nil {
-			defer f.Close()
+	// --- Go: module path + rel ---
+	modDir, modPath := findGoModule(dir)
+	if modPath != "" {
+		rel, err := filepath.Rel(modDir, dir)
+		if err == nil && rel != "." && rel != "" {
+			return modPath + "/" + filepath.ToSlash(rel)
+		}
+		return modPath
+	}
+
+	// --- JS/TS: nearest package.json name ---
+	if pkgDir, pkgName := findNPMPackage(dir); pkgName != "" {
+		rel, err := filepath.Rel(pkgDir, dir)
+		if err == nil && rel != "." && rel != "" {
+			return pkgName + "/" + filepath.ToSlash(rel)
+		}
+		return pkgName
+	}
+
+	// Fallback: directory name
+	return filepath.Base(dir)
+}
+
+func findGoModule(start string) (modDir, modulePath string) {
+	cur := start
+	for i := 0; i < 24; i++ {
+		gomod := filepath.Join(cur, "go.mod")
+		if f, err := os.Open(gomod); err == nil {
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
 				if strings.HasPrefix(line, "module ") {
-					return strings.TrimSpace(strings.TrimPrefix(line, "module"))
+					mod := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+					_ = f.Close()
+					return cur, mod
+				}
+			}
+			_ = f.Close()
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return "", ""
+}
+
+func findNPMPackage(start string) (pkgDir, name string) {
+	cur := start
+	for i := 0; i < 24; i++ {
+		pj := filepath.Join(cur, "package.json")
+		data, err := os.ReadFile(pj)
+		if err == nil {
+			// tiny parse: "name": "foo"
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, `"name"`) {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						n := strings.Trim(parts[1], ` ",`)
+						if n != "" {
+							return cur, n
+						}
+					}
 				}
 			}
 		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
 	}
-
-	// For other languages, use directory name as package
-	return filepath.Base(dir)
+	return "", ""
 }
 
 // isTestFile checks if a file is a test file.

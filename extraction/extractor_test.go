@@ -101,11 +101,11 @@ func (s MyStruct) Method() {
 }
 `
 	ext := NewExtractor("go")
-	nodes, edges := ext.Extract(source, "/test.go")
+	res := ext.Extract(source, "/test.go")
 
 	// Check nodes
 	nodeNames := make(map[string]bool)
-	for _, n := range nodes {
+	for _, n := range res.Nodes {
 		nodeNames[n.Name] = true
 		if n.File != "/test.go" {
 			t.Errorf("wrong file: %s", n.File)
@@ -119,20 +119,20 @@ func (s MyStruct) Method() {
 		}
 	}
 
-	// Check edges
+	// Calls are unresolved refs (step 2), not live edges.
 	hasCall := false
-	for _, e := range edges {
-		if e.Kind == "calls" && e.SourceName == "world" && e.TargetName == "hello" {
+	for _, r := range res.Refs {
+		if r.ReferenceKind == "calls" && r.FromName == "world" && r.ReferenceName == "hello" {
 			hasCall = true
 		}
 	}
 	if !hasCall {
-		t.Error("missing edge: world -> hello")
+		t.Error("missing ref: world -> hello")
 	}
 
 	// Check import edge
 	hasImport := false
-	for _, e := range edges {
+	for _, e := range res.Edges {
 		if e.Kind == "imports" && e.TargetName == "fmt" {
 			hasImport = true
 		}
@@ -156,10 +156,10 @@ class MyComponent extends React.Component {
 }
 `
 	ext := NewExtractor("javascript")
-	nodes, edges := ext.Extract(source, "/app.js")
+	res := ext.Extract(source, "/app.js")
 
 	nodeNames := make(map[string]bool)
-	for _, n := range nodes {
+	for _, n := range res.Nodes {
 		nodeNames[n.Name] = true
 	}
 
@@ -171,7 +171,7 @@ class MyComponent extends React.Component {
 	}
 
 	hasImport := false
-	for _, e := range edges {
+	for _, e := range res.Edges {
 		if e.Kind == "imports" && e.TargetName == "react" {
 			hasImport = true
 		}
@@ -196,10 +196,10 @@ class MyClass:
         hello()
 `
 	ext := NewExtractor("python")
-	nodes, edges := ext.Extract(source, "/main.py")
+	res := ext.Extract(source, "/main.py")
 
 	nodeNames := make(map[string]bool)
-	for _, n := range nodes {
+	for _, n := range res.Nodes {
 		nodeNames[n.Name] = true
 	}
 
@@ -211,13 +211,13 @@ class MyClass:
 	}
 
 	hasCall := false
-	for _, e := range edges {
-		if e.Kind == "calls" && e.SourceName == "world" && e.TargetName == "hello" {
+	for _, r := range res.Refs {
+		if r.ReferenceKind == "calls" && r.FromName == "world" && r.ReferenceName == "hello" {
 			hasCall = true
 		}
 	}
 	if !hasCall {
-		t.Error("missing edge: world -> hello")
+		t.Error("missing ref: world -> hello")
 	}
 }
 
@@ -231,10 +231,10 @@ struct MyStruct {
 }
 `
 	ext := NewExtractor("rust")
-	nodes, _ := ext.Extract(source, "/main.rs")
+	res := ext.Extract(source, "/main.rs")
 
 	nodeNames := make(map[string]bool)
-	for _, n := range nodes {
+	for _, n := range res.Nodes {
 		nodeNames[n.Name] = true
 	}
 
@@ -346,12 +346,12 @@ func TestIsPythonKeyword(t *testing.T) {
 
 func TestExtractEmptySource(t *testing.T) {
 	ext := NewExtractor("go")
-	nodes, edges := ext.Extract("", "/empty.go")
-	if len(nodes) != 0 {
-		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	res := ext.Extract("", "/empty.go")
+	if len(res.Nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(res.Nodes))
 	}
-	if len(edges) != 0 {
-		t.Errorf("expected 0 edges, got %d", len(edges))
+	if len(res.Edges) != 0 || len(res.Refs) != 0 {
+		t.Errorf("expected 0 edges/refs, got edges=%d refs=%d", len(res.Edges), len(res.Refs))
 	}
 }
 
@@ -363,12 +363,12 @@ func TestExtractObjC(t *testing.T) {
 - (void)doWork;
 `
 	ext := NewExtractor("objective-c")
-	nodes, edges := ext.Extract(src, "/App.m")
-	if len(nodes) < 2 {
-		t.Fatalf("expected objc nodes, got %d", len(nodes))
+	res := ext.Extract(src, "/App.m")
+	if len(res.Nodes) < 2 {
+		t.Fatalf("expected objc nodes, got %d", len(res.Nodes))
 	}
-	if len(edges) < 1 {
-		t.Fatalf("expected import edge, got %d", len(edges))
+	if len(res.Edges) < 1 {
+		t.Fatalf("expected import edge, got %d", len(res.Edges))
 	}
 }
 
@@ -378,15 +378,15 @@ function hello() { return 1 }
 </script>
 <template><div></div></template>`
 	ext := NewExtractor("vue")
-	nodes, _ := ext.Extract(src, "/App.vue")
+	res := ext.Extract(src, "/App.vue")
 	found := false
-	for _, n := range nodes {
+	for _, n := range res.Nodes {
 		if n.Name == "hello" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected hello function in vue script, got %+v", nodes)
+		t.Fatalf("expected hello function in vue script, got %+v", res.Nodes)
 	}
 }
 
@@ -404,13 +404,13 @@ function Bar: Integer;
 procedure Baz;
 `
 	liq := `{% section 'header' %} {% snippet 'card' %}`
-	if n, e := NewExtractor("luau").Extract(lua, "/a.luau"); len(n) < 2 || len(e) < 1 {
-		t.Fatalf("luau nodes=%d edges=%d", len(n), len(e))
+	if r := NewExtractor("luau").Extract(lua, "/a.luau"); len(r.Nodes) < 2 || len(r.Edges) < 1 {
+		t.Fatalf("luau nodes=%d edges=%d", len(r.Nodes), len(r.Edges))
 	}
-	if n, _ := NewExtractor("pascal").Extract(pas, "/a.pas"); len(n) < 3 {
-		t.Fatalf("pascal nodes=%d", len(n))
+	if r := NewExtractor("pascal").Extract(pas, "/a.pas"); len(r.Nodes) < 3 {
+		t.Fatalf("pascal nodes=%d", len(r.Nodes))
 	}
-	if n, _ := NewExtractor("liquid").Extract(liq, "/a.liquid"); len(n) < 2 {
-		t.Fatalf("liquid nodes=%d", len(n))
+	if r := NewExtractor("liquid").Extract(liq, "/a.liquid"); len(r.Nodes) < 2 {
+		t.Fatalf("liquid nodes=%d", len(r.Nodes))
 	}
 }
