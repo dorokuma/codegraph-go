@@ -188,3 +188,31 @@ func TestResolveProjectDefaultAndNearest(t *testing.T) {
 		t.Fatal("expected error for unindexed projectPath")
 	}
 }
+
+func TestGlobMatch(t *testing.T) {
+	tests := []struct {
+		pattern string
+		path    string
+		want    bool
+	}{
+		{"*.go", "main.go", true},
+		{"*.go", "src/main.go", false},
+		{"**/*.go", "main.go", true},
+		{"**/*.go", "src/main.go", true},
+		{"**/*.go", "a/b/c.go", true},
+		{"**/*.go", "main.ts", false},
+		{"src/**/*.go", "src/main.go", true},
+		{"src/**/*.go", "src/pkg/util.go", true},
+		{"src/**/*.go", "other/main.go", false},
+		{"**/*.test.ts", "src/foo.test.ts", true},
+		{"**/*.test.ts", "foo.test.ts", true},
+		{"**/*.test.ts", "foo.ts", false},
+		{"*.go", "", false},
+	}
+	for _, tt := range tests {
+		got := globMatch(tt.pattern, tt.path)
+		if got != tt.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
+		}
+	}
+}

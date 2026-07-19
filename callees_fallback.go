@@ -16,14 +16,12 @@ import (
 
 // toolCalleesBodyFallback is the legacy rg + brace-matching path used when
 // the call graph has no edges for the symbol yet.
-func (s *server) toolCalleesBodyFallback(ctx context.Context, args nameArgs) (*mcp.CallToolResult, any, error) {
-	root, err := s.resolvePath(args.Path)
-	if err != nil {
-		return nil, nil, err
-	}
+func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args nameArgs) (*mcp.CallToolResult, any, error) {
 	// Guard against rg hanging on large trees or named pipes.
 	rgCtx, rgCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer rgCancel()
+	// Safety: QuoteMeta escapes all regex metacharacters so args.Name cannot
+	// inject arbitrary patterns into the rg -e argument.
 	quoted := regexp.QuoteMeta(args.Name)
 	defPattern := fmt.Sprintf(`(func\s+(\([^)]*\)\s*)?|def |defn |function |async function |fn |class )%s\b`, quoted)
 	rgDef := exec.CommandContext(rgCtx, "rg",

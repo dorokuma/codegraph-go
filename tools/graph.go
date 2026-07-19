@@ -790,10 +790,3 @@ func resolveDefs(database *db.DB, name, pathFilter, fileHint, glob, workdir stri
 	}
 	return defs, nil
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

@@ -71,9 +71,11 @@ func (w *WALCheckpoint) Stop() {
 }
 
 // runCheckpoint runs a passive WAL checkpoint. Logs failures but never interrupts work.
+// Uses RLock because PASSIVE checkpoint does not modify database state,
+// so it can run concurrently with normal read queries.
 func (w *WALCheckpoint) runCheckpoint() {
-	w.db.mu.Lock()
-	defer w.db.mu.Unlock()
+	w.db.mu.RLock()
+	defer w.db.mu.RUnlock()
 
 	// PASSIVE: checkpoint as much as possible without blocking readers.
 	// Returns (busy, log) — we ignore busy (readers are fine).

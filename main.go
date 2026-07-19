@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/dorokuma/codegraph-go/daemon"
 	"github.com/dorokuma/codegraph-go/db"
 	"github.com/dorokuma/codegraph-go/extraction"
@@ -335,7 +336,7 @@ func newMCPServer(s *server) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "node",
 		Description: "SECONDARY. Two modes. (1) READ A FILE — pass `file` alone (no name): on-disk source with line numbers like Read (`<n>\\t<line>`), plus which files depend on it; offset/limit like Read; symbolsOnly for a cheap map. " +
-			"(2) ONE SYMBOL — pass `name`: location, body (includeCode default true), caller/callee trail. Overloaded names return EVERY matching body in one call; pass file/line to pin one. Prefer explore for multi-symbol flows.",
+			"(2) ONE SYMBOL — pass `name`: location, body (includeCode default false; set true to include source), caller/callee trail. Overloaded names return EVERY matching body in one call; pass file/line to pin one. Prefer explore for multi-symbol flows.",
 	}, s.toolNode)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -502,6 +503,20 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+
+	// Home/broad mode: rg would search the entire home directory (go/pkg/mod,
+	// other projects, etc.). Use the DB file list instead — it only contains
+	// files that passed the indexer's home-mode filtering.
+	if extraction.IsBroadWorkdir(s.workdir) && args.ProjectPath == "" {
+		text, ferr := s.listFilesByGlob(pattern, args.Max)
+		if ferr != nil {
+			return nil, nil, ferr
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: text}},
+		}, nil, nil
+	}
+
 	fullPath := filepath.Join(root, pattern)
 	if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
 		if strings.HasSuffix(pattern, "/") {
@@ -534,15 +549,58 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	}, nil, nil
 }
 
+// listFilesByGlob returns indexed files matching pattern, using the DB.
+// Supports ** for recursive directory matching (e.g. **/*.go, src/**/*.ts).
+func (s *server) listFilesByGlob(pattern string, max int) (string, error) {
+	allFiles, err := s.database.ListFiles()
+	if err != nil {
+		return "", fmt.Errorf("list indexed files: %w", err)
+	}
+	root := s.workdir
+	var matched []string
+	for _, abs := range allFiles {
+		rel, rerr := filepath.Rel(root, abs)
+		if rerr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		if !globMatch(pattern, rel) {
+			continue
+		}
+		matched = append(matched, rel)
+		if len(matched) >= max {
+			break
+		}
+	}
+	if len(matched) == 0 {
+		return "no files matched", nil
+	}
+	return strings.Join(matched, "\n") + "\n", nil
+}
+
+// globMatch supports ** for recursive directory matching in addition to
+// the standard * and ? single-segment patterns.
+func globMatch(pattern, relPath string) bool {
+	// Normalize to forward slashes for consistent matching.
+	p := filepath.ToSlash(pattern)
+	s := filepath.ToSlash(relPath)
+	matched, _ := doublestar.Match(p, s)
+	return matched
+}
+
 type exploreArgs struct {
 	Query       string `json:"query,omitempty" jsonschema:"symbol or free-text; empty = project overview,optional"`
 	Path        string `json:"path,omitempty" jsonschema:"optional project subdirectory (home mode),optional"`
 	Max         int    `json:"max,omitempty" jsonschema:"cap on files shown (0 = size-tier default; max 100),optional"`
-	SkipCode    bool   `json:"skipCode,omitempty" jsonschema:"omit source bodies; show location + trail only,optional"`
+	SkipCode    *bool  `json:"skipCode,omitempty" jsonschema:"omit source bodies; show location + trail only,optional"`
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
 func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args exploreArgs) (*mcp.CallToolResult, any, error) {
+	// Default skipCode=true matching official CodeGraph behavior.
+	skipCode := true
+	if args.SkipCode != nil {
+		skipCode = *args.SkipCode
+	}
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Query); p != "" {
 			args.ProjectPath = p
@@ -556,7 +614,7 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 		Query:    args.Query,
 		Path:     args.Path,
 		Max:      args.Max,
-		SkipCode: args.SkipCode,
+		SkipCode: skipCode,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -608,9 +666,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 
 	// Fallback: body-parse via rg (legacy path in callees_fallback.go).
-	// Body fallback still uses session default workdir paths via s.workdir;
-	// swap temporarily is awkward — pass project via resolvePathIn in fallback.
-	return s.toolCalleesBodyFallback(ctx, args)
+	return s.toolCalleesBodyFallback(ctx, root, args)
 }
 
 func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
@@ -747,7 +803,7 @@ type nodeArgs struct {
 	Name         string `json:"name,omitempty" jsonschema:"symbol name (symbol mode). Omit and pass file alone to read a whole file like Read.,optional"`
 	File         string `json:"file,omitempty" jsonschema:"file path or basename. Alone = file-read mode; with name = disambiguate overload.,optional"`
 	Line         int    `json:"line,omitempty" jsonschema:"symbol mode: pin definition at/around this line,optional"`
-	IncludeCode  *bool  `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default true),optional"`
+	IncludeCode  *bool  `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default false; set true to include source),optional"`
 	SymbolsOnly  bool   `json:"symbolsOnly,omitempty" jsonschema:"file mode: symbol map + dependents only,optional"`
 	Offset       int    `json:"offset,omitempty" jsonschema:"file mode: 1-based start line (like Read),optional"`
 	Limit        int    `json:"limit,omitempty" jsonschema:"file mode: max lines (default whole file, cap 2000),optional"`

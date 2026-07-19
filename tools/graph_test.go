@@ -109,3 +109,126 @@ func TestToolExploreOverview(t *testing.T) {
 		t.Fatalf("unexpected overview:\n%s", text)
 	}
 }
+
+func TestResolveDefs(t *testing.T) {
+	database, dir, cleanup := seedGraph(t)
+	defer cleanup()
+
+	// Basic lookup
+	defs, err := resolveDefs(database, "foo", "", "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("expected foo defs")
+	}
+	if defs[0].Name != "foo" {
+		t.Fatalf("expected foo, got %s", defs[0].Name)
+	}
+
+	// Non-existent symbol
+	defs, err = resolveDefs(database, "nonexistent", "", "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("expected 0 defs, got %d", len(defs))
+	}
+
+	// Path filter: only files under foo.go's dir
+	defs, err = resolveDefs(database, "foo", dir, "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range defs {
+		if d.Name == "foo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("path filter should include foo, got %v", defs)
+	}
+
+	// Path filter: exclude by path
+	defs, err = resolveDefs(database, "foo", "/nonexistent", "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("path filter should exclude, got %d", len(defs))
+	}
+
+	// Glob filter
+	defs, err = resolveDefs(database, "foo", "", "", "*.go", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("glob *.go should match foo.go")
+	}
+
+	defs, err = resolveDefs(database, "foo", "", "", "*.ts", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("glob *.ts should not match, got %d", len(defs))
+	}
+
+	// File hint narrows overloaded names
+	defs, err = resolveDefs(database, "foo", "", "foo.go", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 || defs[0].Name != "foo" {
+		t.Fatalf("file hint should narrow to foo, got %v", defs)
+	}
+}
+
+func TestTrimExploreBody(t *testing.T) {
+	// Short body unchanged
+	short := "func foo() {}"
+	if got := trimExploreBody(short, 100); got != short {
+		t.Fatalf("short body should be unchanged, got %q", got)
+	}
+
+	// Empty max returns empty
+	if got := trimExploreBody(short, 0); got != "" {
+		t.Fatalf("zero max should return empty, got %q", got)
+	}
+
+	// Long body gets trimmed
+	long := strings.Repeat("x", 200)
+	got := trimExploreBody(long, 50)
+	if len(got) >= len(long) {
+		t.Fatalf("expected trim, got %d chars: %q", len(got), got)
+	}
+	if !strings.Contains(got, "trimmed") {
+		t.Fatalf("trim note missing: %q", got)
+	}
+}
+
+func TestContainerMatches(t *testing.T) {
+	database, _, cleanup := seedGraph(t)
+	defer cleanup()
+
+	// Get a node to test with
+	defs, err := database.GetNodeByName("foo")
+	if err != nil || len(defs) == 0 {
+		t.Fatal("expected foo node")
+	}
+	node := defs[0]
+
+	// Should match when name is in pool
+	segPool := map[string]bool{"foo": true}
+	if !containerMatches(node, segPool) {
+		t.Fatal("foo node should match pool with 'foo'")
+	}
+
+	// Should not match when name is not in pool
+	segPool = map[string]bool{"nonexistent": true}
+	if containerMatches(node, segPool) {
+		t.Fatal("foo node should not match pool with 'nonexistent'")
+	}
+}

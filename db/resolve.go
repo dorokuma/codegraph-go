@@ -3,6 +3,7 @@ package db
 import (
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // MaxBodyChars caps stored symbol bodies so the DB and FTS stay lean.
@@ -18,6 +19,10 @@ func TruncateBody(body string) string {
 	cut := MaxBodyChars
 	if i := strings.LastIndex(body[:cut], "\n"); i > MaxBodyChars*3/4 {
 		cut = i
+	}
+	// Ensure we don't split a multi-byte rune.
+	for cut > 0 && !utf8.RuneStart(body[cut]) {
+		cut--
 	}
 	return body[:cut] + "\n/* ... body truncated ... */"
 }
