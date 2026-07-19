@@ -119,9 +119,8 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Affected test files (%d):\n", len(testFiles)))
 	for _, f := range testFiles {
-		b.WriteString(fmt.Sprintf("- %s\n", f))
+		fmt.Fprintf(&b, "%s\n", f)
 	}
 
 	return &AffectedResult{

@@ -87,20 +87,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 		}, nil
 	}
 
-	// Multiple overloads: list or pack bodies (official: never force agent to Read).
-	header := fmt.Sprintf("**%d definitions named %q**", len(nodes), name)
-	if !includeCode {
-		var b strings.Builder
-		b.WriteString(header)
-		b.WriteString("\n\nRe-query with `includeCode: true` to get every body in one call — no need to pick one first.\n\n")
-		for _, n := range nodes {
-			fmt.Fprintf(&b, "- `%s` (%s) — %s:%d\n", n.Name, n.Kind, db.RelPath(workdir, n.File), n.Line)
-		}
-		return &NodeResult{
-			Content: []ContentItem{{Type: "text", Text: b.String()}},
-		}, nil
-	}
-
+	// Multiple overloads: pack bodies
 	var rendered []string
 	var listed []db.Node
 	used := 0
@@ -109,7 +96,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 			listed = append(listed, n)
 			continue
 		}
-		section := renderNodeSection(database, workdir, n, true)
+		section := renderNodeSection(database, workdir, n, includeCode)
 		if len(rendered) == 0 || used+len(section) <= nodeBodyBudget {
 			rendered = append(rendered, section)
 			used += len(section)
@@ -119,25 +106,9 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 	}
 
 	var b strings.Builder
-	b.WriteString(header)
-	fmt.Fprintf(&b, "\nReturning %d in full", len(rendered))
+	b.WriteString(strings.Join(rendered, "\n\n"))
 	if len(listed) > 0 {
-		fmt.Fprintf(&b, "; %d more listed below", len(listed))
-	}
-	b.WriteString(" — pick the one you need (no Read required).\n\n")
-	b.WriteString(strings.Join(rendered, "\n\n---\n\n"))
-	if len(listed) > 0 {
-		b.WriteString("\n\n**Other definitions**\n")
-		listCap := 20
-		for i, n := range listed {
-			if i >= listCap {
-				fmt.Fprintf(&b, "- … +%d more\n", len(listed)-listCap)
-				break
-			}
-			fmt.Fprintf(&b, "- `%s` (%s) — %s:%d\n", n.Name, n.Kind, db.RelPath(workdir, n.File), n.Line)
-		}
-		base := filepath.Base(listed[0].File)
-		fmt.Fprintf(&b, "\n> Need one of these in full? Call node again with `file` (e.g. %q) or `line` — do NOT Read it.\n", base)
+		fmt.Fprintf(&b, "\n... (%d more definitions)", len(listed))
 	}
 	return &NodeResult{
 		Content: []ContentItem{{Type: "text", Text: b.String()}},
@@ -228,25 +199,40 @@ func findSymbolMatches(database *db.DB, workdir, name, fileHint string, lineHint
 
 func renderNodeSection(database *db.DB, workdir string, node db.Node, includeCode bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "**%s** (%s)\n\n", node.Name, node.Kind)
-	fmt.Fprintf(&b, "**Location:** %s:%d\n", db.RelPath(workdir, node.File), node.Line)
-	if node.Language != "" {
-		fmt.Fprintf(&b, "**Language:** %s\n", node.Language)
-	}
-	if node.Signature != "" {
-		fmt.Fprintf(&b, "**Signature:** `%s`\n", strings.TrimSpace(node.Signature))
-	}
-	if node.Docstring != "" && len(node.Docstring) < 200 {
-		fmt.Fprintf(&b, "\n%s\n", node.Docstring)
-	}
+	// 精简输出：只显示位置和代码，像 Read 一样
+	fmt.Fprintf(&b, "%s:%d\n", db.RelPath(workdir, node.File), node.Line)
 
 	if includeCode && node.Body != "" {
-		lang := node.Language
 		numbered := numberSourceLines(node.Body, node.Line)
-		fmt.Fprintf(&b, "\n```%s\n%s\n```\n", lang, numbered)
+		b.WriteString(numbered)
 	}
 
-	b.WriteString(formatTrail(database, workdir, node))
+	// 精简 trail：只显示名称和位置，不显示额外格式
+	callers, _ := database.GetCallersWithKind(node.ID)
+	callees, _ := database.GetCalleesWithKind(node.ID)
+	if len(callers) > 0 || len(callees) > 0 {
+		b.WriteString("\n")
+		if len(callees) > 0 {
+			parts := make([]string, 0, min(len(callees), 6))
+			for i, c := range callees {
+				if i >= 6 {
+					break
+				}
+				parts = append(parts, fmt.Sprintf("%s:%d", c.Name, c.Line))
+			}
+			fmt.Fprintf(&b, "Calls: %s\n", strings.Join(parts, ", "))
+		}
+		if len(callers) > 0 {
+			parts := make([]string, 0, min(len(callers), 6))
+			for i, c := range callers {
+				if i >= 6 {
+					break
+				}
+				parts = append(parts, fmt.Sprintf("%s:%d", c.Name, c.Line))
+			}
+			fmt.Fprintf(&b, "Callers: %s\n", strings.Join(parts, ", "))
+		}
+	}
 	return b.String()
 }
 
@@ -364,33 +350,26 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 		}
 	}
 
-	symbolMap := func(heading string, limit int) string {
-		var b strings.Builder
-		b.WriteString(heading)
-		b.WriteByte('\n')
-		for i, n := range symbols {
-			if i >= limit {
-				fmt.Fprintf(&b, "- … +%d more\n", len(symbols)-limit)
-				break
-			}
-			sig := ""
-			if n.Signature != "" {
-				sig = " " + strings.Join(strings.Fields(n.Signature), " ")
-			}
-			fmt.Fprintf(&b, "- `%s` (%s)%s — :%d\n", n.Name, n.Kind, sig, n.Line)
-		}
-		return b.String()
-	}
-
 	if args.SymbolsOnly {
 		var b strings.Builder
-		fmt.Fprintf(&b, "**%s** — %d symbol%s, %s\n\n", rel, len(symbols), plural(len(symbols)), depSummary)
-		if len(symbols) > 0 {
-			b.WriteString(symbolMap("**Symbols**", 200))
-		} else {
-			b.WriteString("_No indexed symbols in this file._\n")
+		if len(dependents) > 0 {
+			shown := dependents
+			if len(shown) > 8 {
+				shown = shown[:8]
+			}
+			rels := make([]string, len(shown))
+			for i, d := range shown {
+				rels[i] = db.RelPath(workdir, d)
+			}
+			fmt.Fprintf(&b, "used by %d: %s\n", len(dependents), strings.Join(rels, ", "))
 		}
-		b.WriteString("\n> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.\n")
+		if len(symbols) > 0 {
+			for _, n := range symbols {
+				fmt.Fprintf(&b, "%s %s:%d\n", n.Name, db.RelPath(workdir, n.File), n.Line)
+			}
+		} else {
+			b.WriteString("(no indexed symbols)\n")
+		}
 		return b.String(), nil
 	}
 
@@ -398,23 +377,11 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 	// (including via symlink escape — resolve to real path before read).
 	abs, ok := safeReadPath(workdir, resolved)
 	if !ok {
-		var b strings.Builder
-		fmt.Fprintf(&b, "**%s** — path is outside the workspace root (or escapes via symlink); refusing to dump contents. %s\n\n", rel, depSummary)
-		if len(symbols) > 0 {
-			b.WriteString(symbolMap("**Symbols**", 200))
-		}
-		b.WriteString("\n> Use a path under the project root, or Read that file with your built-in tools if you intentionally need it.\n")
-		return b.String(), nil
+		return "(path outside workspace)\n", nil
 	}
 	content, err := os.ReadFile(abs)
 	if err != nil {
-		var b strings.Builder
-		fmt.Fprintf(&b, "**%s** — could not read from disk (it may have moved since indexing). %s\n\n", rel, depSummary)
-		if len(symbols) > 0 {
-			b.WriteString(symbolMap("**Symbols**", 200))
-		}
-		fmt.Fprintf(&b, "\n> Read `%s` directly for its current content.\n", rel)
-		return b.String(), nil
+		return "", err
 	}
 
 	fileLines := strings.Split(string(content), "\n")
@@ -431,29 +398,20 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 		maxLines = nodeFileLineDef
 	}
 
-	header := fmt.Sprintf("**%s** — %d lines, %d symbol%s · %s", rel, total, len(symbols), plural(len(symbols)), depSummary)
 	var numbered []string
-	used := len(header) + 8
 	start := offset - 1
 	i := start
 	for ; i < total && len(numbered) < maxLines; i++ {
 		ln := fmt.Sprintf("%d\t%s", i+1, fileLines[i])
-		if used+len(ln)+1 > nodeFileCharBudg && len(numbered) > 0 {
-			break
-		}
-		// UTF-8 safety for budget accounting is approximate; content itself stays intact.
 		numbered = append(numbered, ln)
-		used += len(ln) + 1
 	}
 	shownEnd := start + len(numbered)
 	complete := offset == 1 && shownEnd >= total
 
 	var b strings.Builder
-	b.WriteString(header)
-	b.WriteString("\n\n")
 	b.WriteString(strings.Join(numbered, "\n"))
 	if !complete {
-		fmt.Fprintf(&b, "\n\n(lines %d–%d of %d — pass `offset`/`limit` for another range, or `node` with a symbol name for one symbol in full)", offset, shownEnd, total)
+		fmt.Fprintf(&b, "\n... (lines %d-%d of %d)", offset, shownEnd, total)
 	}
 	return b.String(), nil
 }

@@ -283,24 +283,18 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, args nameArgs) (*m
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Functions called by %s (%d callees):\n", args.Name, len(allCalls))
 	currentFile := ""
 	for _, c := range allCalls {
 		if c.file != currentFile {
 			currentFile = c.file
-			rel, _ := filepath.Rel(s.workdir, c.file)
-			if rel == "" {
-				rel = c.file
-			}
-			fmt.Fprintf(&b, "\n%s:\n", rel)
 		}
-		fmt.Fprintf(&b, "  %5d  %s()\n", c.line, c.callee)
+		fmt.Fprintf(&b, "%s:%d\n", filepath.Base(c.file), c.line)
 	}
 	if len(allCalls) >= args.MaxResults {
-		fmt.Fprintf(&b, "\n... (max %d, truncated)", args.MaxResults)
+		fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
 	}
 
-	out := "# Callees of " + args.Name + " (body-parse fallback — index had no call edges)\n" + b.String()
+	out := b.String()
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(out, defaultOutputChars)}},
 	}, nil, nil

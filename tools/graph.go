@@ -49,7 +49,6 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Callers of %s (from index)\n", args.Name)
 	total := 0
 	anyEdge := false
 
@@ -62,27 +61,18 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 			continue
 		}
 		anyEdge = true
-		rel := db.RelPath(workdir, def.File)
-		fmt.Fprintf(&b, "\n## %s (%s) at %s:%d\n", def.Name, def.Kind, rel, def.Line)
 		for _, c := range callers {
 			if total >= args.MaxResults {
-				fmt.Fprintf(&b, "... (max %d; raise max_results)\n", args.MaxResults)
+				fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
 				return b.String(), true, nil
 			}
-			via := c.EdgeKind
-			if via == "" || via == db.EdgeCalls {
-				via = "calls"
-			}
-			fmt.Fprintf(&b, "- %s (%s) at %s:%d  [%s]\n", c.Name, c.Kind, db.RelPath(workdir, c.File), c.Line, via)
+			fmt.Fprintf(&b, "%s:%d\n", db.RelPath(workdir, c.File), c.Line)
 			total++
 		}
 	}
 
 	if !anyEdge {
 		return "", false, nil
-	}
-	if total == 0 {
-		fmt.Fprintf(&b, "\n(no callers found in index for %d definition(s))\n", len(defs))
 	}
 	return b.String(), true, nil
 }
@@ -105,7 +95,6 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Callees of %s (from index)\n", args.Name)
 	total := 0
 	anyEdge := false
 
@@ -118,24 +107,18 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 			continue
 		}
 		anyEdge = true
-		rel := db.RelPath(workdir, def.File)
-		fmt.Fprintf(&b, "\n## %s (%s) at %s:%d\n", def.Name, def.Kind, rel, def.Line)
 		seen := map[string]bool{}
 		for _, c := range callees {
-			key := fmt.Sprintf("%s|%s|%d|%s", c.Name, c.File, c.Line, c.EdgeKind)
+			key := fmt.Sprintf("%s|%s|%d", c.Name, c.File, c.Line)
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
 			if total >= args.MaxResults {
-				fmt.Fprintf(&b, "... (max %d; raise max_results)\n", args.MaxResults)
+				fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
 				return b.String(), true, nil
 			}
-			via := c.EdgeKind
-			if via == "" || via == db.EdgeCalls {
-				via = "calls"
-			}
-			fmt.Fprintf(&b, "- %s (%s) at %s:%d  [%s]\n", c.Name, c.Kind, db.RelPath(workdir, c.File), c.Line, via)
+			fmt.Fprintf(&b, "%s:%d\n", db.RelPath(workdir, c.File), c.Line)
 			total++
 		}
 	}
@@ -233,14 +216,12 @@ func ToolImpactGraph(database *db.DB, workdir string, args GraphQueryArgs) (stri
 	})
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Impact radius of %s (index, depth≤%d)\n", args.Name, depth)
-	fmt.Fprintf(&b, "Definitions: %d · Affected files: %d\n\n", len(defs), len(list))
 	for i, h := range list {
 		if i >= args.MaxResults {
-			fmt.Fprintf(&b, "... (max %d files)\n", args.MaxResults)
+			fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
 			break
 		}
-		fmt.Fprintf(&b, "- %s  (refs≈%d, hop=%d)\n", db.RelPath(workdir, h.file), h.count, h.depth)
+		fmt.Fprintf(&b, "%s\n", db.RelPath(workdir, h.file))
 	}
 	return b.String(), true, nil
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/dorokuma/codegraph-go/sync"
 	"github.com/dorokuma/codegraph-go/tools"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -309,6 +310,16 @@ func newMCPServer(s *server) *mcp.Server {
 		Description: "PRIMARY TOOL — call FIRST for almost any question or before an edit: how does X work, architecture, a bug, where/what is X, or the symbols you are about to change. " +
 			"Returns verbatim source of relevant symbols PLUS the call path among them (Flow). Query can be a natural-language question OR a bag of symbol/file names. " +
 			"Treat returned source as already Read — do NOT re-open those files. Usually the ONLY call you need.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"query":       {Type: "string", Description: "symbol or free-text; empty = overview"},
+				"path":        {Type: "string", Description: "optional project subdirectory (home mode)"},
+				"max":         {Type: "integer", Description: "cap on entries (default 30, hard max 60)"},
+				"skipCode":    {Type: "boolean", Description: "omit source code from results (default true). Set false to include implementation bodies."},
+				"projectPath": {Type: "string", Description: "absolute path to the project to query"},
+			},
+		},
 	}, s.toolExplore)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -502,9 +513,8 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		nodes, err := database.FullTextSearch(args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
-			fmt.Fprintf(&b, "# Symbol search %q (index FTS, %d hits)\n", args.Pattern, len(nodes))
 			for _, n := range nodes {
-				fmt.Fprintf(&b, "%s:%d  %s (%s)\n", db.RelPath(projRoot, n.File), n.Line, n.Name, n.Kind)
+				fmt.Fprintf(&b, "%s:%d\n", db.RelPath(projRoot, n.File), n.Line)
 			}
 			text := truncateOutput(b.String(), defaultOutputChars)
 			text = s.addStalenessWarning(text)

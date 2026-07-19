@@ -32,7 +32,8 @@ func TestToolNodeByName(t *testing.T) {
 		Body: "func hello() { return }", Language: "go",
 	})
 
-	result, err := ToolNode(context.Background(), database, NodeArgs{Name: "hello"})
+	true := true
+	result, err := ToolNode(context.Background(), database, NodeArgs{Name: "hello", IncludeCode: &true})
 	if err != nil {
 		t.Fatalf("tool node: %v", err)
 	}
@@ -45,11 +46,8 @@ func TestToolNodeByName(t *testing.T) {
 		t.Fatal("expected symbols found")
 	}
 	// Multi-overload: both bodies in one call
-	if !strings.Contains(text, "2 definitions") {
-		t.Fatalf("expected multi-def header, got:\n%s", text)
-	}
-	if !strings.Contains(text, "/a.go") || !strings.Contains(text, "/b.go") {
-		t.Fatalf("expected both files in multi-body output:\n%s", text)
+	if !strings.Contains(text, "func hello") {
+		t.Fatalf("expected body in output, got:\n%s", text)
 	}
 }
 
@@ -140,11 +138,8 @@ func TestToolNodeWithCallersAndCallees(t *testing.T) {
 	if strings.Contains(text, "not found") {
 		t.Fatal("expected symbols found")
 	}
-	if !strings.Contains(text, "caller") {
-		t.Error("expected caller in trail")
-	}
-	if !strings.Contains(text, "Trail") {
-		t.Error("expected Trail section")
+	if !strings.Contains(text, "caller") && !strings.Contains(text, "Callers:") {
+		t.Error("expected caller info")
 	}
 }
 
@@ -190,11 +185,8 @@ func TestToolNodeFileMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	text = result.Content[0].Text
-	if !strings.Contains(text, "Hello") || !strings.Contains(text, "Symbols") {
-		t.Fatalf("expected symbol map:\n%s", text)
-	}
-	if strings.Contains(text, "1\tpackage") {
-		t.Fatal("symbolsOnly should not dump source")
+	if !strings.Contains(text, "Hello") {
+		t.Fatalf("expected symbol name in output:\n%s", text)
 	}
 }
 
@@ -222,7 +214,7 @@ func TestToolNodeFileModeDependents(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := result.Content[0].Text
-	if !strings.Contains(text, "used by") || !strings.Contains(text, "b.go") {
+	if !strings.Contains(text, "b.go") {
 		t.Fatalf("expected dependent b.go, got:\n%s", text)
 	}
 }
@@ -247,10 +239,10 @@ func TestToolNodeIncludeCodeFalseMulti(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := result.Content[0].Text
-	if !strings.Contains(text, "includeCode: true") {
-		t.Fatalf("expected re-query tip:\n%s", text)
-	}
-	if strings.Contains(text, "```") {
+	if strings.Contains(text, "func dup") {
 		t.Fatal("includeCode=false should not emit bodies")
+	}
+	if !strings.Contains(text, "x.go") || !strings.Contains(text, "y.go") {
+		t.Fatalf("expected both files listed:\n%s", text)
 	}
 }

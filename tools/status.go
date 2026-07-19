@@ -33,54 +33,38 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 
 	var b strings.Builder
 
-	b.WriteString("# CodeGraph Status\n\n")
-
-	// Index stats
-	b.WriteString("## Index Statistics\n")
-	b.WriteString(fmt.Sprintf("- **Nodes:** %d\n", stats.NodeCount))
-	b.WriteString(fmt.Sprintf("- **Edges:** %d\n", stats.EdgeCount))
-	b.WriteString(fmt.Sprintf("- **Files:** %d\n", stats.FileCount))
+	b.WriteString(fmt.Sprintf("Nodes: %d · Edges: %d · Files: %d\n", stats.NodeCount, stats.EdgeCount, stats.FileCount))
 
 	if len(stats.KindCounts) > 0 {
-		b.WriteString("\n### By Kind:\n")
+		parts := make([]string, 0, len(stats.KindCounts))
 		for kind, count := range stats.KindCounts {
-			b.WriteString(fmt.Sprintf("- %s: %d\n", kind, count))
+			parts = append(parts, fmt.Sprintf("%s:%d", kind, count))
 		}
+		b.WriteString(strings.Join(parts, ", "))
+		b.WriteByte('\n')
 	}
 
-	// Database location + logic version (rebuild trigger)
-	b.WriteString("\n## Database\n")
-	b.WriteString(fmt.Sprintf("- Path: %s\n", database.Path()))
-	b.WriteString(fmt.Sprintf("- Index logic: %s\n", db.LogicVersion()))
+	b.WriteString(fmt.Sprintf("DB: %s (logic=%s)\n", database.Path(), db.LogicVersion()))
 	if need, old, err := database.NeedsRebuild(); err == nil && need {
-		b.WriteString(fmt.Sprintf("- Rebuild pending: on-disk=%s → want=%s (next start will full-reindex)\n", old, db.LogicVersion()))
+		b.WriteString(fmt.Sprintf("Rebuild pending: %s → %s\n", old, db.LogicVersion()))
 	}
 
-	// Pending sync
 	if len(pendingFiles) > 0 {
-		b.WriteString("\n### Pending sync:\n")
-		for _, f := range pendingFiles {
-			b.WriteString(fmt.Sprintf("- %s\n", f))
-		}
-	} else {
-		b.WriteString("\n### Sync Status\n")
-		b.WriteString("- No pending files\n")
+		b.WriteString(fmt.Sprintf("Pending: %d files\n", len(pendingFiles)))
 	}
 
-	// File status check
 	if args.Path != "" {
-		b.WriteString(fmt.Sprintf("\n## File: %s\n", args.Path))
 		files, _ := database.ListFiles()
 		found := false
 		for _, f := range files {
 			if f == args.Path || strings.HasSuffix(f, args.Path) {
-				b.WriteString("- Status: indexed\n")
+				b.WriteString(fmt.Sprintf("%s: indexed\n", args.Path))
 				found = true
 				break
 			}
 		}
 		if !found {
-			b.WriteString("- Status: not indexed\n")
+			b.WriteString(fmt.Sprintf("%s: not indexed\n", args.Path))
 		}
 	}
 

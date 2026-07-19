@@ -51,11 +51,11 @@ func TestToolStatusWithPendingFiles(t *testing.T) {
 	}
 
 	text := result.Content[0].Text
-	if !contains(text, "Pending sync") {
-		t.Error("expected Pending sync in output")
+	if !contains(text, "Pending") {
+		t.Error("expected Pending in output")
 	}
-	if !contains(text, "/a.go") {
-		t.Error("expected /a.go in pending list")
+	if !contains(text, "2 files") {
+		t.Error("expected 2 files in pending")
 	}
 }
 
