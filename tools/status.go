@@ -45,9 +45,9 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 		b.WriteByte('\n')
 	}
 
-	b.WriteString(fmt.Sprintf("DB: %s (logic=%s)\n", database.Path(), db.LogicVersion()))
+	b.WriteString(fmt.Sprintf("DB: %s (schema=%s)\n", database.Path(), db.SchemaRevision()))
 	if need, old, err := database.NeedsRebuild(); err == nil && need {
-		b.WriteString(fmt.Sprintf("Rebuild pending: %s → %s\n", old, db.LogicVersion()))
+		b.WriteString(fmt.Sprintf("Rebuild pending: %s → %s\n", old, db.SchemaRevision()))
 	}
 
 	if len(pendingFiles) > 0 {

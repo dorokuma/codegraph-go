@@ -340,8 +340,8 @@ func (o *Orchestrator) RebuildAll() (int, int, error) {
 	if err != nil {
 		return files, nodes, err
 	}
-	if err := o.db.SetLogicVersion(); err != nil {
-		log.Printf("set logic version: %v", err)
+	if err := o.db.SetSchemaRevision(); err != nil {
+		log.Printf("set schema revision: %v", err)
 	}
 	return files, nodes, nil
 }

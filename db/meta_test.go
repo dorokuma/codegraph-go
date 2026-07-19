@@ -17,7 +17,7 @@ func TestNeedsRebuildFresh(t *testing.T) {
 	if !need {
 		t.Fatalf("fresh db should need rebuild, old=%s", old)
 	}
-	if err := database.SetLogicVersion(); err != nil {
+	if err := database.SetSchemaRevision(); err != nil {
 		t.Fatal(err)
 	}
 	need, _, err = database.NeedsRebuild()

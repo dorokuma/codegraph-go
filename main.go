@@ -254,23 +254,23 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 
 	rebuild, oldVer, err := database.NeedsRebuild()
 	if err != nil {
-		log.Printf("logic version check: %v", err)
+		log.Printf("schema revision check: %v", err)
 	}
 	var files, nodes int
 	if rebuild {
-		log.Printf("index logic %s → %s: full rebuild...", oldVer, db.LogicVersion())
+		log.Printf("schema revision %s → %s: full rebuild...", oldVer, db.SchemaRevision())
 		files, nodes, err = orch.RebuildAll()
 	} else {
 		log.Printf("indexing project in background...")
 		files, nodes, err = orch.IndexAll()
 		if err == nil {
-			_ = database.SetLogicVersion()
+			_ = database.SetSchemaRevision()
 		}
 	}
 	if err != nil {
 		log.Printf("index warning: %v", err)
 	}
-	log.Printf("indexed %d files, %d nodes (logic=%s)", files, nodes, db.LogicVersion())
+	log.Printf("indexed %d files, %d nodes (schema=%s)", files, nodes, db.SchemaRevision())
 
 	// Optional git-status assist: catch edits missed while nothing was watching.
 	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {

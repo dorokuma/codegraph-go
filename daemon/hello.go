@@ -28,7 +28,7 @@ type ClientHello struct {
 const (
 	maxHelloLineBytes    = 4096
 	clientHelloTimeout   = 3 * time.Second
-	helloProtocolVersion = 1
+	handshakeProtocol = 1
 )
 
 // WriteHello sends the daemon hello line.
@@ -37,7 +37,7 @@ func WriteHello(w io.Writer, socketPath string) error {
 		Codegraph:  PackageVersion,
 		PID:        os.Getpid(),
 		SocketPath: socketPath,
-		Protocol:   helloProtocolVersion,
+		Protocol:   handshakeProtocol,
 	}
 	b, err := json.Marshal(h)
 	if err != nil {
@@ -57,7 +57,7 @@ func ReadHello(r *bufio.Reader) (Hello, error) {
 	if err := json.Unmarshal(line, &h); err != nil {
 		return Hello{}, fmt.Errorf("bad daemon hello: %w", err)
 	}
-	if h.Codegraph == "" || h.Protocol != helloProtocolVersion {
+	if h.Codegraph == "" || h.Protocol != handshakeProtocol {
 		return Hello{}, fmt.Errorf("unsupported daemon hello")
 	}
 	return h, nil

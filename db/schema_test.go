@@ -9,9 +9,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestLogicVersionIs15(t *testing.T) {
-	if LogicVersion() != "15" {
-		t.Fatalf("IndexLogicVersion = %q, want 15", LogicVersion())
+func TestSchemaRevisionIs15(t *testing.T) {
+	if SchemaRevision() != "15" {
+		t.Fatalf("IndexSchemaRevision = %q, want 15", SchemaRevision())
 	}
 }
 
@@ -202,7 +202,7 @@ func TestOldDBUpgradesToV7(t *testing.T) {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
-		INSERT INTO meta(key, value) VALUES('index_logic_version', '6');
+		INSERT INTO meta(key, value) VALUES('index_schema_revision', '6');
 		CREATE TABLE nodes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind TEXT NOT NULL,
@@ -303,7 +303,7 @@ func TestOldDBUpgradesToV7(t *testing.T) {
 	if err := database.WipeIndex(); err != nil {
 		t.Fatalf("wipe after upgrade: %v", err)
 	}
-	if err := database.SetLogicVersion(); err != nil {
+	if err := database.SetSchemaRevision(); err != nil {
 		t.Fatal(err)
 	}
 	need, _, err = database.NeedsRebuild()
