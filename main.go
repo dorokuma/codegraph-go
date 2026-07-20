@@ -509,7 +509,12 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	// other projects, etc.). Use the DB file list instead — it only contains
 	// files that passed the indexer's home-mode filtering.
 	if extraction.IsBroadWorkdir(s.workdir) && args.ProjectPath == "" {
-		text, ferr := s.listFilesByGlob(pattern, args.Max)
+		// Narrow pattern if a path subdirectory is specified.
+		effectivePattern := pattern
+		if args.Path != "" {
+			effectivePattern = filepath.Join(args.Path, pattern)
+		}
+		text, ferr := s.listFilesByGlob(effectivePattern, args.Max)
 		if ferr != nil {
 			return nil, nil, ferr
 		}
