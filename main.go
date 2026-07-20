@@ -485,6 +485,7 @@ func isSimpleIdent(s string) bool {
 
 type filesArgs struct {
 	Pattern     string `json:"pattern,omitempty" jsonschema:"glob pattern relative to workspace, e.g. \"src/**/*.go\",optional"`
+	Path        string `json:"path,omitempty" jsonschema:"optional subdirectory under workspace,optional"`
 	Max         int    `json:"max,omitempty"     jsonschema:"cap (default 100),optional"`
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
@@ -515,6 +516,14 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: text}},
 		}, nil, nil
+	}
+
+	// Narrow search root if a path subdirectory is specified.
+	if args.Path != "" {
+		root, err = s.resolvePathIn(root, args.Path)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	fullPath := filepath.Join(root, pattern)
