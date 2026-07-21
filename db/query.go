@@ -829,6 +829,41 @@ func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 	return files, rows.Err()
 }
 
+// ListFilesInDir returns all indexed files whose parent directory matches dir.
+func (d *DB) ListFilesInDir(dir string) ([]string, error) {
+	return d.ListFilesInDirContext(context.Background(), dir)
+}
+
+// ListFilesInDirContext is the context-aware variant of ListFilesInDir.
+func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Escape LIKE special chars in dir so _ and % are matched literally.
+	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(dir)
+	pattern := escaped + "/%"
+
+	rows, err := d.conn.QueryContext(ctx,
+		"SELECT path FROM files WHERE path LIKE ? ESCAPE '\\' ORDER BY path", pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("list files in dir scan: %w", err)
+		}
+		// Only include files directly in this directory, not subdirectories.
+		if filepath.Dir(p) == dir {
+			files = append(files, p)
+		}
+	}
+	return files, rows.Err()
+}
+
 // CountFilesUnderContext returns the number of indexed files whose path
 // is under prefix (same directory or descendant).
 func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, error) {
