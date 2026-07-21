@@ -96,11 +96,20 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			// import-closure BFS would miss them.
 			if !isTestFile(file, workdir, args.Filter) {
 				dir := filepath.Dir(file)
-				dirFiles, dirErr := database.ListFilesInDirContext(ctx, dir)
-				if dirErr == nil {
-					for _, df := range dirFiles {
-						if df != file && isTestFile(df, workdir, args.Filter) && !affected[df] {
-							affected[df] = true
+				// dir is absolute (absFiles are workdir-absolute); convert
+				// to workdir-relative because the files table stores paths
+				// relative to workdir, and ListFilesInDir uses LIKE matching.
+				relDir, relErr := filepath.Rel(workdir, dir)
+				if relErr == nil {
+					dirFiles, dirErr := database.ListFilesInDirContext(ctx, relDir)
+					if dirErr == nil {
+						for _, df := range dirFiles {
+							// df is relative; join back to absolute to match
+							// the internal absFiles format.
+							absDf := filepath.Join(workdir, df)
+							if absDf != file && isTestFile(absDf, workdir, args.Filter) && !affected[absDf] {
+								affected[absDf] = true
+							}
 						}
 					}
 				}
