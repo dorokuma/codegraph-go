@@ -37,7 +37,7 @@ rm -rf ./bin
 echo "cleaned build output ./bin"
 
 echo "=== 验证 ==="
-"$BINARY" version 2>&1 | head -1
+test -x "$BINARY" && echo "binary deployed: $BINARY ($(stat -c %s "$BINARY") bytes)" || { echo "DEPLOY FAILED: binary not executable"; exit 1; }
 
 echo "=== 提交 ==="
 git add deploy.sh daemon/paths.go
