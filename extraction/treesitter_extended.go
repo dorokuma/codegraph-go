@@ -265,8 +265,12 @@ func (e *TreeSitterExtractor) processCLikeImport(node *sitter.Node, source []byt
 }
 
 func (e *TreeSitterExtractor) findCLikeCalls(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
-	if node.Type() == "function_definition" || node.Type() == "method_declaration" ||
-		node.Type() == "function_declaration" || node.Type() == "lambda_expression" {
+	if node.Type() == "function_declaration" || node.Type() == "method_declaration" || node.Type() == "lambda_expression" {
+		return
+	}
+	// Named function_definition (has its own node via walkLua/extractCLike) gets its
+	// own call extraction; only traverse anonymous function_definition bodies (e.g. Lua callbacks).
+	if node.Type() == "function_definition" && node.ChildByFieldName("name") != nil {
 		return
 	}
 

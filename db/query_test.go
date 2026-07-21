@@ -396,6 +396,31 @@ func TestFindImporters(t *testing.T) {
 	if len(importers) != 2 {
 		t.Fatalf("expected 2 importers, got %d", len(importers))
 	}
+
+	// M-12: underscore in package name must not be treated as LIKE wildcard.
+	modU, _ := database.UpsertNode(&Node{Kind: "module", Name: "github.com/test/pkg_util", File: "github.com/test/pkg_util", Line: 0})
+	subPkg, _ := database.UpsertNode(&Node{Kind: "module", Name: "github.com/test/pkg_util/sub", File: "github.com/test/pkg_util/sub", Line: 0})
+	fileC, _ := database.UpsertNode(&Node{Kind: KindFile, Name: "/c.go", File: "/c.go", Line: 0})
+	database.UpsertEdge(&Edge{SourceID: fileC, TargetID: modU, Kind: EdgeImports, File: "/c.go", Line: 1})
+	database.UpsertEdge(&Edge{SourceID: fileC, TargetID: subPkg, Kind: EdgeImports, File: "/c.go", Line: 2})
+	// Also create a distractor package that differs by one char (would match if _ were wildcard)
+	modX, _ := database.UpsertNode(&Node{Kind: "module", Name: "github.com/test/pkgXutil", File: "github.com/test/pkgXutil", Line: 0})
+	fileD, _ := database.UpsertNode(&Node{Kind: KindFile, Name: "/d.go", File: "/d.go", Line: 0})
+	database.UpsertEdge(&Edge{SourceID: fileD, TargetID: modX, Kind: EdgeImports, File: "/d.go", Line: 1})
+
+	importers2, err := database.FindImporters("github.com/test/pkg_util")
+	if err != nil {
+		t.Fatalf("find underscore pkg: %v", err)
+	}
+	if len(importers2) != 1 {
+		t.Fatalf("expected 1 importer (c.go via DISTINCT), got %d: %v", len(importers2), importers2)
+	}
+	// Verify /d.go (pkgXutil) is NOT included — _ escaped, not LIKE wildcard.
+	for _, f := range importers2 {
+		if f == "/d.go" {
+			t.Fatalf("pkgXutil incorrectly matched as importer of pkg_util — LIKE _ escape failed")
+		}
+	}
 }
 
 func TestNodeKinds(t *testing.T) {
@@ -437,6 +462,14 @@ func TestFullTextSearch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
+	// S-19: snake_case names with underscores must be findable via FTS
+	// (tokenize tokenchars='_' prevents splitting on underscore).
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "foo_bar", File: "/snake.go", Line: 1,
+		Body: "func foo_bar() {}", Language: "go",
+	}); err != nil {
+		t.Fatalf("upsert foo_bar: %v", err)
+	}
 
 	nodes, err := database.FullTextSearch("UserService", 10)
 	if err != nil {
@@ -452,6 +485,15 @@ func TestFullTextSearch(t *testing.T) {
 	// default limit path
 	if _, err := database.FullTextSearch("AuthHelper", 0); err != nil {
 		t.Fatalf("fts default limit: %v", err)
+	}
+
+	// S-19: verify snake_case name is not split on underscore
+	nodes, err = database.FullTextSearch("foo_bar", 10)
+	if err != nil {
+		t.Fatalf("fts foo_bar: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "foo_bar" {
+		t.Fatalf("expected foo_bar via FTS, got %d nodes", len(nodes))
 	}
 }
 

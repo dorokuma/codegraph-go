@@ -33,7 +33,7 @@ type ExploreArgs struct {
 
 // ToolCallersGraph finds call sites via the indexed call graph.
 // Returns (text, found). found=false means the index has no edges — caller may fall back to rg.
-func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
+func ToolCallersGraph(ctx context.Context, database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
@@ -41,7 +41,7 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 		args.MaxResults = 40
 	}
 
-	defs, err := resolveDefs(database, args.Name, args.Path, args.File, args.Glob, workdir)
+	defs, err := resolveDefs(ctx, database, args.Name, args.Path, args.File, args.Glob, workdir)
 	if err != nil {
 		return "", false, err
 	}
@@ -55,7 +55,7 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 
 	seen := map[string]bool{}
 	for _, def := range defs {
-		callers, err := database.GetCallersWithKind(def.ID)
+		callers, err := database.GetCallersWithKindContext(ctx, def.ID)
 		if err != nil {
 			return "", false, err
 		}
@@ -85,7 +85,7 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 }
 
 // ToolCalleesGraph lists what a symbol calls via the indexed call graph.
-func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
+func ToolCalleesGraph(ctx context.Context, database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
@@ -93,7 +93,7 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 		args.MaxResults = 40
 	}
 
-	defs, err := resolveDefs(database, args.Name, args.Path, args.File, args.Glob, workdir)
+	defs, err := resolveDefs(ctx, database, args.Name, args.Path, args.File, args.Glob, workdir)
 	if err != nil {
 		return "", false, err
 	}
@@ -107,7 +107,7 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 	seen := map[string]bool{}
 
 	for _, def := range defs {
-		callees, err := database.GetCalleesWithKind(def.ID)
+		callees, err := database.GetCalleesWithKindContext(ctx, def.ID)
 		if err != nil {
 			return "", false, err
 		}
@@ -137,7 +137,7 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 }
 
 // ToolImpactGraph returns files affected by changing a symbol (via call/import edges).
-func ToolImpactGraph(database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
+func ToolImpactGraph(ctx context.Context, database *db.DB, workdir string, args GraphQueryArgs) (string, bool, error) {
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
@@ -152,7 +152,7 @@ func ToolImpactGraph(database *db.DB, workdir string, args GraphQueryArgs) (stri
 		depth = 5
 	}
 
-	defs, err := resolveDefs(database, args.Name, args.Path, args.File, args.Glob, workdir)
+	defs, err := resolveDefs(ctx, database, args.Name, args.Path, args.File, args.Glob, workdir)
 	if err != nil {
 		return "", false, err
 	}
@@ -186,7 +186,7 @@ func ToolImpactGraph(database *db.DB, workdir string, args GraphQueryArgs) (stri
 		if cur.d >= depth {
 			continue
 		}
-		callers, err := database.GetCallers(cur.id)
+		callers, err := database.GetCallersWithKindContext(ctx, cur.id)
 		if err != nil {
 			return "", false, err
 		}
@@ -510,49 +510,57 @@ func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query str
 			var nb strings.Builder
 			fmt.Fprintf(&nb, "\n### %s (%s) L%d\n", n.Name, n.Kind, n.Line)
 
-			if callers, err := database.GetCallersWithKindContext(ctx, n.ID); err == nil && len(callers) > 0 {
-				nb.WriteString("Callers: ")
-				parts := make([]string, 0, min(maxEdges, len(callers)))
-				for i, c := range callers {
-					if i >= maxEdges {
-						parts = append(parts, "…")
-						break
+			if callers, err := database.GetCallersWithKindContext(ctx, n.ID); err == nil {
+				if len(callers) > 0 {
+					nb.WriteString("Callers: ")
+					parts := make([]string, 0, min(maxEdges, len(callers)))
+					for i, c := range callers {
+						if i >= maxEdges {
+							parts = append(parts, "…")
+							break
+						}
+						label := fmt.Sprintf("%s@%s:%d", c.Name, filepath.Base(c.File), c.Line)
+						if c.EdgeKind == db.EdgeReferences {
+							label += "(route)"
+						} else if c.EdgeKind == "bridge" {
+							label += "(bridge)"
+						}
+						parts = append(parts, label)
 					}
-					label := fmt.Sprintf("%s@%s:%d", c.Name, filepath.Base(c.File), c.Line)
-					if c.EdgeKind == db.EdgeReferences {
-						label += "(route)"
-					} else if c.EdgeKind == "bridge" {
-						label += "(bridge)"
-					}
-					parts = append(parts, label)
+					nb.WriteString(strings.Join(parts, ", "))
+					nb.WriteByte('\n')
 				}
-				nb.WriteString(strings.Join(parts, ", "))
-				nb.WriteByte('\n')
+			} else {
+				nb.WriteString("(callers fetch failed)\n")
 			}
-			if callees, err := database.GetCalleesWithKindContext(ctx, n.ID); err == nil && len(callees) > 0 {
-				nb.WriteString("Calls: ")
-				parts := make([]string, 0, min(maxEdges, len(callees)))
-				seen := map[string]bool{}
-				for _, c := range callees {
-					key := c.Name + c.EdgeKind
-					if seen[key] {
-						continue
+			if callees, err := database.GetCalleesWithKindContext(ctx, n.ID); err == nil {
+				if len(callees) > 0 {
+					nb.WriteString("Calls: ")
+					parts := make([]string, 0, min(maxEdges, len(callees)))
+					seen := map[string]bool{}
+					for _, c := range callees {
+						key := c.Name + c.EdgeKind
+						if seen[key] {
+							continue
+						}
+						seen[key] = true
+						if len(parts) >= maxEdges {
+							parts = append(parts, "…")
+							break
+						}
+						label := c.Name
+						if c.EdgeKind == db.EdgeReferences {
+							label += "(handler)"
+						} else if c.EdgeKind == "bridge" {
+							label += "(bridge)"
+						}
+						parts = append(parts, label)
 					}
-					seen[key] = true
-					if len(parts) >= maxEdges {
-						parts = append(parts, "…")
-						break
-					}
-					label := c.Name
-					if c.EdgeKind == db.EdgeReferences {
-						label += "(handler)"
-					} else if c.EdgeKind == "bridge" {
-						label += "(bridge)"
-					}
-					parts = append(parts, label)
+					nb.WriteString(strings.Join(parts, ", "))
+					nb.WriteByte('\n')
 				}
-				nb.WriteString(strings.Join(parts, ", "))
-				nb.WriteByte('\n')
+			} else {
+				nb.WriteString("(callees fetch failed)\n")
 			}
 
 			body := n.Body
@@ -738,14 +746,14 @@ func trimExploreBody(body string, maxChars int) string {
 	return safeUTF8Truncate(body, cut) + "\n… (trimmed to explore budget)"
 }
 
-func resolveDefs(database *db.DB, name, pathFilter, fileHint, glob, workdir string) ([]db.Node, error) {
-	nodes, err := database.GetNodeByName(name)
+func resolveDefs(ctx context.Context, database *db.DB, name, pathFilter, fileHint, glob, workdir string) ([]db.Node, error) {
+	nodes, err := database.GetNodeByNameContext(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 	if len(nodes) == 0 {
 		// FTS fallback for partial names
-		nodes, err = database.FullTextSearch(name, 20)
+		nodes, err = database.FullTextSearchContext(ctx, name, 20)
 		if err != nil {
 			return nil, err
 		}

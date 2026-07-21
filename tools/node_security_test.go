@@ -141,7 +141,7 @@ func TestNodeSecurity_GraphFileHintSuffix(t *testing.T) {
 	id4, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Baz", File: ot, Line: 2})
 	database.UpsertEdge(&db.Edge{SourceID: id4, TargetID: id2, Kind: db.EdgeCalls, File: ot, Line: 2})
 
-	text, ok, err := ToolCallersGraph(database, dir, GraphQueryArgs{Name: "Foo", File: "a.go", MaxResults: 10})
+	text, ok, err := ToolCallersGraph(context.Background(), database, dir, GraphQueryArgs{Name: "Foo", File: "a.go", MaxResults: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

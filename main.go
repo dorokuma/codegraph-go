@@ -277,6 +277,7 @@ func openServerState(workdir string, noSync bool) (*server, func()) {
 		}
 		s.closeProjectCache()
 		_ = database.Close()
+		closeSafeLog()
 	}
 	return s, cleanup
 }
@@ -465,7 +466,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	// Official CodeGraph search is symbol-first. For a plain identifier with no
 	// path/glob/regex metacharacters, hit FTS before spawning rg.
 	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && isSimpleIdent(args.Pattern) {
-		nodes, err := database.FullTextSearch(args.Pattern, args.MaxResults)
+		nodes, err := database.FullTextSearchContext(ctx, args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
 			for _, n := range nodes {
@@ -507,7 +508,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
 			msg := "no matches"
 			if args.Path != "" {
-				indexed, cerr := countIndexedUnder(database, projRoot, root)
+				indexed, cerr := countIndexedUnder(ctx, database, projRoot, root)
 				if cerr == nil && indexed == 0 {
 					msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
 				}
@@ -524,7 +525,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// and include a hint so the agent knows to use built-in tools.
 		msg := "no matches"
 		if args.Path != "" {
-			indexed, cerr := countIndexedUnder(database, projRoot, root)
+			indexed, cerr := countIndexedUnder(ctx, database, projRoot, root)
 			if cerr == nil && indexed == 0 {
 				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
 			}
@@ -751,7 +752,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	defer s.releaseProject(root)
 
 	// Graph-first (official CodeGraph path).
-	if text, ok, err := tools.ToolCalleesGraph(database, root, tools.GraphQueryArgs{
+	if text, ok, err := tools.ToolCalleesGraph(ctx, database, root, tools.GraphQueryArgs{
 		Name: args.Name, Path: args.Path, File: args.File, Glob: args.Glob, MaxResults: args.MaxResults,
 	}); err != nil {
 		return nil, nil, err
@@ -786,7 +787,7 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	defer s.releaseProject(root)
 
 	// Graph-first (official CodeGraph path).
-	if text, ok, err := tools.ToolCallersGraph(database, root, tools.GraphQueryArgs{
+	if text, ok, err := tools.ToolCallersGraph(ctx, database, root, tools.GraphQueryArgs{
 		Name: args.Name, Path: args.Path, File: args.File, Glob: args.Glob, MaxResults: args.MaxResults,
 	}); err != nil {
 		return nil, nil, err
@@ -873,7 +874,7 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	defer s.releaseProject(projRoot)
 
 	// Graph BFS first (official getImpactRadius).
-	if text, ok, err := tools.ToolImpactGraph(database, projRoot, tools.GraphQueryArgs{
+	if text, ok, err := tools.ToolImpactGraph(ctx, database, projRoot, tools.GraphQueryArgs{
 		Name: args.Name, Path: args.Path, File: args.File, Glob: args.Glob, MaxResults: args.MaxResults, Depth: 2,
 	}); err != nil {
 		return nil, nil, err
@@ -1023,6 +1024,8 @@ func (s *server) resolvePath(p string) (string, error) {
 }
 
 // resolvePathIn joins p under root and rejects escapes outside root.
+// When workdir is "/" the entire filesystem is the workspace — this is
+// intentional for full-disk indexing scenarios and is not a sandbox escape.
 func (s *server) resolvePathIn(root, p string) (string, error) {
 	if p == "" {
 		return root, nil
@@ -1176,6 +1179,15 @@ func (s *server) detectProject(queries ...string) string {
 	return ""
 }
 
+// resetDetect clears the detect cache so the next detectProject call rescans
+// workdir. Used when a projectPath lookup fails, indicating the cache may be stale.
+func (s *server) resetDetect() {
+	s.detectMu.Lock()
+	s.detectDone = false
+	s.detectDirs = nil
+	s.detectMu.Unlock()
+}
+
 func (s *server) resolveProject(projectPath string) (root string, database *db.DB, err error) {
 	if strings.TrimSpace(projectPath) == "" {
 		return s.workdir, s.database, nil
@@ -1186,6 +1198,8 @@ func (s *server) resolveProject(projectPath string) (root string, database *db.D
 	}
 	resolved := db.FindNearestCodeGraphRoot(abs)
 	if resolved == "" {
+		// Cache may be stale — allow detectProject to rescan on next call.
+		s.resetDetect()
 		return "", nil, fmt.Errorf(
 			"no .codegraph index found walking up from %s; pass a path inside an indexed project, or omit projectPath to use the session default",
 			abs,
@@ -1272,15 +1286,21 @@ func (s *server) releaseProject(root string) {
 }
 
 // closeProjectCache closes all cached cross-project DBs and pending-close
-// entries at shutdown.
+// entries at shutdown. Entries still in use (refs>0) are left for OS cleanup.
 func (s *server) closeProjectCache() {
 	s.projectMu.Lock()
 	defer s.projectMu.Unlock()
 	for root, e := range s.projectCache {
+		if atomic.LoadInt32(&e.refs) > 0 {
+			continue
+		}
 		_ = e.db.Close()
 		delete(s.projectCache, root)
 	}
 	for root, e := range s.projectPendingClose {
+		if atomic.LoadInt32(&e.refs) > 0 {
+			continue
+		}
 		_ = e.db.Close()
 		delete(s.projectPendingClose, root)
 	}
@@ -1320,21 +1340,8 @@ func relativizeRgOutput(out string, projRoot string) string {
 }
 
 // countIndexedUnder returns the number of indexed files whose path is under the given root.
-func countIndexedUnder(database *db.DB, projRoot, searchRoot string) (int, error) {
-	allFiles, err := database.ListFiles()
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	// Normalize searchRoot to avoid "//" issues.
-	cleanRoot := strings.TrimSuffix(searchRoot, string(filepath.Separator))
-	for _, abs := range allFiles {
-		// Match files that live under searchRoot (same dir or descendant).
-		if abs == cleanRoot || strings.HasPrefix(abs, cleanRoot+string(filepath.Separator)) {
-			count++
-		}
-	}
-	return count, nil
+func countIndexedUnder(ctx context.Context, database *db.DB, projRoot, searchRoot string) (int, error) {
+	return database.CountFilesUnderContext(ctx, searchRoot)
 }
 
 func readLines(path string) ([]string, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -644,7 +645,7 @@ func (d *DB) GetImpact(nodeID int64) (map[string]int, error) {
 		}
 		result[file] = cnt
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // FileNeedsReindex checks if a file needs reindexing based on size and mtime.
@@ -828,6 +829,22 @@ func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 	return files, rows.Err()
 }
 
+// CountFilesUnderContext returns the number of indexed files whose path
+// is under prefix (same directory or descendant).
+func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var count int
+	err := d.conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM files WHERE path = ? OR path LIKE ?",
+		prefix, prefix+string(filepath.Separator)+"%").Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count files under: %w", err)
+	}
+	return count, nil
+}
+
 // GetFileDependents returns distinct other files that have a structural edge
 // into a symbol defined in filePath (who depends on this file).
 func (d *DB) GetFileDependents(filePath string) ([]string, error) {
@@ -857,7 +874,10 @@ func (d *DB) GetFileDependentsContext(ctx context.Context, filePath string) ([]s
 	var files []string
 	for rows.Next() {
 		var f string
-		if err := rows.Scan(&f); err == nil && f != "" {
+		if err := rows.Scan(&f); err != nil {
+			return nil, fmt.Errorf("GetFileDependentsContext scan: %w", err)
+		}
+		if f != "" {
 			files = append(files, f)
 		}
 	}
@@ -887,9 +907,10 @@ func (d *DB) GetImportTargetNames(filePath string) ([]string, error) {
 	var names []string
 	for rows.Next() {
 		var name string
-		if err := rows.Scan(&name); err == nil {
-			names = append(names, name)
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("GetImportTargetNames scan: %w", err)
 		}
+		names = append(names, name)
 	}
 	return names, rows.Err()
 }

@@ -13,7 +13,7 @@ import (
 // or non-repo roots yield nil. Used after cold index so edits made while no
 // watcher was running still get picked up (no git hooks installed).
 func GitDirtySourceFiles(workdir string) []string {
-	cmd := exec.Command("git", "-C", workdir, "status", "--porcelain", "--untracked-files=no")
+	cmd := exec.Command("git", "-c", "core.quotePath=false", "-C", workdir, "status", "--porcelain", "--untracked-files=no")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
@@ -30,6 +30,7 @@ func GitDirtySourceFiles(workdir string) []string {
 			pathPart = pathPart[i+4:]
 		}
 		pathPart = strings.Trim(pathPart, "\"")
+		pathPart = strings.ReplaceAll(pathPart, "\\\"", "\"")
 		if pathPart == "" {
 			continue
 		}

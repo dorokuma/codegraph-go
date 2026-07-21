@@ -163,6 +163,7 @@ func (d *Daemon) Stop(reason string) {
 
 func (d *Daemon) acceptLoop() {
 	defer d.wg.Done()
+	var permErrs int
 	for {
 		conn, err := d.listener.Accept()
 		if err != nil {
@@ -172,13 +173,26 @@ func (d *Daemon) acceptLoop() {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				// Temporary accept errors: keep going.
 				log.Printf("daemon accept (temporary): %v", err)
+				permErrs = 0
 				continue
 			}
-			// Permanent error — back off briefly
-			log.Printf("daemon accept (permanent): %v", err)
-			time.Sleep(100 * time.Millisecond)
+			// Permanent error — back off with a cap and count.
+			permErrs++
+			log.Printf("daemon accept (permanent #%d): %v", permErrs, err)
+			if permErrs >= 5 {
+				log.Printf("daemon accept: %d consecutive permanent errors, shutting down", permErrs)
+				d.Stop("accept-permanent-failures")
+				return
+			}
+			// Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1s cap.
+			sleep := 100 * time.Millisecond
+			for i := 1; i < permErrs && sleep < time.Second; i++ {
+				sleep *= 2
+			}
+			time.Sleep(sleep)
 			continue
 		}
+		permErrs = 0
 		d.wg.Add(1)
 		go d.serveConn(conn)
 	}

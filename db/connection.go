@@ -33,6 +33,11 @@ func Open(workdir string) (*DB, error) {
 	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
 	// not just the first one in the pool (database/sql may open new connections
 	// concurrently, and default is foreign_keys=OFF / busy_timeout=0).
+	// Guard against paths containing '?' which would be misinterpreted as the
+	// start of the query component in a file:// URI.
+	if strings.Contains(dbPath, "?") {
+		return nil, fmt.Errorf("db path contains '?' which conflicts with DSN query separator: %s", dbPath)
+	}
 	dsn := "file://" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {

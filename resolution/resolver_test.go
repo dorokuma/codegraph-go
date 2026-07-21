@@ -142,3 +142,78 @@ func copyTree(t *testing.T, src, dst string) {
 		t.Fatal(err)
 	}
 }
+
+// TestProvHeuristicReject verifies M-8: same-package cross-file calls resolve
+// via ProvProximity, while cross-package calls without import closure are rejected.
+func TestProvHeuristicReject(t *testing.T) {
+	// Part 1: Same-package cross-file resolution (ProvProximity).
+	dir1 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir1, "main.go"), []byte(`package p
+func Caller() string { return Helper() }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir1, "helper.go"), []byte(`package p
+func Helper() string { return "ok" }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db1 := indexDir(t, dir1)
+	assertGraphCall(t, db1, "Caller", "Helper")
+
+	// Part 2: Cross-package call without import closure should NOT resolve.
+	// Place the caller in a subdirectory so sibling-directory heuristic doesn't fire.
+	dir2 := t.TempDir()
+	callerDir := filepath.Join(dir2, "caller")
+	if err := os.MkdirAll(callerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(callerDir, "root.go"), []byte(`package root
+func RootCaller() string { return pkg.Foo() }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgDir := filepath.Join(dir2, "lib", "pkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "pkg.go"), []byte(`package pkg
+func Foo() string { return "ok" }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db2 := indexDir(t, dir2)
+	// RootCaller -> Foo: cross-package, no go.mod, should NOT resolve.
+	callers, err := db2.GetNodeByName("RootCaller")
+	if err != nil || len(callers) == 0 {
+		t.Fatalf("RootCaller missing: %v", err)
+	}
+	callees, err := db2.GetCalleesWithKind(callers[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range callees {
+		if c.Name == "Foo" && c.EdgeKind == db.EdgeCalls {
+			t.Fatal("RootCaller -> Foo should NOT resolve cross-package without import closure")
+		}
+	}
+
+	// Part 3: Same-package cross-file in a subdirectory also works.
+	dir3 := t.TempDir()
+	sub := filepath.Join(dir3, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "a.go"), []byte(`package sub
+func Alpha() string { return Beta() }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "b.go"), []byte(`package sub
+func Beta() string { return "ok" }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db3 := indexDir(t, dir3)
+	assertGraphCall(t, db3, "Alpha", "Beta")
+}

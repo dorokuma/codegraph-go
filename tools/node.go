@@ -259,7 +259,10 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 	if depErr != nil {
 		dependents = nil
 	}
-	depSummary := "no other indexed file depends on it"
+	depSummary := "(dependents fetch failed)"
+	if depErr == nil {
+		depSummary = "no other indexed file depends on it"
+	}
 	if len(dependents) > 0 {
 		shown := dependents
 		if len(shown) > 8 {
@@ -277,7 +280,9 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 
 	if args.SymbolsOnly {
 		var b strings.Builder
-		if len(dependents) > 0 {
+		if depErr != nil {
+			b.WriteString("(dependents fetch failed)\n")
+		} else if len(dependents) > 0 {
 			shown := dependents
 			if len(shown) > 8 {
 				shown = shown[:8]
