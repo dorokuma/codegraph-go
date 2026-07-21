@@ -21,6 +21,8 @@ rm -f /root/.codegraph/daemon.pid /root/.codegraph/daemon.sock 2>/dev/null
 echo "=== 替换二进制 ==="
 install -m 755 ./bin/codegraph-go "$BINARY"
 echo "DEPLOYED → $BINARY"
+rm -rf ./bin
+echo "cleaned build output ./bin"
 
 echo "=== 验证 ==="
 "$BINARY" version 2>&1 | head -1
