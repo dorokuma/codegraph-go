@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/dorokuma/codegraph-go/db"
 	"github.com/dorokuma/codegraph-go/extraction"
@@ -52,6 +53,7 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 	total := 0
 	anyEdge := false
 
+	seen := map[string]bool{}
 	for _, def := range defs {
 		callers, err := database.GetCallersWithKind(def.ID)
 		if err != nil {
@@ -62,6 +64,11 @@ func ToolCallersGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 		}
 		anyEdge = true
 		for _, c := range callers {
+			key := fmt.Sprintf("%s|%s|%d", c.Name, c.File, c.Line)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			if total >= args.MaxResults {
 				fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
 				return b.String(), true, nil
@@ -97,6 +104,7 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 	var b strings.Builder
 	total := 0
 	anyEdge := false
+	seen := map[string]bool{}
 
 	for _, def := range defs {
 		callees, err := database.GetCalleesWithKind(def.ID)
@@ -107,7 +115,6 @@ func ToolCalleesGraph(database *db.DB, workdir string, args GraphQueryArgs) (str
 			continue
 		}
 		anyEdge = true
-		seen := map[string]bool{}
 		for _, c := range callees {
 			key := fmt.Sprintf("%s|%s|%d", c.Name, c.File, c.Line)
 			if seen[key] {
@@ -228,9 +235,8 @@ func ToolImpactGraph(database *db.DB, workdir string, args GraphQueryArgs) (stri
 
 // ToolExplore builds an overview or a symbol-centered context pack (official primary tool).
 // With a multi-symbol query it surfaces Flow (call path) first, then source under a size budget.
+// DB reads now accept context via Context variants; cancellation is supported.
 func ToolExplore(ctx context.Context, database *db.DB, workdir string, args ExploreArgs) (string, error) {
-	_ = ctx
-
 	root := workdir
 	if args.Path != "" {
 		p := args.Path
@@ -249,12 +255,12 @@ func ToolExplore(ctx context.Context, database *db.DB, workdir string, args Expl
 		if max <= 0 {
 			max = 30
 		}
-		return exploreOverview(database, workdir, root, max)
+		return exploreOverview(ctx, database, workdir, root, max)
 	}
-	return exploreQuery(database, workdir, root, query, args.Max, args.SkipCode)
+	return exploreQuery(ctx, database, workdir, root, query, args.Max, args.SkipCode)
 }
 
-func exploreOverview(database *db.DB, workdir, root string, max int) (string, error) {
+func exploreOverview(ctx context.Context, database *db.DB, workdir, root string, max int) (string, error) {
 	var b strings.Builder
 
 	// Home / broad workdir: list indexed project-like top-level dirs.
@@ -289,7 +295,7 @@ func exploreOverview(database *db.DB, workdir, root string, max int) (string, er
 		}
 		b.WriteString("\nTip: pass path=<project> or query=<symbol> for a focused explore.\n")
 
-		if stats, err := database.GetStats(); err == nil && stats != nil {
+		if stats, err := database.GetStatsContext(ctx); err == nil && stats != nil {
 			fmt.Fprintf(&b, "\n## Index\n- nodes: %d · edges: %d · files: %d\n", stats.NodeCount, stats.EdgeCount, stats.FileCount)
 		}
 		return b.String(), nil
@@ -336,7 +342,7 @@ func exploreOverview(database *db.DB, workdir, root string, max int) (string, er
 	}
 
 	// Sample of indexed symbols in this subtree
-	if files, err := database.ListFiles(); err == nil {
+	if files, err := database.ListFilesContext(ctx); err == nil {
 		prefix := root
 		if !strings.HasSuffix(prefix, string(filepath.Separator)) {
 			prefix += string(filepath.Separator)
@@ -354,9 +360,9 @@ func exploreOverview(database *db.DB, workdir, root string, max int) (string, er
 	return b.String(), nil
 }
 
-func exploreQuery(database *db.DB, workdir, root, query string, max int, skipCode bool) (string, error) {
+func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query string, max int, skipCode bool) (string, error) {
 	fileCount := 0
-	if stats, err := database.GetStats(); err == nil && stats != nil {
+	if stats, err := database.GetStatsContext(ctx); err == nil && stats != nil {
 		fileCount = stats.FileCount
 	}
 	budget := GetExploreOutputBudget(fileCount)
@@ -375,10 +381,10 @@ func exploreQuery(database *db.DB, workdir, root, query string, max int, skipCod
 	}
 
 	// 1) Flow among named symbols (bag of tokens); same path/root as source gather.
-	flow := buildFlowFromNamedSymbols(database, workdir, root, query)
+	flow := buildFlowFromNamedSymbols(ctx, database, workdir, root, query)
 
 	// 2) Gather symbols to show: flow spine/named first, then classic lookup.
-	nodes, err := gatherExploreNodes(database, workdir, root, query, flow, maxFiles*4)
+	nodes, err := gatherExploreNodes(ctx, database, workdir, root, query, flow, maxFiles*4)
 	if err != nil {
 		return "", err
 	}
@@ -504,7 +510,7 @@ func exploreQuery(database *db.DB, workdir, root, query string, max int, skipCod
 			var nb strings.Builder
 			fmt.Fprintf(&nb, "\n### %s (%s) L%d\n", n.Name, n.Kind, n.Line)
 
-			if callers, err := database.GetCallersWithKind(n.ID); err == nil && len(callers) > 0 {
+			if callers, err := database.GetCallersWithKindContext(ctx, n.ID); err == nil && len(callers) > 0 {
 				nb.WriteString("Callers: ")
 				parts := make([]string, 0, min(maxEdges, len(callers)))
 				for i, c := range callers {
@@ -523,7 +529,7 @@ func exploreQuery(database *db.DB, workdir, root, query string, max int, skipCod
 				nb.WriteString(strings.Join(parts, ", "))
 				nb.WriteByte('\n')
 			}
-			if callees, err := database.GetCalleesWithKind(n.ID); err == nil && len(callees) > 0 {
+			if callees, err := database.GetCalleesWithKindContext(ctx, n.ID); err == nil && len(callees) > 0 {
 				nb.WriteString("Calls: ")
 				parts := make([]string, 0, min(maxEdges, len(callees)))
 				seen := map[string]bool{}
@@ -617,14 +623,14 @@ func exploreQuery(database *db.DB, workdir, root, query string, max int, skipCod
 	// Last-resort hard ceiling so hosts never externalize a giant tool result.
 	out := b.String()
 	if len(out) > hardCeiling {
-		out = out[:hardCeiling] + "\n… (explore output truncated to budget ceiling)\n"
+		out = safeUTF8Truncate(out, hardCeiling) + "\n… (explore output truncated to budget ceiling)\n"
 	}
 	return out, nil
 }
 
 // gatherExploreNodes collects symbols for explore output: multi-token bag,
 // flow spine/named, then single-name / FTS fallback.
-func gatherExploreNodes(database *db.DB, workdir, root, query string, flow flowResult, capN int) ([]db.Node, error) {
+func gatherExploreNodes(ctx context.Context, database *db.DB, workdir, root, query string, flow flowResult, capN int) ([]db.Node, error) {
 	if capN <= 0 {
 		capN = 30
 	}
@@ -661,19 +667,19 @@ func gatherExploreNodes(database *db.DB, workdir, root, query string, flow flowR
 		if len(out) >= capN {
 			break
 		}
-		hits, err := findCallableSymbols(database, t)
+		hits, err := findCallableSymbols(ctx, database, t)
 		if err != nil {
 			return nil, err
 		}
 		if len(hits) == 0 {
 			// non-callable symbols (types, etc.) still useful for single-name explore
-			nodes, err := database.GetNodeByName(t)
+			nodes, err := database.GetNodeByNameContext(ctx, t)
 			if err != nil {
 				return nil, err
 			}
 			if len(nodes) == 0 {
 				if i := strings.LastIndexAny(t, ".#/"); i >= 0 && i+1 < len(t) {
-					nodes, err = database.GetNodeByName(t[i+1:])
+					nodes, err = database.GetNodeByNameContext(ctx, t[i+1:])
 					if err != nil {
 						return nil, err
 					}
@@ -691,7 +697,7 @@ func gatherExploreNodes(database *db.DB, workdir, root, query string, flow flowR
 
 	// Single-token / no hits: FTS on full query string (legacy behavior).
 	if len(out) == 0 {
-		nodes, err := database.FullTextSearch(query, capN)
+		nodes, err := database.FullTextSearchContext(ctx, query, capN)
 		if err != nil {
 			return nil, err
 		}
@@ -700,6 +706,18 @@ func gatherExploreNodes(database *db.DB, workdir, root, query string, flow flowR
 		}
 	}
 	return out, nil
+}
+
+// safeUTF8Truncate cuts s to n bytes on a valid UTF-8 boundary.
+// Mirrors truncateOutput in limits.go (package main, not importable from tools).
+func safeUTF8Truncate(s string, n int) string {
+	if n <= 0 || n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.ValidString(s[:n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func trimExploreBody(body string, maxChars int) string {
@@ -717,7 +735,7 @@ func trimExploreBody(body string, maxChars int) string {
 			cut = i
 		}
 	}
-	return body[:cut] + "\n… (trimmed to explore budget)"
+	return safeUTF8Truncate(body, cut) + "\n… (trimmed to explore budget)"
 }
 
 func resolveDefs(database *db.DB, name, pathFilter, fileHint, glob, workdir string) ([]db.Node, error) {

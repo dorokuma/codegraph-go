@@ -2,6 +2,7 @@ package resolution
 
 import (
 	"log"
+	"path/filepath"
 
 	"github.com/dorokuma/codegraph-go/db"
 )
@@ -100,6 +101,10 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 	}
 
 	m := MatchName(candidates, r.ReferenceName, fromFile, preferCall)
+	if m.TargetID != 0 && m.Provenance == ProvHeuristic && preferCall {
+		// No file/directory proximity: reject to let unique-callable check handle it.
+		m = MatchResult{}
+	}
 	if m.TargetID == 0 {
 		// Unique global callable: accept as heuristic.
 		if preferCall {
@@ -110,7 +115,17 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 				}
 			}
 			if len(callables) == 1 {
-				m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
+				// Only accept a unique callable when supported by import closure,
+				// same-directory, or sibling-directory (same parent) proximity.
+				cdir := filepath.Dir(callables[0].File)
+				fromDir := filepath.Dir(fromFile)
+				if _, ok := FilterByImports(database, workdir, fromFile, lang, []db.Node{callables[0]}); ok {
+					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvImport}
+				} else if cdir == fromDir {
+					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
+				} else if filepath.Dir(cdir) == fromDir {
+					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
+				}
 			}
 		}
 	}
@@ -152,20 +167,20 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		want[f] = true
 	}
 	var st Stats
-	pending, err := database.ListUnresolvedRefs("", "pending")
+
+	// Load refs for changed files directly via SQL (avoid full-table scan + Go filter).
+	pendingByFiles, err := database.ListUnresolvedRefsByFiles(files, "pending")
 	if err != nil {
 		return st, err
 	}
-	failed, err := database.ListUnresolvedRefs("", "failed")
+	failedByFiles, err := database.ListUnresolvedRefsByFiles(files, "failed")
 	if err != nil {
 		return st, err
 	}
 	var batch []db.UnresolvedRef
-	for _, r := range pending {
-		if want[r.FilePath] {
-			batch = append(batch, r)
-		}
-	}
+	batch = append(batch, pendingByFiles...)
+	batch = append(batch, failedByFiles...)
+
 	// Also any pending/failed whose name might be defined in changed files.
 	changedNames := map[string]bool{}
 	for _, f := range files {
@@ -177,18 +192,28 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 			changedNames[n.Name] = true
 		}
 	}
-	for _, r := range append(pending, failed...) {
-		if want[r.FilePath] {
-			continue // already queued
+	if len(changedNames) > 0 {
+		pending, err := database.ListUnresolvedRefs("", "pending")
+		if err != nil {
+			return st, err
 		}
-		tail := r.NameTail
-		if tail == "" {
-			tail = nameTail(r.ReferenceName)
+		failed, err := database.ListUnresolvedRefs("", "failed")
+		if err != nil {
+			return st, err
 		}
-		if changedNames[r.ReferenceName] || changedNames[tail] {
-			batch = append(batch, r)
-			if r.Status == "failed" {
-				st.Retried++
+		for _, r := range append(pending, failed...) {
+			if want[r.FilePath] {
+				continue // already queued via ByFiles
+			}
+			tail := r.NameTail
+			if tail == "" {
+				tail = nameTail(r.ReferenceName)
+			}
+			if changedNames[r.ReferenceName] || changedNames[tail] {
+				batch = append(batch, r)
+				if r.Status == "failed" {
+					st.Retried++
+				}
 			}
 		}
 	}
@@ -206,13 +231,15 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		}
 		if ok {
 			st.Resolved++
-		} else if r.Status == "pending" || r.Status == "" {
+		} else {
 			st.Failed++
-			tail := r.NameTail
-			if tail == "" {
-				tail = nameTail(r.ReferenceName)
+			if r.Status == "pending" || r.Status == "" {
+				tail := r.NameTail
+				if tail == "" {
+					tail = nameTail(r.ReferenceName)
+				}
+				_ = database.MarkUnresolvedFailed(r.ID, tail)
 			}
-			_ = database.MarkUnresolvedFailed(r.ID, tail)
 		}
 	}
 	return st, nil

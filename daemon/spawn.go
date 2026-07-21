@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -44,7 +45,7 @@ func SpawnDetached(root string) error {
 	// Mark as daemon; scrub any stale host-ppid markers.
 	filtered := make([]string, 0, len(env)+1)
 	for _, e := range env {
-		if len(e) >= len(EnvDaemonInternal) && e[:len(EnvDaemonInternal)] == EnvDaemonInternal {
+		if strings.HasPrefix(e, EnvDaemonInternal+"=") {
 			continue
 		}
 		filtered = append(filtered, e)

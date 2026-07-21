@@ -97,9 +97,6 @@ func MatchName(candidates []db.Node, refName, fromFile string, preferCall bool) 
 	}
 
 	if len(candidates) > 1 && best.Score < 5 && preferCall {
-		if best.TargetID != 0 {
-			return best
-		}
 		return MatchResult{}
 	}
 	// Unique global with weak score still counts as heuristic.

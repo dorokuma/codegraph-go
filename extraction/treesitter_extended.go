@@ -707,8 +707,12 @@ func (e *TreeSitterExtractor) walkLua(node *sitter.Node, source []byte, filePath
 		e.processLuaFunction(node, source, filePath, nodes, edges, enclosingTable)
 		return
 	case "function_definition":
-		// Anonymous or assigned function
+		// May be anonymous (M.foo = function() … end) or named.
 		e.processLuaFunction(node, source, filePath, nodes, edges, enclosingTable)
+		return
+	case "assignment_statement", "local_variable_declaration":
+		// Assignment-style functions: M.foo = function() … end
+		e.processLuaAssignment(node, source, filePath, nodes, edges, enclosingTable)
 		return
 	case "table_constructor":
 		// Could be a module table
@@ -725,6 +729,8 @@ func (e *TreeSitterExtractor) processLuaFunction(node *sitter.Node, source []byt
 		nameNode = node.ChildByFieldName("declarator")
 	}
 	if nameNode == nil {
+		// Anonymous function_definition without assignment context (e.g. callback arg).
+		// Skip — the parent assignment_statement handler will pick it up if relevant.
 		return
 	}
 	name := nameNode.Content(source)
@@ -751,6 +757,106 @@ func (e *TreeSitterExtractor) processLuaFunction(node *sitter.Node, source []byt
 		})
 	}
 	body := node.ChildByFieldName("body")
+	if body != nil {
+		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+	}
+}
+
+// processLuaAssignment handles M.foo = function() … end style definitions.
+// The assignment node contains a variable_list on the left and an expression_list
+// with an anonymous function_definition on the right.
+func (e *TreeSitterExtractor) processLuaAssignment(node *sitter.Node, source []byte, filePath string, nodes *[]ExtractedNode, edges *[]ExtractedEdge, enclosingTable string) {
+	// Extract variable name from left-hand side.
+	var lhsName string
+	for i := 0; i < int(node.ChildCount()); i++ {
+		ch := node.Child(i)
+		switch ch.Type() {
+		case "variable_list", "variable_declarator":
+			lhsName = luaExtractVariableName(ch, source)
+		}
+	}
+	if lhsName == "" {
+		return
+	}
+	// Find the function_definition child and emit a node for it.
+	for i := 0; i < int(node.ChildCount()); i++ {
+		ch := node.Child(i)
+		if ch.Type() == "function_definition" {
+			e.emitLuaAnonFunc(ch, source, filePath, nodes, edges, enclosingTable, lhsName)
+			return
+		}
+		if ch.Type() == "expression_list" {
+			for j := 0; j < int(ch.ChildCount()); j++ {
+				gc := ch.Child(j)
+				if gc.Type() == "function_definition" {
+					e.emitLuaAnonFunc(gc, source, filePath, nodes, edges, enclosingTable, lhsName)
+					return
+				}
+			}
+		}
+	}
+}
+
+// luaExtractVariableName extracts a name from a Lua variable expression.
+// Handles dot_index_expression (M.foo), bracket_index_expression (M["foo"]),
+// and plain identifier.
+func luaExtractVariableName(node *sitter.Node, source []byte) string {
+	switch node.Type() {
+	case "identifier":
+		return node.Content(source)
+	case "dot_index_expression":
+		// table.field → return field name
+		for i := 0; i < int(node.ChildCount()); i++ {
+			ch := node.Child(i)
+			if ch.Type() == "identifier" || ch.Type() == "property_identifier" {
+				return ch.Content(source)
+			}
+		}
+		// Fallback: full expression
+		return node.Content(source)
+	case "bracket_index_expression":
+		// table["field"] → return string content or full expression
+		for i := 0; i < int(node.ChildCount()); i++ {
+			ch := node.Child(i)
+			if ch.Type() == "string" {
+				s := ch.Content(source)
+				return strings.Trim(s, `"'`)
+			}
+		}
+		return node.Content(source)
+	default:
+		// For variable_list, walk children to find first named child.
+		for i := 0; i < int(node.ChildCount()); i++ {
+			if name := luaExtractVariableName(node.Child(i), source); name != "" {
+				return name
+			}
+		}
+		return ""
+	}
+}
+
+// emitLuaAnonFunc creates a node for an anonymous function that was assigned to a variable.
+func (e *TreeSitterExtractor) emitLuaAnonFunc(fn *sitter.Node, source []byte, filePath string, nodes *[]ExtractedNode, edges *[]ExtractedEdge, enclosingTable, name string) {
+	startLine := int(fn.StartPoint().Row) + 1
+	endLine := int(fn.EndPoint().Row) + 1
+	kind := "function"
+	qn := name
+	if enclosingTable != "" {
+		kind = "method"
+		qn = enclosingTable + "." + name
+	}
+	*nodes = append(*nodes, ExtractedNode{
+		Kind: kind, Name: name, File: filePath, Line: startLine, EndLine: endLine,
+		Language: "lua", QualifiedName: qn,
+		Visibility: "public", IsExported: !strings.HasPrefix(name, "_"),
+		StartColumn: int(fn.StartPoint().Column), EndColumn: int(fn.EndPoint().Column),
+	})
+	if enclosingTable != "" {
+		*edges = append(*edges, ExtractedEdge{
+			SourceName: enclosingTable, TargetName: name, Kind: "contains", File: filePath, Line: startLine,
+		})
+	}
+	body := fn.ChildByFieldName("body")
 	if body != nil {
 		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
 	}

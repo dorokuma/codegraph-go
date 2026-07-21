@@ -249,11 +249,10 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 		for _, p := range ResolveImportPath(workdir, fromFile, spec, lang) {
 			importedFiles[p] = true
 		}
-		// Also accept module path suffix match against candidate.File
+		// Also accept candidates whose file path contains spec as a complete
+		// path segment (boundary-aware, avoids short name over-matching).
 		for _, c := range candidates {
-			if strings.Contains(c.File, filepath.ToSlash(spec)) ||
-				strings.HasSuffix(filepath.Dir(c.File), spec) ||
-				strings.TrimSuffix(filepath.Base(c.File), filepath.Ext(c.File)) == filepath.Base(spec) {
+			if specMatchesFile(c.File, spec) {
 				importedFiles[c.File] = true
 			}
 		}
@@ -271,4 +270,25 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 		return candidates, false
 	}
 	return hit, true
+}
+
+// specMatchesFile returns true when spec appears as a complete path segment
+// in file. This avoids over-matching short/bare names like "util" or
+// "components" as substrings of unrelated paths.
+func specMatchesFile(file, spec string) bool {
+	spec = filepath.ToSlash(spec)
+	file = filepath.ToSlash(file)
+	if file == spec {
+		return true
+	}
+	if strings.HasPrefix(file, spec+"/") {
+		return true
+	}
+	if strings.HasSuffix(file, "/"+spec) {
+		return true
+	}
+	if strings.Contains(file, "/"+spec+"/") {
+		return true
+	}
+	return false
 }

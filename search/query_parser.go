@@ -112,13 +112,19 @@ func tokenize(raw string) []string {
 		start := i
 		for i < len(runes) && !unicode.IsSpace(runes[i]) {
 			if runes[i] == '"' {
-				end := strings.IndexRune(raw[i+1:], '"')
-				if end == -1 {
-					i = len(runes)
-					break
+				// search for closing quote in rune space
+				foundClosing := false
+				for j := i + 1; j < len(runes); j++ {
+					if runes[j] == '"' {
+						i = j + 1 // skip past closing quote
+						foundClosing = true
+						break
+					}
 				}
-				i += end + 2 // skip past closing quote
-				continue
+				if !foundClosing {
+					i = len(runes)
+				}
+				break
 			}
 			i++
 		}

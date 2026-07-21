@@ -5,14 +5,19 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dorokuma/codegraph-go/db"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// callRe matches a bare identifier followed by optional spaces and '('.
+// Compiled once at package init — used by toolCalleesBodyFallback to discover
+// callee names inside function bodies.
+var callRe = regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 
 // toolCalleesBodyFallback is the legacy rg + brace-matching path used when
 // the call graph has no edges for the symbol yet.
@@ -30,8 +35,11 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		"-e", defPattern, root)
 	defOut, err := rgDef.Output()
 	if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
+		// Fallback uses an independent context — primary may have exhausted its timeout.
+		fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer fallbackCancel()
 		fallbackPattern := fmt.Sprintf(`\b%s\s*\(`, quoted)
-		rgDefFallback := exec.CommandContext(rgCtx, "rg",
+		rgDefFallback := exec.CommandContext(fallbackCtx, "rg",
 			"--line-number", "--no-heading", "--color=never",
 			"--max-count=20",
 			"-e", fallbackPattern, root)
@@ -65,7 +73,6 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		}, nil, nil
 	}
 
-	callRe := regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 	controlFlow := map[string]bool{
 		"if": true, "for": true, "while": true, "switch": true, "case": true,
 		"return": true, "defer": true, "go": true, "select": true,
@@ -100,6 +107,9 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		if err != nil {
 			continue
 		}
+		// seen is per-def — each function body is scanned independently.
+		// A symbol called by multiple definitions will appear under each def,
+		// which matches the caller-facing UX ("what does THIS definition call?").
 		seen := make(map[string]bool)
 
 		bodyStart := d.line - 1
@@ -281,12 +291,8 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 	}
 
 	var b strings.Builder
-	currentFile := ""
 	for _, c := range allCalls {
-		if c.file != currentFile {
-			currentFile = c.file
-		}
-		fmt.Fprintf(&b, "%s:%d\n", filepath.Base(c.file), c.line)
+		fmt.Fprintf(&b, "%s:%d\n", db.RelPath(root, c.file), c.line)
 	}
 	if len(allCalls) >= args.MaxResults {
 		fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)

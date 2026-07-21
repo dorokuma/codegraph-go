@@ -49,54 +49,27 @@ var (
 	cgoCallRe = regexp.MustCompile(`\bC\.(\w+)`)
 	// //export GoFunctionName
 	cgoExportRe = regexp.MustCompile(`//export\s+(\w+)`)
-	// C function declarations in preamble: void func(), int func(), etc.
-	cgoPreambleRe = regexp.MustCompile(`(?:void|int|char\*?|float|double|long|short|unsigned|struct\s+\w+)\s+(\w+)\s*\(`)
 	// Go function declarations
 	goFuncDeclRe = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(`)
 )
 
 func (d *CrossLanguageDetector) detectCGo(source string, filePath string) []BridgeEdge {
 	lines := strings.Split(source, "\n")
-	var edges []BridgeEdge
 
-	// First pass: find preamble (comment block before import "C")
-	inPreamble := false
-	preambleFuncs := make(map[string]bool)
+	// Find import "C" line; if absent, no CGo in this file.
 	importCLine := -1
-
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Detect preamble comment block
-		if strings.HasPrefix(trimmed, "/*") {
-			inPreamble = true
-		}
-		if inPreamble {
-			if matches := cgoPreambleRe.FindStringSubmatch(trimmed); len(matches) > 1 {
-				preambleFuncs[matches[1]] = true
-			}
-			if strings.Contains(trimmed, "*/") {
-				inPreamble = false
-			}
-			continue
-		}
-
-		// Single-line comments before import "C" might also be preamble
-		if strings.HasPrefix(trimmed, "//") && importCLine == -1 {
-			if matches := cgoPreambleRe.FindStringSubmatch(trimmed); len(matches) > 1 {
-				preambleFuncs[matches[1]] = true
-			}
-			continue
-		}
-
-		// Find import "C"
-		if cgoImportRe.MatchString(trimmed) {
+		if cgoImportRe.MatchString(strings.TrimSpace(line)) {
 			importCLine = i
 			break
 		}
 	}
+	if importCLine == -1 {
+		return nil
+	}
 
-	// Second pass: find C.func() calls and //export after import "C"
+	// Scan after import "C": //export directives and C.func() calls.
+	var edges []BridgeEdge
 	currentFunc := ""
 	for i := importCLine + 1; i < len(lines); i++ {
 		line := lines[i]

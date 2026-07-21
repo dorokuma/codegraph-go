@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/dorokuma/codegraph-go/db"
 )
@@ -91,13 +92,16 @@ func TestTruncateOutputUTF8(t *testing.T) {
 	if !isValidUTF8(result) {
 		t.Error("result should be valid UTF-8")
 	}
+
+	// Verify that invalid UTF-8 is detected as false
+	invalid := string([]byte{0xff, 0xfe, 0xfd})
+	if isValidUTF8(invalid) {
+		t.Error("invalid UTF-8 should be detected as false")
+	}
 }
 
 func isValidUTF8(s string) bool {
-	for range s {
-		// Just iterate to check for invalid runes
-	}
-	return true
+	return utf8.ValidString(s)
 }
 
 func TestLimitLinesEdgeCases(t *testing.T) {

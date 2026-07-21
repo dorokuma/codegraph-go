@@ -75,7 +75,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     body,
     language,
     content='nodes',
-    content_rowid='id'
+    content_rowid='id',
+    tokenize='unicode61 tokenchars _'
 );
 
 -- Triggers to keep FTS index in sync

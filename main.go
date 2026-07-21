@@ -36,9 +36,24 @@ type server struct {
 	// watcher is set from the background index goroutine after auto-sync starts.
 	watcher atomic.Pointer[sync.Watcher]
 
-	// Cross-project cache: resolved .codegraph root → open DB (step 4 projectPath).
-	projectMu    stdsync.Mutex
-	projectCache map[string]*db.DB
+	// bgDone signals the background index/watch goroutine to exit.
+	bgDone chan struct{}
+	bgWg   stdsync.WaitGroup
+
+	// Cross-project cache: resolved .codegraph root → open DB with ref-counting
+	// so concurrent tool calls don't race with LRU eviction (W-1).
+	projectMu          stdsync.Mutex
+	projectCache       map[string]*dbEntry // guarded by projectMu
+	projectLRU         []string            // ordered by access time; oldest first
+	projectMaxLRU      int                 // max cached project DBs (0 = unlimited)
+	projectPendingClose map[string]*dbEntry // evicted but still in use; guarded by projectMu
+
+	// defReCache avoids recompiling the caller-filter regex per toolCallers invocation.
+	defReCache stdsync.Map // string → *regexp.Regexp
+
+	// detectCache avoids repeated os.ReadDir+stat per tool call in home mode.
+	detectOnce stdsync.Once
+	detectDirs []string // cached project directory names under workdir
 }
 
 // runInit implements `codegraph-go init <root>` for hosts that pre-warm the
@@ -246,9 +261,15 @@ func openServerState(workdir string, noSync bool) (*server, func()) {
 		workdir:      workdir,
 		database:     database,
 		orchestrator: orch,
+		bgDone:       make(chan struct{}),
 	}
+	s.bgWg.Add(1)
 	go backgroundIndexAndWatch(s, noSync)
 	cleanup := func() {
+		// Signal background goroutine to stop, then wait for it to finish
+		// before closing the database.
+		close(s.bgDone)
+		s.bgWg.Wait()
 		walCP.Stop()
 		if w := s.watcher.Load(); w != nil {
 			w.Stop()
@@ -260,9 +281,18 @@ func openServerState(workdir string, noSync bool) (*server, func()) {
 }
 
 func backgroundIndexAndWatch(s *server, noSync bool) {
+	defer s.bgWg.Done()
 	database := s.database
 	orch := s.orchestrator
 	workdir := s.workdir
+
+	// Check for shutdown before each expensive phase so cleanup can
+	// interrupt quickly rather than blocking until indexing finishes.
+	select {
+	case <-s.bgDone:
+		return
+	default:
+	}
 
 	rebuild, oldVer, err := database.NeedsRebuild()
 	if err != nil {
@@ -271,9 +301,21 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 	var files, nodes int
 	if rebuild {
 		log.Printf("schema revision %s → %s: full rebuild...", oldVer, db.SchemaRevision())
+
+		select {
+		case <-s.bgDone:
+			return
+		default:
+		}
 		files, nodes, err = orch.RebuildAll()
 	} else {
 		log.Printf("indexing project in background...")
+
+		select {
+		case <-s.bgDone:
+			return
+		default:
+		}
 		files, nodes, err = orch.IndexAll()
 		if err == nil {
 			_ = database.SetSchemaRevision()
@@ -286,6 +328,11 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 
 	// Optional git-status assist: catch edits missed while nothing was watching.
 	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
+		select {
+		case <-s.bgDone:
+			return
+		default:
+		}
 		c, n, gerr := orch.IndexChanges(dirty)
 		if gerr != nil {
 			log.Printf("git-assist sync: %v", gerr)
@@ -296,6 +343,12 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 
 	if noSync {
 		return
+	}
+
+	select {
+	case <-s.bgDone:
+		return
+	default:
 	}
 	watcher, err := sync.NewWatcher(orch, workdir)
 	if err != nil {
@@ -406,6 +459,7 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(projRoot)
 
 	// Official CodeGraph search is symbol-first. For a plain identifier with no
 	// path/glob/regex metacharacters, hit FTS before spawning rg.
@@ -439,23 +493,47 @@ func (s *server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	if args.Glob != "" {
 		rg.Args = append(rg.Args, "--glob", args.Glob)
 	}
+	// When the user specifies a path they intend to search that directory
+	// regardless of .gitignore rules. Otherwise a seemingly thorough search
+	// silently skips ignored files.
+	if args.Path != "" {
+		rg.Args = append(rg.Args, "--no-ignore")
+	}
 	rg.Args = append(rg.Args, "--", args.Pattern, root)
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
 		// rg exits 1 on no matches; other errors should surface.
 		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			msg := "no matches"
+			if args.Path != "" {
+				indexed, cerr := countIndexedUnder(database, projRoot, root)
+				if cerr == nil && indexed == 0 {
+					msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
+				}
+			}
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
+				Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 			}, nil, nil
 		}
 		return nil, nil, fmt.Errorf("rg search: %w", err)
 	}
 	if len(out) == 0 {
+		// When a path subdirectory is specified, the user may be searching
+		// an unindexed area. Check whether any files are indexed under root
+		// and include a hint so the agent knows to use built-in tools.
+		msg := "no matches"
+		if args.Path != "" {
+			indexed, cerr := countIndexedUnder(database, projRoot, root)
+			if cerr == nil && indexed == 0 {
+				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
+			}
+		}
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "no matches"}},
+			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 		}, nil, nil
 	}
-	text := limitLines(string(out), args.MaxResults)
+	text := relativizeRgOutput(string(out), projRoot)
+	text = limitLines(text, args.MaxResults)
 	text = truncateOutput(text, defaultOutputChars)
 	text = s.addStalenessWarning(text)
 	return &mcp.CallToolResult{
@@ -504,6 +582,7 @@ func (s *server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 
 	// Home/broad mode: rg would search the entire home directory (go/pkg/mod,
 	// other projects, etc.). Use the DB file list instead — it only contains
@@ -624,6 +703,7 @@ func (s *server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 	text, err := tools.ToolExplore(ctx, database, root, tools.ExploreArgs{
 		Query:    args.Query,
 		Path:     args.Path,
@@ -667,6 +747,7 @@ func (s *server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 
 	// Graph-first (official CodeGraph path).
 	if text, ok, err := tools.ToolCalleesGraph(database, root, tools.GraphQueryArgs{
@@ -701,6 +782,7 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 
 	// Graph-first (official CodeGraph path).
 	if text, ok, err := tools.ToolCallersGraph(database, root, tools.GraphQueryArgs{
@@ -724,6 +806,7 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 	rg := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
+		"--fixed-strings",
 		fmt.Sprintf("--max-count=%d", rgCap),
 		"-w", args.Name, searchRoot)
 	if args.Glob != "" {
@@ -733,8 +816,9 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found (index empty for this symbol; rg fallback also empty)"}}}, nil, nil
 	}
-	quoted := regexp.QuoteMeta(args.Name)
-	defRe := regexp.MustCompile(`(func\s+(\([^)]*\)\s*)?|def\s+|function\s+|class\s+|fn\s+)` + quoted + `\b`)
+	// Compile (or reuse) a regex that matches definitions of the target symbol.
+	// The fixed prefix is the same for every name; only the quoted name varies.
+	defRe := s.getCachedDefRe(args.Name)
 	var filtered []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		parts := strings.SplitN(line, ":", 3)
@@ -749,7 +833,9 @@ func (s *server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		if defRe.MatchString(cleaned) {
 			continue
 		}
-		filtered = append(filtered, line)
+		// Convert absolute path to relative for consistency with FTS/graph output.
+		relFile := db.RelPath(root, parts[0])
+		filtered = append(filtered, fmt.Sprintf("%s:%s:%s", relFile, parts[1], text))
 		if len(filtered) >= args.MaxResults {
 			break
 		}
@@ -783,6 +869,7 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(projRoot)
 
 	// Graph BFS first (official getImpactRadius).
 	if text, ok, err := tools.ToolImpactGraph(database, projRoot, tools.GraphQueryArgs{
@@ -801,12 +888,14 @@ func (s *server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	}
 	rg := exec.CommandContext(ctx, "rg",
 		"--line-number", "--no-heading", "--color=never",
+		"--fixed-strings",
 		"-c", "-w", args.Name, root)
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
 	}
-	result := "# Impact of " + args.Name + " (rg fallback)\n" + limitLines(string(out), args.MaxResults)
+	rgText := relativizeRgOutput(string(out), projRoot)
+	result := "# Impact of " + args.Name + " (rg fallback)\n" + limitLines(rgText, args.MaxResults)
 	result = truncateOutput(result, defaultOutputChars)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
@@ -834,6 +923,7 @@ func (s *server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args node
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 	// Keep original file hint for basename matching; only absolutize when it resolves under root.
 	file := args.File
 	if file != "" && strings.TrimSpace(args.Name) != "" {
@@ -883,6 +973,7 @@ func (s *server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 	var pendingFiles []string
 	// Pending files only apply to the default session watcher.
 	if root == s.workdir {
@@ -941,7 +1032,14 @@ func (s *server) resolvePathIn(root, p string) (string, error) {
 	} else {
 		target = filepath.Clean(filepath.Join(root, p))
 	}
-	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+	// When root is "/", root+sep becomes "//" which breaks HasPrefix.
+	// Direct equality check handles this edge case.
+	if target == root {
+		return target, nil
+	}
+	// Normalize root for prefix comparison: strip trailing separator before appending.
+	cleanRoot := strings.TrimSuffix(root, string(filepath.Separator))
+	if !strings.HasPrefix(target, cleanRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q is outside workspace %q", p, root)
 	}
 	return target, nil
@@ -1027,29 +1125,35 @@ func isWordSep(b byte) bool {
 // detectProject tries to find which project the user is asking about
 // by matching query/args against project directory names under workdir.
 // Returns the project dir name (relative to workdir) or empty string.
+// Results are cached per workdir to avoid repeated os.ReadDir + stat.
 func (s *server) detectProject(queries ...string) string {
 	if !extraction.IsBroadWorkdir(s.workdir) {
 		return ""
 	}
-	entries, err := os.ReadDir(s.workdir)
-	if err != nil {
-		return ""
-	}
-	for _, q := range queries {
-		q = strings.ToLower(strings.TrimSpace(q))
-		if q == "" {
-			continue
+	// Populate cached project names once per server lifetime.
+	s.detectOnce.Do(func() {
+		entries, err := os.ReadDir(s.workdir)
+		if err != nil {
+			return
 		}
 		for _, e := range entries {
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
 			projectDir := filepath.Join(s.workdir, e.Name())
-			if !extraction.HasProjectMarker(projectDir) {
-				continue
+			if extraction.HasProjectMarker(projectDir) {
+				s.detectDirs = append(s.detectDirs, e.Name())
 			}
-			if strings.ToLower(e.Name()) == q {
-				return e.Name()
+		}
+	})
+	for _, q := range queries {
+		q = strings.ToLower(strings.TrimSpace(q))
+		if q == "" {
+			continue
+		}
+		for _, name := range s.detectDirs {
+			if strings.ToLower(name) == q {
+				return name
 			}
 		}
 	}
@@ -1059,17 +1163,9 @@ func (s *server) detectProject(queries ...string) string {
 		if q == "" {
 			continue
 		}
-		for _, e := range entries {
-			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-				continue
-			}
-			projectDir := filepath.Join(s.workdir, e.Name())
-			if !extraction.HasProjectMarker(projectDir) {
-				continue
-			}
-			name := strings.ToLower(e.Name())
-			if isWordIn(name, q) {
-				return e.Name()
+		for _, name := range s.detectDirs {
+			if isWordIn(strings.ToLower(name), q) {
+				return name
 			}
 		}
 	}
@@ -1097,26 +1193,144 @@ func (s *server) resolveProject(projectPath string) (root string, database *db.D
 	s.projectMu.Lock()
 	defer s.projectMu.Unlock()
 	if s.projectCache == nil {
-		s.projectCache = map[string]*db.DB{}
+		s.projectCache = map[string]*dbEntry{}
+		s.projectPendingClose = map[string]*dbEntry{}
+		s.projectMaxLRU = 10 // keep at most 10 cross-project DBs open
 	}
 	if cached, ok := s.projectCache[resolved]; ok {
-		return resolved, cached, nil
+		// Move to end of LRU list (most recently used).
+		s.touchProjectLRU(resolved)
+		atomic.AddInt32(&cached.refs, 1)
+		return resolved, cached.db, nil
+	}
+	// Evict oldest if at capacity. For entries still in use (refs>0),
+	// remove from cache+LRU but defer Close to releaseProject via
+	// projectPendingClose so in-flight callers are not disrupted.
+	if s.projectMaxLRU > 0 && len(s.projectLRU) >= s.projectMaxLRU {
+		evict := s.projectLRU[0]
+		s.projectLRU = s.projectLRU[1:]
+		if e, ok := s.projectCache[evict]; ok {
+			delete(s.projectCache, evict)
+			if atomic.LoadInt32(&e.refs) == 0 {
+				_ = e.db.Close()
+			} else {
+				s.projectPendingClose[evict] = e
+			}
+		}
 	}
 	opened, err := db.Open(resolved)
 	if err != nil {
 		return "", nil, fmt.Errorf("open index at %s: %w", resolved, err)
 	}
-	s.projectCache[resolved] = opened
+	entry := &dbEntry{db: opened, refs: 1}
+	s.projectCache[resolved] = entry
+	s.projectLRU = append(s.projectLRU, resolved)
 	return resolved, opened, nil
 }
 
+// touchProjectLRU moves root to the end of the LRU list (must hold projectMu).
+func (s *server) touchProjectLRU(root string) {
+	for i, r := range s.projectLRU {
+		if r == root {
+			s.projectLRU = append(s.projectLRU[:i], s.projectLRU[i+1:]...)
+			s.projectLRU = append(s.projectLRU, root)
+			return
+		}
+	}
+}
+
+// dbEntry wraps a cached project DB with a reference count so concurrent
+// tool calls don't race with LRU eviction.
+type dbEntry struct {
+	db   *db.DB
+	refs int32 // atomic: number of in-flight callers using this DB
+}
+
+// releaseProject decrements the refcount on a cross-project DB and closes
+// it when the count reaches zero AND the entry has been evicted from the
+// cache (pending-close). For the session-default DB this is a no-op.
+func (s *server) releaseProject(root string) {
+	if root == s.workdir {
+		return
+	}
+	s.projectMu.Lock()
+	defer s.projectMu.Unlock()
+	if e, ok := s.projectPendingClose[root]; ok {
+		if atomic.AddInt32(&e.refs, -1) == 0 {
+			_ = e.db.Close()
+			delete(s.projectPendingClose, root)
+		}
+		return
+	}
+	if e, ok := s.projectCache[root]; ok {
+		atomic.AddInt32(&e.refs, -1)
+	}
+}
+
+// closeProjectCache closes all cached cross-project DBs and pending-close
+// entries at shutdown.
 func (s *server) closeProjectCache() {
 	s.projectMu.Lock()
 	defer s.projectMu.Unlock()
-	for root, d := range s.projectCache {
-		_ = d.Close()
+	for root, e := range s.projectCache {
+		_ = e.db.Close()
 		delete(s.projectCache, root)
 	}
+	for root, e := range s.projectPendingClose {
+		_ = e.db.Close()
+		delete(s.projectPendingClose, root)
+	}
+	s.projectLRU = nil
+}
+
+// getCachedDefRe returns a compiled regex that matches definitions of the given name.
+// The result is cached per name to avoid repeated MustCompile across invocations.
+func (s *server) getCachedDefRe(name string) *regexp.Regexp {
+	if cached, ok := s.defReCache.Load(name); ok {
+		return cached.(*regexp.Regexp)
+	}
+	quoted := regexp.QuoteMeta(name)
+	re := regexp.MustCompile(`(func\s+(\([^)]*\)\s*)?|def\s+|function\s+|class\s+|fn\s+)` + quoted + `\b`)
+	s.defReCache.Store(name, re)
+	return re
+}
+
+// relativizeRgOutput converts absolute file paths in rg output to paths relative
+// to projRoot, so they match the format used by FTS/explore/node tools.
+func relativizeRgOutput(out string, projRoot string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) < 2 {
+			b.WriteString(line)
+			b.WriteByte('\n')
+			continue
+		}
+		rel := db.RelPath(projRoot, parts[0])
+		fmt.Fprintf(&b, "%s:%s\n", rel, parts[1])
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// countIndexedUnder returns the number of indexed files whose path is under the given root.
+func countIndexedUnder(database *db.DB, projRoot, searchRoot string) (int, error) {
+	allFiles, err := database.ListFiles()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	// Normalize searchRoot to avoid "//" issues.
+	cleanRoot := strings.TrimSuffix(searchRoot, string(filepath.Separator))
+	for _, abs := range allFiles {
+		// Match files that live under searchRoot (same dir or descendant).
+		if abs == cleanRoot || strings.HasPrefix(abs, cleanRoot+string(filepath.Separator)) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func readLines(path string) ([]string, error) {
@@ -1243,6 +1457,7 @@ func (s *server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
+	defer s.releaseProject(root)
 	result, err := tools.ToolAffected(ctx, database, root, tools.AffectedArgs{
 		Files:  args.Files,
 		Stdin:  args.Stdin,

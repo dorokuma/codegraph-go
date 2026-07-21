@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -20,11 +21,16 @@ const metaSchemaKey = "index_schema_revision"
 // schema revision and must be wiped + fully reindexed.
 // meta table is created by schema.sql / Open — this method only reads.
 func (d *DB) NeedsRebuild() (bool, string, error) {
+	return d.NeedsRebuildContext(context.Background())
+}
+
+// NeedsRebuildContext is the context-aware variant of NeedsRebuild.
+func (d *DB) NeedsRebuildContext(ctx context.Context) (bool, string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	var cur string
-	err := d.conn.QueryRow(`SELECT value FROM meta WHERE key = ?`, metaSchemaKey).Scan(&cur)
+	err := d.conn.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaSchemaKey).Scan(&cur)
 	if err != nil {
 		// missing row or missing table on very old DBs → rebuild
 		return true, "(none)", nil
@@ -76,8 +82,7 @@ func (d *DB) WipeIndex() error {
 	}
 	// Rebuild empty FTS
 	if _, err := tx.Exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`); err != nil {
-		// non-fatal on empty
-		_ = err
+		return fmt.Errorf("wipe: rebuild nodes_fts: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err

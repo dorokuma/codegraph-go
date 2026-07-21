@@ -110,6 +110,9 @@ func TestSplitIdentifierSegments(t *testing.T) {
 		{"A", []string{"a"}},
 		{"getHTTPResponse", []string{"get", "http", "response"}},
 		{"$state", []string{"state"}},
+		// Multi-byte camelCase: caféBar should split correctly
+		{"caféBar", []string{"café", "bar"}},
+		{"überCool", []string{"über", "cool"}},
 	}
 
 	for _, tt := range tests {
@@ -122,6 +125,70 @@ func TestSplitIdentifierSegments(t *testing.T) {
 			for i := range got {
 				if got[i] != tt.want[i] {
 					t.Errorf("SplitIdentifierSegments(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestTokenize(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "simple words",
+			input: "foo bar baz",
+			want:  []string{"foo", "bar", "baz"},
+		},
+		{
+			name:  "quoted string",
+			input: `path:"src/my dir" foo`,
+			want:  []string{"path:\"src/my dir\"", "foo"},
+		},
+		{
+			name:  "multi-byte with quote",
+			input: "日本語 kind:\"テスト\" hello",
+			want:  []string{"日本語", "kind:\"テスト\"", "hello"},
+		},
+		{
+			name:  "unclosed quote consumes rest",
+			input: `path:"unclosed foo`,
+			want:  []string{"path:\"unclosed foo"},
+		},
+		{
+			name:  "unclosed quote only",
+			input: `path:"hello`,
+			want:  []string{"path:\"hello"},
+		},
+		{
+			name:  "emoji in quoted",
+			input: `name:"🚀 launch" kind:function`,
+			want:  []string{"name:\"🚀 launch\"", "kind:function"},
+		},
+		{
+			name:  "empty",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "whitespace only",
+			input: "   ",
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tokenize(tt.input)
+			if len(got) != len(tt.want) {
+				t.Errorf("tokenize(%q) = %v (len=%d), want %v (len=%d)", tt.input, got, len(got), tt.want, len(tt.want))
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("tokenize(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
 				}
 			}
 		})

@@ -34,6 +34,7 @@ var (
 	emitEventRe      = regexp.MustCompile(`\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]`)
 	setStateRe       = regexp.MustCompile(`this\.setState\s*\(`)
 	jsxTagRe         = regexp.MustCompile(`<([A-Z][A-Za-z0-9_]*)[\s/>]`)
+	wordParenRe      = regexp.MustCompile(`\b\w+\s*\(`)
 )
 
 // SynthesizeAll runs whole-graph dynamic-dispatch synthesis after base resolution.
@@ -121,11 +122,63 @@ type synthEdge struct {
 	Meta     map[string]string
 }
 
+// lruCache is a bounded in-memory cache with LRU eviction.
+type lruCache struct {
+	max   int
+	keys  []string
+	store map[string]string
+}
+
+func newLRUCache(max int) *lruCache {
+	return &lruCache{
+		max:   max,
+		keys:  make([]string, 0, max),
+		store: make(map[string]string),
+	}
+}
+
+func (l *lruCache) get(key string) (string, bool) {
+	v, ok := l.store[key]
+	if ok {
+		l.touch(key)
+	}
+	return v, ok
+}
+
+func (l *lruCache) put(key, value string) {
+	if _, ok := l.store[key]; ok {
+		l.store[key] = value
+		l.touch(key)
+		return
+	}
+	if len(l.keys) >= l.max {
+		oldest := l.keys[len(l.keys)-1]
+		l.keys = l.keys[:len(l.keys)-1]
+		delete(l.store, oldest)
+	}
+	l.store[key] = value
+	l.keys = append([]string{key}, l.keys...)
+}
+
+func (l *lruCache) touch(key string) {
+	for i, k := range l.keys {
+		if k == key {
+			l.keys = append(l.keys[:i], l.keys[i+1:]...)
+			break
+		}
+	}
+	l.keys = append([]string{key}, l.keys...)
+}
+
+func (l *lruCache) len() int { return len(l.store) }
+
+const fileContentMaxEntries = 64
+
 type synthCtx struct {
 	db      *db.DB
 	workdir string
 	// caches — avoid repeated full-table GetNodesByKind scans (memory/CPU).
-	fileContent map[string]string
+	fileContent *lruCache
 	nodesByName map[string][]db.Node
 	nodesInFile map[string][]db.Node
 	nodesByKind map[string][]db.Node
@@ -136,7 +189,7 @@ func newSynthCtx(database *db.DB, workdir string) *synthCtx {
 	ctx := &synthCtx{
 		db:          database,
 		workdir:     workdir,
-		fileContent: map[string]string{},
+		fileContent: newLRUCache(fileContentMaxEntries),
 		nodesByName: map[string][]db.Node{},
 		nodesInFile: map[string][]db.Node{},
 		nodesByKind: map[string][]db.Node{},
@@ -163,7 +216,7 @@ func (c *synthCtx) readFile(path string) string {
 	if path == "" {
 		return ""
 	}
-	if s, ok := c.fileContent[path]; ok {
+	if s, ok := c.fileContent.get(path); ok {
 		return s
 	}
 	// path may be absolute already
@@ -176,12 +229,12 @@ func (c *synthCtx) readFile(path string) string {
 		// try as-is
 		data, err = os.ReadFile(path)
 		if err != nil {
-			c.fileContent[path] = ""
+			c.fileContent.put(path, "")
 			return ""
 		}
 	}
 	s := string(data)
-	c.fileContent[path] = s
+	c.fileContent.put(path, s)
 	return s
 }
 
@@ -275,7 +328,7 @@ func registrarField(src string) string {
 
 func dispatcherField(src string) string {
 	if m := dispatcherForOf.FindStringSubmatch(src); len(m) > 1 {
-		if regexp.MustCompile(`\b\w+\s*\(`).MatchString(src) {
+		if wordParenRe.MatchString(src) {
 			return m[1]
 		}
 	}
@@ -283,6 +336,61 @@ func dispatcherField(src string) string {
 		return m[1]
 	}
 	return ""
+}
+
+// resolveCallbackTarget picks the best callable node named cbName in the context
+// of a registration call made at caller. It prefers same-file, same-directory,
+// and same-type (via class-method containment) over a blind global first match.
+func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db.Node) *db.Node {
+	nodes := ctx.getNodesByName(cbName)
+	var callables []db.Node
+	for _, n := range nodes {
+		if n.Kind == db.KindMethod || n.Kind == db.KindFunction {
+			callables = append(callables, n)
+		}
+	}
+	if len(callables) == 0 {
+		return nil
+	}
+	if len(callables) == 1 {
+		n := callables[0]
+		return &n
+	}
+
+	// Score each candidate: lower is better.
+	type cand struct {
+		n     db.Node
+		score int
+	}
+	var ranked []cand
+	callerDir := filepath.Dir(caller.File)
+	regDir := filepath.Dir(reg.File)
+	for _, c := range callables {
+		sc := 100
+		cDir := filepath.Dir(c.File)
+		if c.File == caller.File {
+			sc = 1
+		} else if cDir == callerDir {
+			sc = 2
+		} else if c.File == reg.File {
+			sc = 3
+		} else if cDir == regDir {
+			sc = 4
+		} else if strings.HasPrefix(c.File, callerDir+string(filepath.Separator)) {
+			sc = 10
+		}
+		ranked = append(ranked, cand{n: c, score: sc})
+	}
+
+	// Stable: pick the lowest score; if tie, first in original order wins (fallback).
+	best := &ranked[0]
+	for i := 1; i < len(ranked); i++ {
+		if ranked[i].score < best.score {
+			best = &ranked[i]
+		}
+	}
+	n := best.n
+	return &n
 }
 
 // fieldChannelEdges: registrar/dispatcher share a field store → dispatcher calls registered callbacks.
@@ -368,14 +476,7 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 			if len(am) < 2 {
 				continue
 			}
-			var fn *db.Node
-			for _, n := range ctx.getNodesByName(am[1]) {
-				if n.Kind == db.KindMethod || n.Kind == db.KindFunction {
-					nn := n
-					fn = &nn
-					break
-				}
-			}
+			fn := resolveCallbackTarget(ctx, am[1], caller, reg.node)
 			if fn == nil {
 				continue
 			}
@@ -742,7 +843,6 @@ func bridgeSymbolEdges(ctx *synthCtx) ([]synthEdge, error) {
 				"via":           r.ReferenceName,
 			},
 		})
-		_ = ctx.db.DeleteUnresolvedRef(r.ID)
 	}
 	return edges, nil
 }

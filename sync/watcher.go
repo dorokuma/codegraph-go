@@ -22,6 +22,7 @@ type Watcher struct {
 	debounce     time.Duration
 	done         chan struct{}
 	stopOnce     sync.Once
+	wg           sync.WaitGroup
 }
 
 // NewWatcher creates a new file watcher.
@@ -60,6 +61,7 @@ func (w *Watcher) Start() error {
 		return err
 	}
 
+	w.wg.Add(1)
 	go w.loop()
 	return nil
 }
@@ -70,9 +72,11 @@ func (w *Watcher) Stop() {
 		close(w.done)
 		_ = w.watcher.Close()
 	})
+	w.wg.Wait()
 }
 
 func (w *Watcher) loop() {
+	defer w.wg.Done()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -170,11 +174,14 @@ func (w *Watcher) processPending() {
 	for _, path := range ready {
 		if _, err := os.Stat(path); err == nil {
 			existing = append(existing, path)
-		} else {
+		} else if os.IsNotExist(err) {
 			// File was deleted, remove from index
 			if err := w.orchestrator.DeleteFile(path); err != nil {
 				log.Printf("delete index %s: %v", path, err)
 			}
+		} else {
+			// Permission error or other transient issue — skip, don't delete
+			log.Printf("stat pending %s: %v", path, err)
 		}
 	}
 
@@ -199,13 +206,17 @@ func (w *Watcher) PendingFiles() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	var files []string
+	const maxPendingFiles = 500
+	files := make([]string, 0, maxPendingFiles)
 	for path := range w.pending {
 		rel, _ := filepath.Rel(w.workdir, path)
 		if rel == "" {
 			rel = path
 		}
 		files = append(files, rel)
+		if len(files) >= maxPendingFiles {
+			break
+		}
 	}
 	return files
 }

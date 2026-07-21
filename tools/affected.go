@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,7 @@ var testPatterns = map[string][]string{
 }
 
 // ToolAffected finds test files affected by changes.
+// DB reads now accept context via Context variants; cancellation is supported.
 func ToolAffected(ctx context.Context, database *db.DB, workdir string, args AffectedArgs) (*AffectedResult, error) {
 	if len(args.Files) == 0 && !args.Stdin {
 		return nil, fmt.Errorf("files list is required (or use stdin)")
@@ -78,6 +80,10 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	copy(queue, absFiles)
 
 	for depth := 0; depth < args.Depth && len(queue) > 0; depth++ {
+		// Let cancellation/timeout interrupt the BFS early.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var nextQueue []string
 		for _, file := range queue {
 			if affected[file] {
@@ -86,7 +92,10 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			affected[file] = true
 
 			// Find files that import this file's package
-			importers := findImporters(database, file)
+			importers, err := findImportersCtx(ctx, database, file)
+			if err != nil {
+				continue // DB failure for one file shouldn't block the whole traversal
+			}
 			for _, importer := range importers {
 				if !affected[importer] {
 					nextQueue = append(nextQueue, importer)
@@ -129,18 +138,33 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 }
 
 // findImporters finds files that import the given file's package.
-func findImporters(database *db.DB, targetFile string) []string {
+func findImporters(database *db.DB, targetFile string) ([]string, error) {
 	// Get the package/module path from the file
 	targetPkg := fileToPackage(targetFile)
 	if targetPkg == "" {
-		return nil
+		return nil, nil
 	}
 
 	files, err := database.FindImporters(targetPkg)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return files
+	return files, nil
+}
+
+// findImportersCtx is like findImporters but accepts a context for cancellation.
+func findImportersCtx(ctx context.Context, database *db.DB, targetFile string) ([]string, error) {
+	// Get the package/module path from the file
+	targetPkg := fileToPackage(targetFile)
+	if targetPkg == "" {
+		return nil, nil
+	}
+
+	files, err := database.FindImportersContext(ctx, targetPkg)
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // fileToPackage converts a file path to its likely package/import path.
@@ -204,18 +228,11 @@ func findNPMPackage(start string) (pkgDir, name string) {
 		pj := filepath.Join(cur, "package.json")
 		data, err := os.ReadFile(pj)
 		if err == nil {
-			// tiny parse: "name": "foo"
-			for _, line := range strings.Split(string(data), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, `"name"`) {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) == 2 {
-						n := strings.Trim(parts[1], ` ",`)
-						if n != "" {
-							return cur, n
-						}
-					}
-				}
+			var pkg struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(data, &pkg); err == nil && pkg.Name != "" {
+				return cur, pkg.Name
 			}
 		}
 		parent := filepath.Dir(cur)
@@ -231,6 +248,8 @@ func findNPMPackage(start string) (pkgDir, name string) {
 func isTestFile(file string, workdir string, customFilter string) bool {
 	base := filepath.Base(file)
 	rel, _ := filepath.Rel(workdir, file)
+	// Normalize to forward slashes so path-segment matching is OS-independent.
+	rel = filepath.ToSlash(rel)
 
 	// Custom filter
 	if customFilter != "" {
@@ -242,9 +261,11 @@ func isTestFile(file string, workdir string, customFilter string) bool {
 		return matched
 	}
 
-	// Check if file is in a tests/ directory
-	if strings.Contains(rel, "tests/") || strings.Contains(rel, "test/") || strings.Contains(rel, "__tests__/") {
-		return true
+	// Check if file is in a tests/ directory (exact segment match, not substring).
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "tests" || seg == "test" || seg == "__tests__" {
+			return true
+		}
 	}
 
 	// Check default patterns

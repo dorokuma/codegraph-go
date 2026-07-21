@@ -32,6 +32,11 @@ func newNonBlockWriter(dst io.Writer, queue int) *nonBlockWriter {
 	return w
 }
 
+// Close stops the background goroutine. After Close the writer is no longer usable.
+func (w *nonBlockWriter) Close() {
+	close(w.ch)
+}
+
 func (w *nonBlockWriter) Write(p []byte) (int, error) {
 	// log.Logger may reuse the buffer; copy before enqueue.
 	b := make([]byte, len(p))

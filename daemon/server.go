@@ -169,8 +169,14 @@ func (d *Daemon) acceptLoop() {
 			if d.stopping.Load() || d.ctx.Err() != nil {
 				return
 			}
-			// Temporary accept errors: keep going.
-			log.Printf("daemon accept: %v", err)
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				// Temporary accept errors: keep going.
+				log.Printf("daemon accept (temporary): %v", err)
+				continue
+			}
+			// Permanent error — back off briefly
+			log.Printf("daemon accept (permanent): %v", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		d.wg.Add(1)

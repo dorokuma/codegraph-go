@@ -2,8 +2,10 @@ package extraction
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -26,7 +28,6 @@ import (
 // TreeSitterExtractor uses tree-sitter for AST-based extraction.
 type TreeSitterExtractor struct {
 	language string
-	parser   *sitter.Parser
 	lang     *sitter.Language
 }
 
@@ -54,26 +55,54 @@ var tsLangRegistry = map[string]treeSitterLangFactory{
 	"lua":       {get: lua.GetLanguage},
 }
 
+// tsParserPools caches sync.Pool per language so parsers are reused across files
+// instead of being created per-file (and left for GC non-deterministic finalization).
+var tsParserPools sync.Map
+
+func getParserPool(langName string) *sync.Pool {
+	if p, ok := tsParserPools.Load(langName); ok {
+		return p.(*sync.Pool)
+	}
+	f, ok := tsLangRegistry[langName]
+	if !ok {
+		return nil
+	}
+	pool := &sync.Pool{
+		New: func() any {
+			p := sitter.NewParser()
+			p.SetLanguage(f.get())
+			return p
+		},
+	}
+	actual, _ := tsParserPools.LoadOrStore(langName, pool)
+	return actual.(*sync.Pool)
+}
+
 // NewTreeSitterExtractor creates a tree-sitter extractor for the given language.
+// Parsers are obtained from a per-language pool on each Extract call.
 func NewTreeSitterExtractor(language string) *TreeSitterExtractor {
 	factory, ok := tsLangRegistry[language]
 	if !ok {
 		return nil
 	}
 	lang := factory.get()
-	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
-	return &TreeSitterExtractor{language: language, parser: parser, lang: lang}
+	return &TreeSitterExtractor{language: language, lang: lang}
 }
 
 // Extract parses the source code and returns nodes and edges using tree-sitter.
 func (e *TreeSitterExtractor) Extract(source string, filePath string) ExtractResult {
-	if e.parser == nil {
+	if e.lang == nil {
 		return ExtractResult{}
 	}
+	pool := getParserPool(e.language)
+	if pool == nil {
+		return ExtractResult{}
+	}
+	parser := pool.Get().(*sitter.Parser)
+	defer pool.Put(parser)
 
 	sourceBytes := []byte(source)
-	tree, err := e.parser.ParseCtx(context.Background(), nil, sourceBytes)
+	tree, err := parser.ParseCtx(context.Background(), nil, sourceBytes)
 	if err != nil {
 		return ExtractResult{}
 	}
@@ -349,8 +378,9 @@ func (e *TreeSitterExtractor) extractCallsFromNode(funcNode *sitter.Node, source
 }
 
 func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
-	// Stop at nested function declarations - don't attribute their calls to the outer function
-	if node.Type() == "function_declaration" || node.Type() == "method_declaration" || node.Type() == "func_literal" {
+	// Stop at named nested function declarations (their calls belong to them).
+	// Anonymous func_literal bodies are traversed — their calls belong to the outer function.
+	if node.Type() == "function_declaration" || node.Type() == "method_declaration" {
 		return
 	}
 
@@ -368,15 +398,19 @@ func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePa
 				}
 			}
 
-			if calleeName != "" && calleeName != funcName && !seen[calleeName] && !isGoKeyword(calleeName) {
-				seen[calleeName] = true
-				*edges = append(*edges, ExtractedEdge{
-					SourceName: funcName,
-					TargetName: calleeName,
-					Kind:       "calls",
-					File:       filePath,
-					Line:       funcLine,
-				})
+			if calleeName != "" && calleeName != funcName && !isGoKeyword(calleeName) {
+				callLine := int(node.StartPoint().Row) + 1
+				key := fmt.Sprintf("%s:%d", calleeName, callLine)
+				if !seen[key] {
+					seen[key] = true
+					*edges = append(*edges, ExtractedEdge{
+						SourceName: funcName,
+						TargetName: calleeName,
+						Kind:       "calls",
+						File:       filePath,
+						Line:       callLine,
+					})
+				}
 			}
 		}
 	}
@@ -700,8 +734,9 @@ func (e *TreeSitterExtractor) appendJSCallable(kind, name string, node *sitter.N
 
 // findCallsJS records call edges with the *call-site* line (needed by callback synthesis).
 func (e *TreeSitterExtractor) findCallsJS(node *sitter.Node, source []byte, filePath string, funcName string, edges *[]ExtractedEdge, seen map[string]bool) {
-	// Stop at nested function declarations — their calls belong to them.
-	if node.Type() == "function_declaration" || node.Type() == "arrow_function" || node.Type() == "function_expression" {
+	// Stop at named function declarations — their calls belong to them.
+	// Anonymous arrow_function/function_expression bodies are traversed — their calls belong to the outer function.
+	if node.Type() == "function_declaration" {
 		return
 	}
 
@@ -721,16 +756,19 @@ func (e *TreeSitterExtractor) findCallsJS(node *sitter.Node, source []byte, file
 				}
 			}
 
-			if calleeName != "" && calleeName != funcName && !seen[calleeName] && !isJSKeyword(calleeName) {
-				seen[calleeName] = true
+			if calleeName != "" && calleeName != funcName && !isJSKeyword(calleeName) {
 				callLine := int(node.StartPoint().Row) + 1
-				*edges = append(*edges, ExtractedEdge{
-					SourceName: funcName,
-					TargetName: calleeName,
-					Kind:       "calls",
-					File:       filePath,
-					Line:       callLine,
-				})
+				key := fmt.Sprintf("%s:%d", calleeName, callLine)
+				if !seen[key] {
+					seen[key] = true
+					*edges = append(*edges, ExtractedEdge{
+						SourceName: funcName,
+						TargetName: calleeName,
+						Kind:       "calls",
+						File:       filePath,
+						Line:       callLine,
+					})
+				}
 			}
 		}
 	}
@@ -904,7 +942,7 @@ func (e *TreeSitterExtractor) processPythonClass(node *sitter.Node, source []byt
 }
 
 func (e *TreeSitterExtractor) findCallsPython(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
-	// Stop at nested function definitions
+	// Stop at nested function definitions (named functions get their own nodes via walkPython).
 	if node.Type() == "function_definition" {
 		return
 	}
@@ -925,15 +963,19 @@ func (e *TreeSitterExtractor) findCallsPython(node *sitter.Node, source []byte, 
 				}
 			}
 
-			if calleeName != "" && calleeName != funcName && !seen[calleeName] && !isPythonKeyword(calleeName) {
-				seen[calleeName] = true
-				*edges = append(*edges, ExtractedEdge{
-					SourceName: funcName,
-					TargetName: calleeName,
-					Kind:       "calls",
-					File:       filePath,
-					Line:       funcLine,
-				})
+			if calleeName != "" && calleeName != funcName && !isPythonKeyword(calleeName) {
+				callLine := int(node.StartPoint().Row) + 1
+				key := fmt.Sprintf("%s:%d", calleeName, callLine)
+				if !seen[key] {
+					seen[key] = true
+					*edges = append(*edges, ExtractedEdge{
+						SourceName: funcName,
+						TargetName: calleeName,
+						Kind:       "calls",
+						File:       filePath,
+						Line:       callLine,
+					})
+				}
 			}
 		}
 	}
