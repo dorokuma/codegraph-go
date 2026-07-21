@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dorokuma/codegraph-go/db"
 )
@@ -393,6 +394,21 @@ func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db
 	return &n
 }
 
+// argReCache avoids recompiling the registrar-name regex per call site.
+var argReCache sync.Map
+
+// getArgRe returns a compiled regex that matches calls to name, e.g.
+//   name( this.callback )
+// Cached by name so repeated hits on the same registrar don't recompile.
+func getArgRe(name string) *regexp.Regexp {
+	if v, ok := argReCache.Load(name); ok {
+		return v.(*regexp.Regexp)
+	}
+	re := regexp.MustCompile(regexp.QuoteMeta(name) + `\s*\(\s*(?:this\.)?(\w+)`)
+	actual, _ := argReCache.LoadOrStore(name, re)
+	return actual.(*regexp.Regexp)
+}
+
 // fieldChannelEdges: registrar/dispatcher share a field store → dispatcher calls registered callbacks.
 func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 	methods, err := ctx.nodesOfKind(db.KindMethod)
@@ -449,7 +465,7 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 		if len(chDisp) == 0 {
 			continue
 		}
-		argRe := regexp.MustCompile(regexp.QuoteMeta(reg.node.Name) + `\s*\(\s*(?:this\.)?(\w+)`)
+		argRe := getArgRe(reg.node.Name)
 		incoming, err := ctx.db.GetIncomingEdges(reg.node.ID, []string{db.EdgeCalls})
 		if err != nil {
 			continue

@@ -52,7 +52,8 @@ type server struct {
 	defReCache stdsync.Map // string → *regexp.Regexp
 
 	// detectCache avoids repeated os.ReadDir+stat per tool call in home mode.
-	detectOnce stdsync.Once
+	detectMu   stdsync.Mutex
+	detectDone bool
 	detectDirs []string // cached project directory names under workdir
 }
 
@@ -1130,22 +1131,25 @@ func (s *server) detectProject(queries ...string) string {
 	if !extraction.IsBroadWorkdir(s.workdir) {
 		return ""
 	}
-	// Populate cached project names once per server lifetime.
-	s.detectOnce.Do(func() {
+	// Populate cached project names; retry on failure (unlike sync.Once).
+	s.detectMu.Lock()
+	if !s.detectDone {
 		entries, err := os.ReadDir(s.workdir)
-		if err != nil {
-			return
-		}
-		for _, e := range entries {
-			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-				continue
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				projectDir := filepath.Join(s.workdir, e.Name())
+				if extraction.HasProjectMarker(projectDir) {
+					s.detectDirs = append(s.detectDirs, e.Name())
+				}
 			}
-			projectDir := filepath.Join(s.workdir, e.Name())
-			if extraction.HasProjectMarker(projectDir) {
-				s.detectDirs = append(s.detectDirs, e.Name())
-			}
+			s.detectDone = true
 		}
-	})
+		// On failure, don't set detectDone — retry next call
+	}
+	s.detectMu.Unlock()
 	for _, q := range queries {
 		q = strings.ToLower(strings.TrimSpace(q))
 		if q == "" {
