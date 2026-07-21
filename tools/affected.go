@@ -91,6 +91,21 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			}
 			affected[file] = true
 
+			// Include same-directory test files. Go convention: same-package
+			// _test.go files test the package but don't import it, so the
+			// import-closure BFS would miss them.
+			if !isTestFile(file, workdir, args.Filter) {
+				dir := filepath.Dir(file)
+				dirFiles, dirErr := database.ListFilesInDirContext(ctx, dir)
+				if dirErr == nil {
+					for _, df := range dirFiles {
+						if df != file && isTestFile(df, workdir, args.Filter) && !affected[df] {
+							affected[df] = true
+						}
+					}
+				}
+			}
+
 			// Find files that import this file's package
 			importers, err := findImportersCtx(ctx, database, file)
 			if err != nil {
