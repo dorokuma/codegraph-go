@@ -173,7 +173,7 @@ func (l *lruCache) touch(key string) {
 
 func (l *lruCache) len() int { return len(l.store) }
 
-const fileContentMaxEntries = 64
+const fileContentMaxEntries = 256
 
 type synthCtx struct {
 	db      *db.DB

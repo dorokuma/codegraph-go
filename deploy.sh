@@ -12,7 +12,7 @@ go build -o ./bin/codegraph-go . 2>&1
 echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
 
 echo "=== 停止旧进程 ==="
-PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -o '"pid":[0-9]*' | grep -o '[0-9]*')
+PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
 if [ -n "$PID" ]; then
   if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
     kill "$PID" 2>/dev/null && echo "killed daemon pid $PID" || echo "daemon already stopped"
@@ -45,7 +45,11 @@ if git diff --cached --quiet; then
   echo "无改动，跳过提交"
 else
   VERSION=$(grep 'PackageVersion' daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
-  git commit -m "v${VERSION}" 2>&1
+  if [ -z "$VERSION" ]; then
+    VERSION="unknown"
+    echo "warning: VERSION is empty, using 'unknown'"
+  fi
+  git commit -m "v${VERSION}" 2>&1 || { echo "commit failed (non-fatal)"; }
   echo "COMMITTED v${VERSION} — push manually with: git push"
 fi
 

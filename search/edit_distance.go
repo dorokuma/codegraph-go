@@ -12,8 +12,12 @@ func BoundedEditDistance(a, b string, maxDist int) int {
 	if a == b {
 		return 0
 	}
-	al := len(a)
-	bl := len(b)
+	// Compare as runes so multi-byte identifiers (e.g. "café" vs "cafe")
+	// produce correct character-level edit distances.
+	ra := []rune(a)
+	rb := []rune(b)
+	al := len(ra)
+	bl := len(rb)
 	if abs(al-bl) > maxDist {
 		return maxDist + 1
 	}
@@ -35,7 +39,7 @@ func BoundedEditDistance(a, b string, maxDist int) int {
 		rowMin := cur[0]
 		for j := 1; j <= bl; j++ {
 			cost := 0
-			if a[i-1] != b[j-1] {
+			if ra[i-1] != rb[j-1] {
 				cost = 1
 			}
 			insertion := cur[j-1] + 1

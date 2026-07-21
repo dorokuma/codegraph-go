@@ -326,7 +326,7 @@ func (e *TreeSitterExtractor) processGoFunction(node *sitter.Node, source []byte
 			Line:       startLine,
 		})
 	}
-	e.extractCallsFromNode(node, source, filePath, name, startLine, edges)
+	e.extractCallsFromNode(node, source, filePath, name, edges)
 }
 
 func (e *TreeSitterExtractor) processGoTypeDecl(node *sitter.Node, source []byte, filePath, pkg string, nodes *[]ExtractedNode) {
@@ -369,15 +369,15 @@ func (e *TreeSitterExtractor) processGoTypeDecl(node *sitter.Node, source []byte
 	}
 }
 
-func (e *TreeSitterExtractor) extractCallsFromNode(funcNode *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge) {
+func (e *TreeSitterExtractor) extractCallsFromNode(funcNode *sitter.Node, source []byte, filePath string, funcName string, edges *[]ExtractedEdge) {
 	bodyNode := funcNode.ChildByFieldName("body")
 	if bodyNode == nil {
 		return
 	}
-	e.findCalls(bodyNode, source, filePath, funcName, funcLine, edges, make(map[string]bool))
+	e.findCalls(bodyNode, source, filePath, funcName, edges, make(map[string]bool))
 }
 
-func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
+func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePath string, funcName string, edges *[]ExtractedEdge, seen map[string]bool) {
 	// Stop at named nested function declarations (their calls belong to them).
 	// Anonymous func_literal bodies are traversed — their calls belong to the outer function.
 	if node.Type() == "function_declaration" || node.Type() == "method_declaration" {
@@ -418,7 +418,7 @@ func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePa
 	// Recurse
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
-		e.findCalls(child, source, filePath, funcName, funcLine, edges, seen)
+		e.findCalls(child, source, filePath, funcName, edges, seen)
 	}
 }
 
@@ -739,6 +739,11 @@ func (e *TreeSitterExtractor) findCallsJS(node *sitter.Node, source []byte, file
 	if node.Type() == "function_declaration" {
 		return
 	}
+	// Named function_expression (e.g. const f = function foo(){...}) already has
+	// its own node created by walkNestedNamedJS; skip its body to avoid double-counting.
+	if node.Type() == "function_expression" && node.ChildByFieldName("name") != nil {
+		return
+	}
 
 	if node.Type() == "call_expression" {
 		funcNode := node.ChildByFieldName("function")
@@ -913,7 +918,7 @@ func (e *TreeSitterExtractor) processPythonFunction(node *sitter.Node, source []
 	if body == nil {
 		body = node
 	}
-	e.findCallsPython(body, source, filePath, name, startLine, edges, make(map[string]bool))
+	e.findCallsPython(body, source, filePath, name, edges, make(map[string]bool))
 }
 
 func (e *TreeSitterExtractor) processPythonClass(node *sitter.Node, source []byte, filePath string, nodes *[]ExtractedNode) string {
@@ -941,7 +946,7 @@ func (e *TreeSitterExtractor) processPythonClass(node *sitter.Node, source []byt
 	return name
 }
 
-func (e *TreeSitterExtractor) findCallsPython(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
+func (e *TreeSitterExtractor) findCallsPython(node *sitter.Node, source []byte, filePath string, funcName string, edges *[]ExtractedEdge, seen map[string]bool) {
 	// Stop at nested function definitions (named functions get their own nodes via walkPython).
 	if node.Type() == "function_definition" {
 		return
@@ -982,7 +987,7 @@ func (e *TreeSitterExtractor) findCallsPython(node *sitter.Node, source []byte, 
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
-		e.findCallsPython(child, source, filePath, funcName, funcLine, edges, seen)
+		e.findCallsPython(child, source, filePath, funcName, edges, seen)
 	}
 }
 

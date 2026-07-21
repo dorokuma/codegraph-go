@@ -38,7 +38,7 @@ func TestToolCallersGraph(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, ok, err := ToolCallersGraph(database, dir, GraphQueryArgs{Name: "foo"})
+	text, ok, err := ToolCallersGraph(context.Background(), database, dir, GraphQueryArgs{Name: "foo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestToolCalleesGraph(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, ok, err := ToolCalleesGraph(database, dir, GraphQueryArgs{Name: "foo"})
+	text, ok, err := ToolCalleesGraph(context.Background(), database, dir, GraphQueryArgs{Name: "foo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestToolImpactGraph(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, ok, err := ToolImpactGraph(database, dir, GraphQueryArgs{Name: "bar", Depth: 3})
+	text, ok, err := ToolImpactGraph(context.Background(), database, dir, GraphQueryArgs{Name: "bar", Depth: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestResolveDefs(t *testing.T) {
 	defer cleanup()
 
 	// Basic lookup
-	defs, err := resolveDefs(database, "foo", "", "", "", dir)
+	defs, err := resolveDefs(context.Background(), database, "foo", "", "", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestResolveDefs(t *testing.T) {
 	}
 
 	// Non-existent symbol
-	defs, err = resolveDefs(database, "nonexistent", "", "", "", dir)
+	defs, err = resolveDefs(context.Background(), database, "nonexistent", "", "", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestResolveDefs(t *testing.T) {
 	}
 
 	// Path filter: only files under foo.go's dir
-	defs, err = resolveDefs(database, "foo", dir, "", "", dir)
+	defs, err = resolveDefs(context.Background(), database, "foo", dir, "", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestResolveDefs(t *testing.T) {
 	}
 
 	// Path filter: exclude by path
-	defs, err = resolveDefs(database, "foo", "/nonexistent", "", "", dir)
+	defs, err = resolveDefs(context.Background(), database, "foo", "/nonexistent", "", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestResolveDefs(t *testing.T) {
 	}
 
 	// Glob filter
-	defs, err = resolveDefs(database, "foo", "", "", "*.go", dir)
+	defs, err = resolveDefs(context.Background(), database, "foo", "", "", "*.go", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestResolveDefs(t *testing.T) {
 		t.Fatal("glob *.go should match foo.go")
 	}
 
-	defs, err = resolveDefs(database, "foo", "", "", "*.ts", dir)
+	defs, err = resolveDefs(context.Background(), database, "foo", "", "", "*.ts", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestResolveDefs(t *testing.T) {
 	}
 
 	// File hint narrows overloaded names
-	defs, err = resolveDefs(database, "foo", "", "foo.go", "", dir)
+	defs, err = resolveDefs(context.Background(), database, "foo", "", "foo.go", "", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
