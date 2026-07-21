@@ -97,12 +97,10 @@ func ResolveBestTarget(candidates []Node, fromFile string, preferCallTarget bool
 			bestID = c.ID
 		}
 	}
-	// Require at least some signal if multiple candidates (avoid pure first-hit)
-	if len(candidates) > 1 && bestScore < 5 && preferCallTarget {
-		// still accept best if it's a function somewhere
-		if bestID != 0 {
-			return bestID
-		}
+	// Require at least some signal if multiple candidates (avoid pure first-hit).
+	// bestScore starts at -1 and every candidate with score>=0 sets bestID≠0,
+	// so bestID is always non-zero here. Threshold check must be on bestScore.
+	if bestScore < 5 {
 		return 0
 	}
 	return bestID

@@ -30,9 +30,10 @@ func SplitIdentifierSegments(name string) []string {
 
 	// Split camelCase: insert space before uppercase that follows lowercase.
 	var buf strings.Builder
-	for i, r := range normalized {
+	nr := []rune(normalized)
+	for i, r := range nr {
 		if i > 0 && unicode.IsUpper(r) {
-			prev := rune(normalized[i-1])
+			prev := nr[i-1]
 			if unicode.IsLower(prev) {
 				buf.WriteRune(' ')
 			}

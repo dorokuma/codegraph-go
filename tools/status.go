@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/extraction"
 )
 
 // StatusArgs are the arguments for the status tool.
@@ -26,8 +28,9 @@ type ContentItem struct {
 }
 
 // ToolStatus returns index health and statistics.
+// DB reads now accept context via Context variants; cancellation is supported.
 func ToolStatus(ctx context.Context, database *db.DB, workdir string, args StatusArgs, pendingFiles []string) (*StatusResult, error) {
-	stats, err := database.GetStats()
+	stats, err := database.GetStatsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +49,10 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 	}
 
 	b.WriteString(fmt.Sprintf("DB: %s (schema=%s)\n", database.Path(), db.SchemaRevision()))
-	if need, old, err := database.NeedsRebuild(); err == nil && need {
+	need, old, rebuildErr := database.NeedsRebuildContext(ctx)
+	if rebuildErr != nil {
+		b.WriteString(fmt.Sprintf("Rebuild check failed: %v\n", rebuildErr))
+	} else if need {
 		b.WriteString(fmt.Sprintf("Rebuild pending: %s → %s\n", old, db.SchemaRevision()))
 	}
 
@@ -54,8 +60,39 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 		b.WriteString(fmt.Sprintf("Pending: %d files\n", len(pendingFiles)))
 	}
 
+	// Home-mode: list which projects are indexed under workdir.
+	if extraction.IsBroadWorkdir(workdir) {
+		b.WriteString("\nIndexed projects:\n")
+		entries, readErr := os.ReadDir(workdir)
+		if readErr != nil {
+			b.WriteString(fmt.Sprintf("(error reading workdir: %v)\n", readErr))
+		} else {
+			found := 0
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				full := filepath.Join(workdir, e.Name())
+				if extraction.ShouldSkipDirIn(workdir, full, e.Name()) {
+					continue
+				}
+				if !extraction.HasProjectMarker(full) {
+					continue
+				}
+				b.WriteString(fmt.Sprintf("- %s/\n", e.Name()))
+				found++
+			}
+			if found == 0 {
+				b.WriteString("(no project markers found)\n")
+			}
+		}
+	}
+
 	if args.Path != "" {
-		files, _ := database.ListFiles()
+		files, listErr := database.ListFilesContext(ctx)
+		if listErr != nil {
+			b.WriteString(fmt.Sprintf("ListFiles error: %v\n", listErr))
+		}
 		found := false
 		// Normalize: try exact, suffix, and prefix (for project-level queries like "codegraph-go")
 		norm := filepath.Clean(args.Path)

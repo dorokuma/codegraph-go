@@ -132,3 +132,61 @@ func ScrubNoisyFailedRefs(database *db.DB) (removed int, err error) {
 	}
 	return removed, nil
 }
+
+// ScrubNoisyFailedRefsForFiles is like ScrubNoisyFailedRefs but only processes
+// refs belonging to the given files. When files is nil, processes all files.
+// hasProjectSymbol results are cached per-call to avoid repeated DB lookups.
+func ScrubNoisyFailedRefsForFiles(database *db.DB, files []string) (removed int, err error) {
+	if database == nil {
+		return 0, nil
+	}
+
+	// Cache hasProjectSymbol results per ref name within this call.
+	cache := make(map[string]bool)
+	hasSymbolCached := func(name string) bool {
+		if v, ok := cache[name]; ok {
+			return v
+		}
+		v := hasProjectSymbol(database, name)
+		cache[name] = v
+		return v
+	}
+
+	scrubList := func(status string) (int, error) {
+		var refs []db.UnresolvedRef
+		if files == nil {
+			var err error
+			refs, err = database.ListUnresolvedRefs("", status)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			var err error
+			refs, err = database.ListUnresolvedRefsByFiles(files, status)
+			if err != nil {
+				return 0, err
+			}
+		}
+		count := 0
+		for _, r := range refs {
+			if !IsNoisyRefName(r.ReferenceName) {
+				continue
+			}
+			if hasSymbolCached(r.ReferenceName) {
+				continue
+			}
+			if derr := database.DeleteUnresolvedRef(r.ID); derr != nil {
+				return count, derr
+			}
+			count++
+		}
+		return count, nil
+	}
+
+	n1, err := scrubList("failed")
+	if err != nil {
+		return n1, err
+	}
+	n2, err := scrubList("pending")
+	return n1 + n2, err
+}

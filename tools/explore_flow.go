@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -88,7 +89,7 @@ func tokenSegments(token string) []string {
 //   - ambiguous simple names kept only when a co-named container matches
 //   - chain of ≥2 nodes renders a Flow block (acceptance: two related symbols)
 //   - root subtree filter (ExploreArgs.Path) applies to named seeds and spine hops
-func buildFlowFromNamedSymbols(database *db.DB, workdir, root, query string) flowResult {
+func buildFlowFromNamedSymbols(ctx context.Context, database *db.DB, workdir, root, query string) flowResult {
 	empty := emptyFlow()
 	tokens := tokenizeExploreQuery(query)
 	if len(tokens) < 2 {
@@ -110,7 +111,7 @@ func buildFlowFromNamedSymbols(database *db.DB, workdir, root, query string) flo
 	var namedOrder []db.Node
 
 	for _, t := range tokens {
-		hits, err := findCallableSymbols(database, t)
+		hits, err := findCallableSymbols(ctx, database, t)
 		if err != nil || len(hits) == 0 {
 			continue
 		}
@@ -190,6 +191,10 @@ func buildFlowFromNamedSymbols(database *db.DB, workdir, root, query string) flo
 		deepDepth := 0
 
 		for h := 0; h < len(qq) && len(parent) < 1500; h++ {
+			// Let cancellation/timeout interrupt the BFS early.
+			if err := ctx.Err(); err != nil {
+				return empty
+			}
 			cur := qq[h]
 			if cur.id != seed.ID {
 				if _, isNamed := named[cur.id]; isNamed && cur.depth > deepDepth {
@@ -200,7 +205,7 @@ func buildFlowFromNamedSymbols(database *db.DB, workdir, root, query string) flo
 			if cur.depth >= maxHops-1 {
 				continue
 			}
-			callees, err := database.GetCalleesWithKind(cur.id)
+			callees, err := database.GetCalleesWithKindContext(ctx, cur.id)
 			if err != nil {
 				continue
 			}
@@ -317,20 +322,15 @@ func containerMatches(n db.Node, segPool map[string]bool) bool {
 }
 
 // findCallableSymbols resolves a token to callable nodes (exact name, then tail).
-func findCallableSymbols(database *db.DB, token string) ([]db.Node, error) {
-	name := token
-	if i := strings.LastIndexAny(token, ".#/"); i >= 0 && i+1 < len(token) {
-		// keep full first; also try tail below
-		name = token
-	}
-	nodes, err := database.GetNodeByName(name)
+func findCallableSymbols(ctx context.Context, database *db.DB, token string) ([]db.Node, error) {
+	nodes, err := database.GetNodeByNameContext(ctx, token)
 	if err != nil {
 		return nil, err
 	}
 	if len(nodes) == 0 {
 		// qualified tail: Class.method → method
 		if i := strings.LastIndexAny(token, ".#/"); i >= 0 && i+1 < len(token) {
-			nodes, err = database.GetNodeByName(token[i+1:])
+			nodes, err = database.GetNodeByNameContext(ctx, token[i+1:])
 			if err != nil {
 				return nil, err
 			}
@@ -338,7 +338,7 @@ func findCallableSymbols(database *db.DB, token string) ([]db.Node, error) {
 	}
 	if len(nodes) == 0 {
 		// last segment only for :: forms already handled; try FTS exact
-		fts, err := database.FullTextSearch(lastSegment(token), 20)
+		fts, err := database.FullTextSearchContext(ctx, lastSegment(token), 20)
 		if err != nil {
 			return nil, err
 		}

@@ -327,6 +327,15 @@ func TestClearFile(t *testing.T) {
 		t.Fatalf("expected 0 nodes, got %d", len(nodes))
 	}
 
+	// Edges should cascade-delete (S-17: FK CASCADE from nodes to edges).
+	stats, err := database.GetStats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.EdgeCount != 0 {
+		t.Fatalf("expected 0 edges after ClearFile (CASCADE), got %d", stats.EdgeCount)
+	}
+
 	// File should be gone
 	files, _ := database.ListFiles()
 	for _, f := range files {

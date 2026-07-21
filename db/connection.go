@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -29,7 +30,11 @@ func Open(workdir string) (*DB, error) {
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")
 
-	conn, err := sql.Open("sqlite", dbPath)
+	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
+	// not just the first one in the pool (database/sql may open new connections
+	// concurrently, and default is foreign_keys=OFF / busy_timeout=0).
+	dsn := "file://" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -72,6 +77,13 @@ func Open(workdir string) (*DB, error) {
 	if err := db.ensureSchema(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ensure schema: %w", err)
+	}
+	// Older DBs may have nodes_fts without the tokenize clause; rebuild first
+	// so ensureFTSBackfill only rebuilds once (not once with old tokenize then
+	// again after the DROP+recreate below).
+	if err := db.ensureFTSTokenize(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("fts tokenize: %w", err)
 	}
 	// Old indexes created before FTS need a one-time backfill; triggers only
 	// cover rows written after the FTS table exists.
@@ -119,4 +131,32 @@ func (d *DB) Close() error {
 // Path returns the database file path.
 func (d *DB) Path() string {
 	return d.path
+}
+
+// ensureFTSTokenize checks whether nodes_fts has the tokenize clause and
+// rebuilds it if missing (pre-S-19 schema). CREATE VIRTUAL TABLE IF NOT EXISTS
+// does not alter an existing FTS table, so we must detect and rebuild manually.
+func (d *DB) ensureFTSTokenize() error {
+	var ddl string
+	if err := d.conn.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes_fts'`,
+	).Scan(&ddl); err != nil {
+		// Table doesn't exist yet — schema SQL will create it with tokenize.
+		return nil
+	}
+	if strings.Contains(ddl, "tokenchars") {
+		return nil
+	}
+	// Rebuild: drop old FTS table, re-apply schema, then backfill.
+	if _, err := d.conn.Exec(`DROP TABLE IF EXISTS nodes_fts`); err != nil {
+		return fmt.Errorf("drop old nodes_fts: %w", err)
+	}
+	// Recreate with tokenize via schema SQL (the FTS table portion).
+	if _, err := d.conn.Exec(schemaSQL); err != nil {
+		return fmt.Errorf("recreate nodes_fts: %w", err)
+	}
+	if _, err := d.conn.Exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild nodes_fts after tokenize fix: %w", err)
+	}
+	return nil
 }

@@ -27,6 +27,7 @@ type AliasMap struct {
 var (
 	aliasCacheMu sync.Mutex
 	aliasCache   = map[string]*aliasCacheEntry{}
+	trailingCommaRe = regexp.MustCompile(`,(\s*[}\]])`)
 )
 
 type aliasCacheEntry struct {
@@ -252,6 +253,5 @@ func stripJSONC(src string) string {
 		i++
 	}
 	// trailing commas before } or ]
-	re := regexp.MustCompile(`,(\s*[}\]])`)
-	return re.ReplaceAllString(out.String(), "$1")
+	return trailingCommaRe.ReplaceAllString(out.String(), "$1")
 }

@@ -16,7 +16,7 @@ type NodeArgs struct {
 	Name         string `json:"name,omitempty" jsonschema:"symbol name (symbol mode). Omit and pass file alone to read a whole file like Read.,optional"`
 	File         string `json:"file,omitempty" jsonschema:"file path or basename. Alone = file-read mode; with name = disambiguate overload.,optional"`
 	Line         int    `json:"line,omitempty" jsonschema:"symbol mode: pin definition at/around this line,optional"`
-	IncludeCode *bool `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default true). File mode always returns source unless symbolsOnly.,optional"`
+	IncludeCode *bool `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default false). File mode always returns source unless symbolsOnly.,optional"`
 	SymbolsOnly bool  `json:"symbolsOnly,omitempty" jsonschema:"file mode: return symbol map + dependents only, no source,optional"`
 	Offset      int   `json:"offset,omitempty" jsonschema:"file mode: 1-based start line (like Read),optional"`
 	Limit       int   `json:"limit,omitempty" jsonschema:"file mode: max lines to return (default whole file, cap 2000),optional"`
@@ -43,8 +43,8 @@ func ToolNode(ctx context.Context, database *db.DB, args NodeArgs) (*NodeResult,
 }
 
 // ToolNodeIn is ToolNode with a workdir for nicer paths and on-disk file reads.
+// DB reads now accept context via Context variants; cancellation is supported.
 func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeArgs) (*NodeResult, error) {
-	_ = ctx
 	name := strings.TrimSpace(args.Name)
 	fileHint := strings.TrimSpace(args.File)
 
@@ -54,7 +54,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 
 	// FILE READ MODE: file alone (no name) → on-disk source like Read + dependents.
 	if name == "" && fileHint != "" {
-		text, err := handleFileView(database, workdir, fileHint, args)
+		text, err := handleFileView(ctx, database, workdir, fileHint, args)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +69,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 		includeCode = *args.IncludeCode
 	}
 
-	nodes, err := findSymbolMatches(database, workdir, name, fileHint, args.Line)
+	nodes, err := findSymbolMatches(ctx, database, workdir, name, fileHint, args.Line)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 
 	// Single definition — common case.
 	if len(nodes) == 1 {
-		text := renderNodeSection(database, workdir, nodes[0], includeCode)
+		text := renderNodeSection(ctx, database, workdir, nodes[0], includeCode)
 		return &NodeResult{
 			Content: []ContentItem{{Type: "text", Text: text}},
 		}, nil
@@ -96,7 +96,7 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 			listed = append(listed, n)
 			continue
 		}
-		section := renderNodeSection(database, workdir, n, includeCode)
+		section := renderNodeSection(ctx, database, workdir, n, includeCode)
 		if len(rendered) == 0 || used+len(section) <= nodeBodyBudget {
 			rendered = append(rendered, section)
 			used += len(section)
@@ -115,26 +115,8 @@ func ToolNodeIn(ctx context.Context, database *db.DB, workdir string, args NodeA
 	}, nil
 }
 
-func findSymbolMatches(database *db.DB, workdir, name, fileHint string, lineHint int) ([]db.Node, error) {
-	// Exact file+line pin (when both set with a name, still prefer line containment after name lookup).
-	if fileHint != "" && lineHint > 0 && name == "" {
-		// unreachable in dual-mode entry (name empty → file view); keep for safety
-		node, err := database.GetNodeByFileLine(fileHint, lineHint)
-		if err != nil {
-			return nil, err
-		}
-		if node == nil && workdir != "" && !strings.HasPrefix(fileHint, "/") {
-			node, err = database.GetNodeByFileLine(filepath.Join(workdir, fileHint), lineHint)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if node != nil {
-			return []db.Node{*node}, nil
-		}
-	}
-
-	nodes, err := database.GetNodeByName(name)
+func findSymbolMatches(ctx context.Context, database *db.DB, workdir, name, fileHint string, lineHint int) ([]db.Node, error) {
+	nodes, err := database.GetNodeByNameContext(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +179,7 @@ func findSymbolMatches(database *db.DB, workdir, name, fileHint string, lineHint
 	return defs, nil
 }
 
-func renderNodeSection(database *db.DB, workdir string, node db.Node, includeCode bool) string {
+func renderNodeSection(ctx context.Context, database *db.DB, workdir string, node db.Node, includeCode bool) string {
 	var b strings.Builder
 	// 精简输出：只显示位置和代码，像 Read 一样
 	fmt.Fprintf(&b, "%s:%d\n", db.RelPath(workdir, node.File), node.Line)
@@ -208,8 +190,11 @@ func renderNodeSection(database *db.DB, workdir string, node db.Node, includeCod
 	}
 
 	// 精简 trail：只显示名称和位置，不显示额外格式
-	callers, _ := database.GetCallersWithKind(node.ID)
-	callees, _ := database.GetCalleesWithKind(node.ID)
+	callers, callerErr := database.GetCallersWithKindContext(ctx, node.ID)
+	callees, calleeErr := database.GetCalleesWithKindContext(ctx, node.ID)
+	if callerErr != nil || calleeErr != nil {
+		fmt.Fprintf(&b, "(error fetching callers/callees for %s)\n", node.Name)
+	}
 	if len(callers) > 0 || len(callees) > 0 {
 		b.WriteString("\n")
 		if len(callees) > 0 {
@@ -236,8 +221,8 @@ func renderNodeSection(database *db.DB, workdir string, node db.Node, includeCod
 	return b.String()
 }
 
-func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (string, error) {
-	resolved, candidates, err := resolveIndexedFile(database, workdir, fileArg)
+func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg string, args NodeArgs) (string, error) {
+	resolved, candidates, err := resolveIndexedFile(ctx, database, workdir, fileArg)
 	if err != nil {
 		return "", err
 	}
@@ -257,7 +242,7 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 	}
 
 	rel := db.RelPath(workdir, resolved)
-	nodes, err := database.GetNodesByFile(resolved)
+	nodes, err := database.GetNodesByFileContext(ctx, resolved)
 	if err != nil {
 		return "", err
 	}
@@ -270,7 +255,10 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 	}
 	sort.Slice(symbols, func(i, j int) bool { return symbols[i].Line < symbols[j].Line })
 
-	dependents, _ := database.GetFileDependents(resolved)
+	dependents, depErr := database.GetFileDependentsContext(ctx, resolved)
+	if depErr != nil {
+		dependents = nil
+	}
 	depSummary := "no other indexed file depends on it"
 	if len(dependents) > 0 {
 		shown := dependents
@@ -316,9 +304,17 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 	if !ok {
 		return "(path outside workspace)\n", nil
 	}
+	// Check file size before reading to avoid memory spike on huge files.
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", rel, err)
+	}
+	if fi.Size() > 1<<20 { // 1 MB
+		return "", fmt.Errorf("%s: file too large (%d bytes) — use Read or a narrower range", rel, fi.Size())
+	}
 	content, err := os.ReadFile(abs)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read %s: %w", rel, err)
 	}
 
 	fileLines := strings.Split(string(content), "\n")
@@ -331,7 +327,7 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 		return fmt.Sprintf("**%s** has %d line%s — offset %d is past the end. %s", rel, total, plural(total), offset, depSummary), nil
 	}
 	maxLines := args.Limit
-	if maxLines <= 0 {
+	if maxLines <= 0 || maxLines > nodeFileLineDef {
 		maxLines = nodeFileLineDef
 	}
 
@@ -355,8 +351,8 @@ func handleFileView(database *db.DB, workdir, fileArg string, args NodeArgs) (st
 
 // resolveIndexedFile finds one indexed path for a path/basename hint.
 // When workdir is set, only files under workdir are considered (no ../ escape).
-func resolveIndexedFile(database *db.DB, workdir, fileArg string) (resolved string, candidates []string, err error) {
-	all, err := database.ListFiles()
+func resolveIndexedFile(ctx context.Context, database *db.DB, workdir, fileArg string) (resolved string, candidates []string, err error) {
+	all, err := database.ListFilesContext(ctx)
 	if err != nil {
 		return "", nil, err
 	}

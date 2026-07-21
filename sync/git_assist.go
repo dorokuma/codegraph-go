@@ -45,10 +45,6 @@ func GitDirtySourceFiles(workdir string) []string {
 			continue
 		}
 		// Skip dependency/generated trees.
-		rel, _ := filepath.Rel(workdir, abs)
-		if rel != "" && extraction.ShouldSkipDirIn(workdir, abs, filepath.Base(filepath.Dir(abs))) {
-			// only a weak check; still include the file if parent isn't a skip name
-		}
 		baseWalk := abs
 		skip := false
 		for {

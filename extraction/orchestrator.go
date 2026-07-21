@@ -243,23 +243,25 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("index worker panic: %v", r)
-				}
-				wg.Done()
-			}()
+			defer wg.Done()
 			for j := range ch {
-				f, n := o.indexIfNeeded(j.path, j.info, j.lang)
-				mu.Lock()
-				totalFiles += f
-				totalNodes += n
-				done++
-				cur, tot := done, len(jobs)
-				mu.Unlock()
-				if onEach != nil {
-					onEach(cur, tot)
-				}
+				func(j indexJob) {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("index worker panic: %v", r)
+						}
+					}()
+					f, n := o.indexIfNeeded(j.path, j.info, j.lang)
+					mu.Lock()
+					totalFiles += f
+					totalNodes += n
+					done++
+					cur, tot := done, len(jobs)
+					mu.Unlock()
+					if onEach != nil {
+						onEach(cur, tot)
+					}
+				}(j)
 			}
 		}()
 	}
@@ -300,13 +302,16 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 		log.Printf("resolved %d edges (%d failed, %d retried)", st.Resolved, st.Failed, st.Retried)
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
-	o.runSynthesis()
+	o.runSynthesis(nil)
 	return totalFiles, totalNodes, nil
 }
 
-func (o *Orchestrator) runSynthesis() {
+// runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
+// When files is non-nil only refs related to those files are scrubbed;
+// nil means scrub all. SynthesizeAll is always full-table (its bottom pass).
+func (o *Orchestrator) runSynthesis(files []string) {
 	// Drop pure-noise failed/pending refs with no project symbol first.
-	o.scrubNoise()
+	o.scrubNoise(files)
 	st, err := resolution.SynthesizeAll(o.db, o.workdir)
 	if err != nil {
 		log.Printf("synthesize: %v", err)
@@ -318,8 +323,10 @@ func (o *Orchestrator) runSynthesis() {
 }
 
 // scrubNoise drops failed/pending pure-noise refs with no matching symbol.
-func (o *Orchestrator) scrubNoise() {
-	n, err := ScrubNoisyFailedRefs(o.db)
+// When files is non-nil, only refs belonging to those files are examined;
+// nil means scrub all. hasProjectSymbol results are cached per-call.
+func (o *Orchestrator) scrubNoise(files []string) {
+	n, err := ScrubNoisyFailedRefsForFiles(o.db, files)
 	if err != nil {
 		log.Printf("scrub noisy refs: %v", err)
 		return
@@ -359,7 +366,7 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 	if _, rerr := resolution.ResolveForFiles(o.db, o.workdir, []string{path}); rerr != nil {
 		log.Printf("resolve after index %s: %v", path, rerr)
 	}
-	o.runSynthesis()
+	o.runSynthesis([]string{path})
 	return n, nil
 }
 
@@ -639,11 +646,8 @@ func (o *Orchestrator) resolveSourceID(name string, line int, nodeIDMap map[stri
 	if id, ok := nodeIDMap[name]; ok {
 		return id
 	}
-	for key, id := range nodeIDMap {
-		if n, _, ok := splitNameLineKey(key); ok && n == name {
-			return id
-		}
-	}
+	// Bare name not found — no need to scan nodeIDMap linearly;
+	// splitNameLineKey would not find a better match here.
 	return 0
 }
 
@@ -672,7 +676,7 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	if _, err := resolution.ResolveForFiles(o.db, o.workdir, files); err != nil {
 		log.Printf("resolve changes: %v", err)
 	}
-	o.runSynthesis()
+	o.runSynthesis(files)
 	return totalFiles, totalNodes, nil
 }
 
@@ -681,6 +685,9 @@ type ProgressFunc func(phase string, current, total int)
 
 // IndexAllWithProgress indexes all files with progress reporting.
 // Same walk/skip/index path as IndexAll (collect jobs, then parallel pool).
+//
+// Thread safety: onProgress may be called concurrently by multiple worker
+// goroutines. Callers must ensure their implementation is thread-safe.
 func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, error) {
 	start := time.Now()
 	jobs, err := o.collectIndexJobs()
@@ -699,7 +706,7 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	} else if st.Resolved > 0 {
 		log.Printf("resolved %d edges after index", st.Resolved)
 	}
-	o.runSynthesis()
+	o.runSynthesis(nil)
 	elapsed := time.Since(start)
 	pending, _ := o.db.CountUnresolvedRefs("pending")
 	log.Printf("indexing complete: %d files, %d nodes, %d pending refs in %v (workers=%d)",

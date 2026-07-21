@@ -3,6 +3,7 @@ package extraction
 import (
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -233,16 +234,55 @@ func extractSFCTemplateRefs(language, source, filePath, fromComponent string) []
 			}{body, startLine - 1})
 		}
 	default:
-		// svelte / astro: whole file minus scripts/styles/(astro fm)
-		stripped := sfcScriptRe.ReplaceAllString(source, "\n")
-		stripped = sfcStyleRe.ReplaceAllString(stripped, "\n")
-		if language == "astro" {
-			stripped = astroFMRe.ReplaceAllString(stripped, "\n")
+		// svelte / astro: extract template regions from original source,
+		// skipping script/style/frontmatter blocks. Each region's offset
+		// maps back to original line numbers so template refs get correct
+		// source locations.
+		type span struct{ start, end int }
+		var exclude []span
+		for _, m := range sfcScriptRe.FindAllStringSubmatchIndex(source, -1) {
+			if len(m) >= 2 {
+				exclude = append(exclude, span{m[0], m[1]})
+			}
 		}
-		regions = append(regions, struct {
-			text   string
-			offset int
-		}{stripped, 0})
+		for _, m := range sfcStyleRe.FindAllStringSubmatchIndex(source, -1) {
+			if len(m) >= 2 {
+				exclude = append(exclude, span{m[0], m[1]})
+			}
+		}
+		if language == "astro" {
+			for _, m := range astroFMRe.FindAllStringSubmatchIndex(source, -1) {
+				if len(m) >= 2 {
+					exclude = append(exclude, span{m[0], m[1]})
+				}
+			}
+		}
+		sort.Slice(exclude, func(i, j int) bool { return exclude[i].start < exclude[j].start })
+		pos := 0
+		for _, sp := range exclude {
+			if sp.start > pos {
+				text := source[pos:sp.start]
+				startLine := 1
+				if pos > 0 {
+					startLine = strings.Count(source[:pos], "\n") + 1
+				}
+				regions = append(regions, struct {
+					text   string
+					offset int
+				}{text, startLine - 1})
+			}
+			if sp.end > pos {
+				pos = sp.end
+			}
+		}
+		if pos < len(source) {
+			text := source[pos:]
+			startLine := strings.Count(source[:pos], "\n") + 1
+			regions = append(regions, struct {
+				text   string
+				offset int
+			}{text, startLine - 1})
+		}
 	}
 
 	var refs []UnresolvedReference
@@ -251,10 +291,6 @@ func extractSFCTemplateRefs(language, source, filePath, fromComponent string) []
 		// Component opening tags only.
 		for _, m := range sfcOpenTagRe.FindAllStringSubmatchIndex(reg.text, -1) {
 			if len(m) < 4 {
-				continue
-			}
-			// Reject matches that are actually close tags (safety if regex drifts).
-			if m[2] > 0 && reg.text[m[2]-1] == '/' {
 				continue
 			}
 			raw := reg.text[m[2]:m[3]]

@@ -54,8 +54,8 @@ func (d *FrameworkDetector) DetectRoutes(source string, filePath string, languag
 // ---------- Go frameworks: Gin, chi, gorilla/mux ----------
 
 var (
-	// Gin: r.GET("/path", handler)
-	ginRouteRe = regexp.MustCompile(`(\w+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*"([^"]+)"\s*,\s*(\w+)`)
+	// Gin: r.GET("/path", handler) — also matches chained r.Group("/v1").GET(...)
+	ginRouteRe = regexp.MustCompile(`([\w)]+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*"([^"]+)"\s*,\s*(\w+)`)
 	// chi: r.Get("/path", handler), r.Post("/path", handler)
 	chiRouteRe = regexp.MustCompile(`(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*(\w+)`)
 	// mux: r.HandleFunc("/path", handler).Methods("GET", "POST")

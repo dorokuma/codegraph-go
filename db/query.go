@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -146,6 +147,10 @@ func nullInt(v int) interface{} {
 }
 
 // UpsertEdge inserts or updates an edge. Returns the edge ID.
+// NOTE: result.LastInsertId() is unreliable after ON CONFLICT DO UPDATE —
+// it returns 0 on conflict. Callers that need the real ID should query it
+// separately (like UpsertNode does). Current non-test callers discard the
+// return value so this is harmless in practice.
 func (d *DB) UpsertEdge(e *Edge) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -191,6 +196,8 @@ func (d *DB) UpsertFileRecord(f *FileRecord) error {
 }
 
 // InsertUnresolvedRef stores a pending reference for later resolution.
+// NOTE: result.LastInsertId() is unreliable after ON CONFLICT DO UPDATE —
+// it returns 0 on conflict. Current callers discard the return value.
 func (d *DB) InsertUnresolvedRef(r *UnresolvedRef) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -269,6 +276,47 @@ func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error
 	return out, rows.Err()
 }
 
+// ListUnresolvedRefsByFiles returns unresolved_refs rows for multiple file
+// paths, optionally filtered by status (empty string = no filter).
+// This avoids loading all unresolved refs into memory and filtering in Go.
+func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]UnresolvedRef, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	q := `SELECT id, from_node, reference_name, reference_kind, line, col,
+		file_path, language, status, name_tail, COALESCE(candidates,'')
+		FROM unresolved_refs WHERE file_path IN (`
+	ph := make([]string, len(files))
+	args := make([]interface{}, 0, len(files)+1)
+	for i, f := range files {
+		ph[i] = "?"
+		args = append(args, f)
+	}
+	q += strings.Join(ph, ",") + `)`
+	if status != "" {
+		q += ` AND status = ?`
+		args = append(args, status)
+	}
+	rows, err := d.conn.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UnresolvedRef
+	for rows.Next() {
+		var r UnresolvedRef
+		if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
+			&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // GetEdgeByEndpoints loads one edge by endpoints + kind (for tests / inspection).
 func (d *DB) GetEdgeByEndpoints(sourceID, targetID int64, kind string) (*Edge, error) {
 	d.mu.RLock()
@@ -320,10 +368,15 @@ func (d *DB) MarkUnresolvedFailed(id int64, nameTail string) error {
 
 // GetNodesByFile returns all nodes defined in a file path.
 func (d *DB) GetNodesByFile(file string) ([]Node, error) {
+	return d.GetNodesByFileContext(context.Background(), file)
+}
+
+// GetNodesByFileContext is the context-aware variant of GetNodesByFile.
+func (d *DB) GetNodesByFileContext(ctx context.Context, file string) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes WHERE file = ?`, file)
+	rows, err := d.conn.QueryContext(ctx, `SELECT `+nodeSelectCols+` FROM nodes WHERE file = ?`, file)
 	if err != nil {
 		return nil, err
 	}
@@ -333,10 +386,15 @@ func (d *DB) GetNodesByFile(file string) ([]Node, error) {
 
 // GetNodeByName finds nodes by name (exact match).
 func (d *DB) GetNodeByName(name string) ([]Node, error) {
+	return d.GetNodeByNameContext(context.Background(), name)
+}
+
+// GetNodeByNameContext is the context-aware variant of GetNodeByName.
+func (d *DB) GetNodeByNameContext(ctx context.Context, name string) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT `+nodeSelectCols+`
 		FROM nodes WHERE name = ?
 	`, name)
@@ -493,10 +551,15 @@ func (d *DB) GetCallees(nodeID int64) ([]Node, error) {
 
 // GetCallersWithKind is like GetCallers but also returns the edge kind per hit.
 func (d *DB) GetCallersWithKind(nodeID int64) ([]NodeRef, error) {
+	return d.GetCallersWithKindContext(context.Background(), nodeID)
+}
+
+// GetCallersWithKindContext is the context-aware variant of GetCallersWithKind.
+func (d *DB) GetCallersWithKindContext(ctx context.Context, nodeID int64) ([]NodeRef, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type, e.kind
@@ -513,10 +576,15 @@ func (d *DB) GetCallersWithKind(nodeID int64) ([]NodeRef, error) {
 
 // GetCalleesWithKind is like GetCallees but also returns the edge kind per hit.
 func (d *DB) GetCalleesWithKind(nodeID int64) ([]NodeRef, error) {
+	return d.GetCalleesWithKindContext(context.Background(), nodeID)
+}
+
+// GetCalleesWithKindContext is the context-aware variant of GetCalleesWithKind.
+func (d *DB) GetCalleesWithKindContext(ctx context.Context, nodeID int64) ([]NodeRef, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type, e.kind
@@ -649,6 +717,9 @@ func (d *DB) GetFileContentHash(path string) (string, error) {
 }
 
 // ClearFile removes all nodes, edges, and unresolved_refs for a file (before reindexing).
+// Foreign keys are ON via DSN pragma; deleting nodes cascades to edges and
+// unresolved_refs (by from_node FK). unresolved_refs.file_path has no FK so we
+// delete it explicitly.
 func (d *DB) ClearFile(path string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -659,45 +730,20 @@ func (d *DB) ClearFile(path string) error {
 	}
 	defer tx.Rollback()
 
-	// Drop refs anchored on this file path first (covers any orphan status rows).
+	// Drop refs anchored on this file path (file_path column has no FK).
 	if _, err := tx.Exec(`DELETE FROM unresolved_refs WHERE file_path = ?`, path); err != nil {
-		return err
+		return fmt.Errorf("clear file unresolved_refs: %w", err)
 	}
 
-	// Get node IDs for this file
-	rows, err := tx.Query("SELECT id FROM nodes WHERE file = ?", path)
-	if err != nil {
-		return err
-	}
-	var nodeIDs []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		nodeIDs = append(nodeIDs, id)
-	}
-	rows.Close()
-
-	// Delete edges + any remaining refs by from_node (FK cascade may also do this).
-	for _, id := range nodeIDs {
-		if _, err := tx.Exec("DELETE FROM unresolved_refs WHERE from_node = ?", id); err != nil {
-			return err
-		}
-		if _, err := tx.Exec("DELETE FROM edges WHERE source_id = ? OR target_id = ?", id, id); err != nil {
-			return err
-		}
-	}
-
-	// Delete nodes for this file
-	if _, err := tx.Exec("DELETE FROM nodes WHERE file = ?", path); err != nil {
-		return err
+	// Delete nodes for this file. CASCADE deletes edges (source_id/target_id FK)
+	// and unresolved_refs (from_node FK).
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE file = ?`, path); err != nil {
+		return fmt.Errorf("clear file nodes: %w", err)
 	}
 
 	// Delete file record
-	if _, err := tx.Exec("DELETE FROM files WHERE path = ?", path); err != nil {
-		return err
+	if _, err := tx.Exec(`DELETE FROM files WHERE path = ?`, path); err != nil {
+		return fmt.Errorf("clear file record: %w", err)
 	}
 
 	return tx.Commit()
@@ -713,37 +759,59 @@ type Stats struct {
 
 // GetStats returns index statistics.
 func (d *DB) GetStats() (*Stats, error) {
+	return d.GetStatsContext(context.Background())
+}
+
+// GetStatsContext is the context-aware variant of GetStats.
+func (d *DB) GetStatsContext(ctx context.Context) (*Stats, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	s := &Stats{KindCounts: make(map[string]int)}
 
-	d.conn.QueryRow("SELECT COUNT(*) FROM nodes").Scan(&s.NodeCount)
-	d.conn.QueryRow("SELECT COUNT(*) FROM edges").Scan(&s.EdgeCount)
-	d.conn.QueryRow("SELECT COUNT(*) FROM files").Scan(&s.FileCount)
+	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM nodes").Scan(&s.NodeCount); err != nil {
+		return nil, fmt.Errorf("count nodes: %w", err)
+	}
+	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM edges").Scan(&s.EdgeCount); err != nil {
+		return nil, fmt.Errorf("count edges: %w", err)
+	}
+	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM files").Scan(&s.FileCount); err != nil {
+		return nil, fmt.Errorf("count files: %w", err)
+	}
 
-	rows, err := d.conn.Query("SELECT kind, COUNT(*) FROM nodes GROUP BY kind")
+	rows, err := d.conn.QueryContext(ctx, "SELECT kind, COUNT(*) FROM nodes GROUP BY kind")
 	if err != nil {
-		return s, nil
+		return nil, fmt.Errorf("count by kind: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var kind string
 		var cnt int
-		if err := rows.Scan(&kind, &cnt); err == nil {
-			s.KindCounts[kind] = cnt
+		if err := rows.Scan(&kind, &cnt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan kind count: %w", err)
 		}
+		s.KindCounts[kind] = cnt
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows kind count: %w", err)
 	}
 
 	return s, nil
 }
 
-// ListFiles returns all indexed files.
+// ListFiles returns all indexed files (capped at 100000 to avoid unbounded
+// memory usage on very large databases).
 func (d *DB) ListFiles() ([]string, error) {
+	return d.ListFilesContext(context.Background())
+}
+
+// ListFilesContext is the context-aware variant of ListFiles.
+func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query("SELECT path FROM files ORDER BY path")
+	rows, err := d.conn.QueryContext(ctx, "SELECT path FROM files ORDER BY path LIMIT 100000")
 	if err != nil {
 		return nil, err
 	}
@@ -751,21 +819,27 @@ func (d *DB) ListFiles() ([]string, error) {
 
 	var files []string
 	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err == nil {
-			files = append(files, path)
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("list files scan: %w", err)
 		}
+		files = append(files, p)
 	}
-	return files, nil
+	return files, rows.Err()
 }
 
 // GetFileDependents returns distinct other files that have a structural edge
 // into a symbol defined in filePath (who depends on this file).
 func (d *DB) GetFileDependents(filePath string) ([]string, error) {
+	return d.GetFileDependentsContext(context.Background(), filePath)
+}
+
+// GetFileDependentsContext is the context-aware variant of GetFileDependents.
+func (d *DB) GetFileDependentsContext(ctx context.Context, filePath string) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT DISTINCT src.file
 		FROM edges e
 		JOIN nodes tgt ON tgt.id = e.target_id
@@ -821,16 +895,24 @@ func (d *DB) GetImportTargetNames(filePath string) ([]string, error) {
 }
 
 // FindImporters finds files that import the given package.
+// Escapes _ and % in targetPkg so they are not treated as LIKE wildcards.
 func (d *DB) FindImporters(targetPkg string) ([]string, error) {
+	return d.FindImportersContext(context.Background(), targetPkg)
+}
+
+// FindImportersContext is the context-aware variant of FindImporters.
+func (d *DB) FindImportersContext(ctx context.Context, targetPkg string) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	// Escape _ and % for LIKE; also escape the escape char itself.
+	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(targetPkg)
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT DISTINCT e.file
 		FROM edges e
 		JOIN nodes n ON n.id = e.target_id
-		WHERE e.kind = 'imports' AND (n.name = ? OR n.name LIKE ?)
-	`, targetPkg, targetPkg+"/%")
+		WHERE e.kind = 'imports' AND (n.name = ? OR n.name LIKE ? ESCAPE '\')
+	`, targetPkg, escaped+"/%")
 	if err != nil {
 		return nil, err
 	}
@@ -839,11 +921,12 @@ func (d *DB) FindImporters(targetPkg string) ([]string, error) {
 	var files []string
 	for rows.Next() {
 		var file string
-		if err := rows.Scan(&file); err == nil {
-			files = append(files, file)
+		if err := rows.Scan(&file); err != nil {
+			return nil, fmt.Errorf("find importers scan: %w", err)
 		}
+		files = append(files, file)
 	}
-	return files, nil
+	return files, rows.Err()
 }
 
 // escapeFTS5Query turns free-text input into a safe FTS5 MATCH expression.
@@ -883,6 +966,11 @@ func escapeFTS5Query(query string) string {
 
 // FullTextSearch performs a full-text search using FTS5.
 func (d *DB) FullTextSearch(query string, limit int) ([]Node, error) {
+	return d.FullTextSearchContext(context.Background(), query, limit)
+}
+
+// FullTextSearchContext is the context-aware variant of FullTextSearch.
+func (d *DB) FullTextSearchContext(ctx context.Context, query string, limit int) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -894,7 +982,7 @@ func (d *DB) FullTextSearch(query string, limit int) ([]Node, error) {
 		return nil, nil
 	}
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type

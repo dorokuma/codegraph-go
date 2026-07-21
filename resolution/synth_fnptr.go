@@ -193,6 +193,48 @@ func stripCComments(s string) string {
 	b.Grow(len(s))
 	i := 0
 	for i < len(s) {
+		// String literal: skip "..." (including escaped \")
+		if s[i] == '"' {
+			b.WriteByte(s[i])
+			i++
+			for i < len(s) {
+				if s[i] == '\\' && i+1 < len(s) {
+					b.WriteByte(s[i])
+					i++
+					b.WriteByte(s[i])
+					i++
+				} else if s[i] == '"' {
+					b.WriteByte(s[i])
+					i++
+					break
+				} else {
+					b.WriteByte(s[i])
+					i++
+				}
+			}
+			continue
+		}
+		// Char literal: skip '...' (including escaped \')
+		if s[i] == '\'' {
+			b.WriteByte(s[i])
+			i++
+			for i < len(s) {
+				if s[i] == '\\' && i+1 < len(s) {
+					b.WriteByte(s[i])
+					i++
+					b.WriteByte(s[i])
+					i++
+				} else if s[i] == '\'' {
+					b.WriteByte(s[i])
+					i++
+					break
+				} else {
+					b.WriteByte(s[i])
+					i++
+				}
+			}
+			continue
+		}
 		if i+1 < len(s) && s[i] == '/' && s[i+1] == '/' {
 			b.WriteByte(' ')
 			b.WriteByte(' ')
