@@ -122,16 +122,20 @@ func TestToolAffectedSamePackageTests(t *testing.T) {
 
 	workdir := "/workdir"
 
-	// Populate the files table so ListFilesInDirContext can find them.
+	// Populate the files table with paths RELATIVE to workdir.
+	// This matches the real daemon, which indexes files relative to workdir.
+	// The earlier version of this test stored absolute paths (workdir + f),
+	// which masked the bug where ListFilesInDirContext was called with absolute
+	// dirs but the files table uses relative paths (LIKE mismatch).
 	// Same-package test files don't import their own package, so the import-
 	// closure BFS alone would miss them. The fix adds same-dir test files
 	// when a non-test source file is visited.
 	for _, f := range []string{
-		workdir + "/pkg/a.go",
-		workdir + "/pkg/a_test.go",
-		workdir + "/pkg/b.go",
-		workdir + "/other/c.go",
-		workdir + "/other/c_test.go",
+		"pkg/a.go",
+		"pkg/a_test.go",
+		"pkg/b.go",
+		"other/c.go",
+		"other/c_test.go",
 	} {
 		if err := database.UpsertFile(f, 0, 0); err != nil {
 			t.Fatalf("upsert file %s: %v", f, err)
