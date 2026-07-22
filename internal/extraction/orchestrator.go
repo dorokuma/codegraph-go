@@ -7,12 +7,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/dorokuma/codegraph-go/internal/config"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
@@ -180,28 +179,8 @@ func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string)
 
 // indexWorkerCount picks how many files to extract/index in parallel.
 // DB writes are serialized by db.DB's mutex; only CPU-bound extract runs free.
-// Override with CODEGRAPH_INDEX_WORKERS (1 = serial rollback; cap 16).
 func indexWorkerCount() int {
-	if v := strings.TrimSpace(os.Getenv("CODEGRAPH_INDEX_WORKERS")); v != "" {
-		n, err := strconv.Atoi(v)
-		if err == nil {
-			if n < 1 {
-				return 1
-			}
-			if n > 16 {
-				return 16
-			}
-			return n
-		}
-	}
-	n := runtime.NumCPU() - 1
-	if n < 1 {
-		n = 1
-	}
-	if n > 8 {
-		n = 8
-	}
-	return n
+	return config.IndexWorkers()
 }
 
 type indexJob struct {

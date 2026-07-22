@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/dorokuma/codegraph-go/internal/config"
 	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
@@ -102,19 +102,10 @@ func main() {
 		return
 	}
 
-	var workdir string
-	var noSync bool
-	flag.StringVar(&workdir, "workdir", "", "workspace root (default: cwd)")
-	flag.BoolVar(&noSync, "no-sync", false, "disable auto-sync file watcher")
-	flag.Parse()
+	cfg := config.LoadConfig()
+	workdir := cfg.Workdir
+	noSync := cfg.NoSync
 
-	if workdir == "" {
-		wd, err := os.Getwd()
-		if err != nil {
-			log.Fatalf("cannot determine current directory: %v", err)
-		}
-		workdir = wd
-	}
 	absWd, err := filepath.Abs(workdir)
 	if err != nil {
 		log.Fatalf("bad workdir %q: %v", workdir, err)
