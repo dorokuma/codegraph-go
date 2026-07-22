@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dorokuma/codegraph-go/internal/config"
 )
 
 // Directory basenames that are never project source for indexing/watching.
@@ -141,8 +143,7 @@ func IsBroadWorkdir(workdir string) bool {
 // homeIndexAll enables indexing every non-cache top-level dir under $HOME.
 // Default is off: only project-like top-level dirs are entered.
 func homeIndexAll() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("CODEGRAPH_GO_HOME_INDEX_ALL")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	return config.HomeIndexAll()
 }
 
 // ShouldSkipDir reports whether a directory should be skipped during walk.
