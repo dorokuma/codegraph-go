@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"os"
@@ -11,7 +11,7 @@ import (
 )
 
 func TestResolvePath(t *testing.T) {
-	s := &server{workdir: "/workdir"}
+	s := &Server{Workdir: "/workdir"}
 
 	tests := []struct {
 		input   string
@@ -139,7 +139,7 @@ func TestSearchPerFileCapEdgeCases(t *testing.T) {
 }
 
 func TestAddStalenessWarning(t *testing.T) {
-	s := &server{workdir: "/workdir"}
+	s := &Server{Workdir: "/workdir"}
 	// no watcher
 	if got := s.addStalenessWarning("ok"); got != "ok" {
 		t.Fatalf("expected unchanged without watcher, got %q", got)
@@ -166,7 +166,7 @@ func TestResolveProjectDefaultAndNearest(t *testing.T) {
 	}
 	otherDB.Close()
 
-	s := &server{workdir: def, database: defDB}
+	s := &Server{Workdir: def, Database: defDB}
 
 	root, database, err := s.resolveProject("")
 	if err != nil || root != def || database != defDB {
