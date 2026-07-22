@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
+	"github.com/dorokuma/codegraph-go/internal/safelog"
 	"github.com/dorokuma/codegraph-go/internal/sync"
 	"github.com/dorokuma/codegraph-go/internal/tools"
 
@@ -82,13 +84,13 @@ func runInit(root string) error {
 	if err := database.Close(); err != nil {
 		return err
 	}
-	log.Printf("init ok workdir=%s db=%s", abs, filepath.Join(abs, ".codegraph", "codegraph.db"))
+	slog.Info("init ok", "workdir", abs, "db", filepath.Join(abs, ".codegraph", "codegraph.db"))
 	return nil
 }
 
 func main() {
-	// Never block forever writing logs into an unread stderr pipe.
-	setupSafeLog()
+	_, safelogCleanup := safelog.SetupLogger(config.LogLevel())
+	defer safelogCleanup()
 
 	// Subcommand: init <root>  (must be handled before flag.Parse)
 	if len(os.Args) >= 2 && os.Args[1] == "init" {
@@ -116,7 +118,7 @@ func main() {
 	if rp, err := filepath.EvalSymlinks(workdir); err == nil && rp != "" {
 		workdir = rp
 	}
-	log.Printf("codegraph-go starting, workdir=%s", workdir)
+	slog.Info("starting", "workdir", workdir)
 
 	// Decision order (official #411):
 	//  1. CODEGRAPH_DAEMON_INTERNAL=1 → we ARE the detached daemon
@@ -124,14 +126,16 @@ func main() {
 	//  3. else try proxy to shared daemon (spawn if needed); fallback direct
 	if daemon.Internal() {
 		if err := runDaemonProcess(workdir, noSync); err != nil {
-			log.Fatalf("%v", err)
+			slog.Error("daemon process failed", "error", err)
+			os.Exit(1)
 		}
 		return
 	}
 	if daemon.OptOut() {
-		log.Printf("mode=direct (CODEGRAPH_NO_DAEMON)")
+		slog.Info("mode=direct (CODEGRAPH_NO_DAEMON)")
 		if err := runDirect(workdir, noSync); err != nil {
-			log.Fatalf("%v", err)
+			slog.Error("runDirect failed", "error", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -153,13 +157,14 @@ func main() {
 	// Probe → spawn → dial shared daemon; on failure fall back to direct.
 	conn, br, hello, ok := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond)
 	if ok {
-		log.Printf("mode=proxy → daemon pid %d socket %s", hello.PID, hello.SocketPath)
+		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)
 		_ = daemon.RunProxy(conn, br, hello)
 		return
 	}
-	log.Printf("mode=direct (daemon unavailable)")
+	slog.Info("mode=direct (daemon unavailable)")
 	if err := runDirect(workdir, noSync); err != nil {
-		log.Fatalf("%v", err)
+		slog.Error("runDirect failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -241,7 +246,8 @@ func (o *onceRWC) Close() error {
 func openServerState(workdir string, noSync bool) (*server, func()) {
 	database, err := db.Open(workdir)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		slog.Error("open database", "error", err)
+		os.Exit(1)
 	}
 
 	// Start WAL checkpoint background loop (every 5 minutes).
@@ -268,7 +274,6 @@ func openServerState(workdir string, noSync bool) (*server, func()) {
 		}
 		s.closeProjectCache()
 		_ = database.Close()
-		closeSafeLog()
 	}
 	return s, cleanup
 }
@@ -289,11 +294,11 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 
 	rebuild, oldVer, err := database.NeedsRebuild()
 	if err != nil {
-		log.Printf("schema revision check: %v", err)
+		slog.Warn("schema revision check", "error", err)
 	}
 	var files, nodes int
 	if rebuild {
-		log.Printf("schema revision %s → %s: full rebuild...", oldVer, db.SchemaRevision())
+		slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
 
 		select {
 		case <-s.bgDone:
@@ -302,7 +307,7 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 		}
 		files, nodes, err = orch.RebuildAll()
 	} else {
-		log.Printf("indexing project in background...")
+		slog.Info("indexing project in background...")
 
 		select {
 		case <-s.bgDone:
@@ -315,9 +320,9 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 		}
 	}
 	if err != nil {
-		log.Printf("index warning: %v", err)
+		slog.Warn("index warning", "error", err)
 	}
-	log.Printf("indexed %d files, %d nodes (schema=%s)", files, nodes, db.SchemaRevision())
+	slog.Info("indexed", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 
 	// Optional git-status assist: catch edits missed while nothing was watching.
 	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
@@ -328,9 +333,9 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 		}
 		c, n, gerr := orch.IndexChanges(dirty)
 		if gerr != nil {
-			log.Printf("git-assist sync: %v", gerr)
+			slog.Warn("git-assist sync", "error", gerr)
 		} else if c > 0 {
-			log.Printf("git-assist sync: %d files, %d nodes", c, n)
+			slog.Info("git-assist sync", "files", c, "nodes", n)
 		}
 	}
 
@@ -345,15 +350,15 @@ func backgroundIndexAndWatch(s *server, noSync bool) {
 	}
 	watcher, err := sync.NewWatcher(orch, workdir)
 	if err != nil {
-		log.Printf("watcher warning: %v", err)
+		slog.Warn("watcher warning", "error", err)
 		return
 	}
 	if err := watcher.Start(); err != nil {
-		log.Printf("watcher start warning: %v", err)
+		slog.Warn("watcher start warning", "error", err)
 		return
 	}
 	s.watcher.Store(watcher)
-	log.Printf("auto-sync enabled")
+	slog.Info("auto-sync enabled")
 }
 
 // newMCPServer registers the official 8 + affected tools.
