@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -23,7 +23,7 @@ func textContent(r *mcp.CallToolResult) string {
 	return ""
 }
 
-func setupToolServer(t *testing.T) (*server, string) {
+func setupToolServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
 	database, err := db.Open(dir)
@@ -46,9 +46,9 @@ func setupToolServer(t *testing.T) (*server, string) {
 	database.UpsertFileRecord(&db.FileRecord{Path: "beta.go", Size: 300, Language: "go", NodeCount: 1})
 	database.UpsertFileRecord(&db.FileRecord{Path: "sub/delta.go", Size: 100, Language: "go", NodeCount: 1})
 
-	s := &server{
-		workdir:  dir,
-		database: database,
+	s := &Server{
+		Workdir:  dir,
+		Database: database,
 	}
 	return s, dir
 }

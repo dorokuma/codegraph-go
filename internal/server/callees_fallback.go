@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ var callRe = regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 
 // toolCalleesBodyFallback is the legacy rg + brace-matching path used when
 // the call graph has no edges for the symbol yet.
-func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args nameArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, args nameArgs) (*mcp.CallToolResult, any, error) {
 	// Guard against rg hanging on large trees or named pipes.
 	rgCtx, rgCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer rgCancel()
@@ -303,4 +303,3 @@ func (s *server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(out, defaultOutputChars)}},
 	}, nil, nil
 }
-
