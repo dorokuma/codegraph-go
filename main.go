@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"github.com/dorokuma/codegraph-go/daemon"
+	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
 	"github.com/dorokuma/codegraph-go/internal/sync"
