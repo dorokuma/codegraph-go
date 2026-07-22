@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
-	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
