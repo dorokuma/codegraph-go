@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 
 	"github.com/fsnotify/fsnotify"
 )

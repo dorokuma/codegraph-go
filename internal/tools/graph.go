@@ -10,7 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
-	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 )
 
 // GraphQueryArgs is shared by callers / callees / impact.

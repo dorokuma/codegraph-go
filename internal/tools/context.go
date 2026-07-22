@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
-	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 )
 
 // ContextFormatter formats code graph results as markdown optimized for LLM consumption.

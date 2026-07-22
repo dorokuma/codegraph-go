@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
-	"github.com/dorokuma/codegraph-go/extraction"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 )
 
 func TestIsSupported(t *testing.T) {

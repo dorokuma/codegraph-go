@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
-	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/tools"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
+	"github.com/dorokuma/codegraph-go/internal/tools"
 )
 
 func assertSynthCall(t *testing.T, database *db.DB, caller, callee, by string) {
