@@ -8,7 +8,7 @@ CODEGRAPH_HOME="${CODEGRAPH_HOME:-$HOME/.codegraph}"
 
 echo "=== 编译 ==="
 cd "$ROOT"
-go build -o ./bin/codegraph-go . 2>&1
+go build -o ./bin/codegraph-go ./cmd/codegraph-go 2>&1
 echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
 
 echo "=== 停止旧进程 ==="
@@ -40,11 +40,11 @@ echo "=== 验证 ==="
 test -x "$BINARY" && echo "binary deployed: $BINARY ($(stat -c %s "$BINARY") bytes)" || { echo "DEPLOY FAILED: binary not executable"; exit 1; }
 
 echo "=== 提交 ==="
-git add deploy.sh daemon/paths.go
+git add deploy.sh internal/daemon/paths.go
 if git diff --cached --quiet; then
   echo "无改动，跳过提交"
 else
-  VERSION=$(grep 'PackageVersion' daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
+  VERSION=$(grep 'PackageVersion' internal/daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
   if [ -z "$VERSION" ]; then
     VERSION="unknown"
     echo "warning: VERSION is empty, using 'unknown'"
