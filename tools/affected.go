@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // AffectedArgs are the arguments for the affected tool.

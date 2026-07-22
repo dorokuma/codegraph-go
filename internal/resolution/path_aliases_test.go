@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
 func TestLoadAndApplyTsconfigAliases(t *testing.T) {

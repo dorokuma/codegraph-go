@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestNodeSecurity_FileModeRelativePath(t *testing.T) {

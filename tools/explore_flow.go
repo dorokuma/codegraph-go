@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // flowResult is the call-chain pack among symbols named in an explore query.

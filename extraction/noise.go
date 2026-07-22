@@ -3,7 +3,7 @@ package extraction
 import (
 	"strings"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // noisyRefNames are call/reference targets that are almost always framework /

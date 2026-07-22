@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

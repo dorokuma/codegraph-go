@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
 	"github.com/dorokuma/codegraph-go/tools"
 )
@@ -61,7 +61,7 @@ func assertSynthCall(t *testing.T, database *db.DB, caller, callee, by string) {
 
 func TestSynthCallbackFieldChannel(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_callback"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_callback"), dir)
 	database := indexDir(t, dir)
 
 	// Methods extracted
@@ -85,7 +85,7 @@ func TestSynthCallbackFieldChannel(t *testing.T) {
 // blindly pick the first global match.
 func TestSynthCallbackDisambiguation(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_callback_disambig"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_callback_disambig"), dir)
 	database := indexDir(t, dir)
 
 	// Verify both WidgetA.handle and WidgetB.handle exist (2 each),
@@ -143,7 +143,7 @@ func TestSynthCallbackDisambiguation(t *testing.T) {
 
 func TestSynthEventEmitter(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_callback"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_callback"), dir)
 	database := indexDir(t, dir)
 
 	assertSynthCall(t, database, "publishMount", "onmount", "event-emitter")
@@ -153,7 +153,7 @@ func TestSynthEventEmitter(t *testing.T) {
 func TestSynthReactFullFlow(t *testing.T) {
 	// 7.2: setState→render AND render→JSX child must ship together.
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_react"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_react"), dir)
 	database := indexDir(t, dir)
 
 	assertSynthCall(t, database, "dirty", "render", "react-render")
@@ -180,7 +180,7 @@ func TestSynthReactFullFlow(t *testing.T) {
 
 func TestSynthCallbackExploreFlow(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_callback"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_callback"), dir)
 	database := indexDir(t, dir)
 
 	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
@@ -202,7 +202,7 @@ func TestSynthCallbackExploreFlow(t *testing.T) {
 
 func TestSynthReactRouterRoute(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_route"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_route"), dir)
 	database := indexDir(t, dir)
 
 	routes, err := database.GetNodeByName("GET /home")
@@ -228,7 +228,7 @@ func TestSynthBridgeCrossLang(t *testing.T) {
 	// 7.4：跨语言符号要挂上。主路径是 C 侧抽出 c_hello 后 ResolveAll 连 bridge；
 	// synthesize 的 bridge-link 只兜底 Resolve 仍失败的 pending/failed。
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_bridge"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_bridge"), dir)
 	database := indexDir(t, dir)
 
 	cNodes, err := database.GetNodeByName("c_hello")
@@ -280,7 +280,7 @@ func TestSynthBridgeIdempotent(t *testing.T) {
 	// Place the C file in a deep subdirectory so ResolveAll won't find it via
 	// same-directory or sibling-directory proximity (M-8), forcing bridgeSymbolEdges
 	// to do the linking via synthesis.
-	srcDir := filepath.Join("..", "testdata", "parity", "synth_bridge")
+	srcDir := filepath.Join("..", "..", "testdata", "parity", "synth_bridge")
 	copyTree(t, srcDir, dir)
 
 	// Move hello.c into a deep subdirectory (clib/native) to defeat all
@@ -363,7 +363,7 @@ func TestSynthBridgeIdempotent(t *testing.T) {
 
 func TestSynthFnPointerDispatch(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_fnptr"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_fnptr"), dir)
 	database := indexDir(t, dir)
 
 	// handlers extracted
@@ -380,7 +380,7 @@ func TestSynthFnPointerDispatch(t *testing.T) {
 
 func TestSynthFnPointerExploreFlow(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_fnptr"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_fnptr"), dir)
 	database := indexDir(t, dir)
 
 	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
@@ -402,7 +402,7 @@ func TestSynthFnPointerExploreFlow(t *testing.T) {
 
 func TestSynthGoFrameRoute(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_goframe"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_goframe"), dir)
 	database := indexDir(t, dir)
 
 	routes, err := database.GetNodeByName("POST /user/sign-in")
@@ -422,7 +422,7 @@ func TestSynthGoFrameRoute(t *testing.T) {
 
 func TestSynthGoFrameExploreFlow(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "synth_goframe"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_goframe"), dir)
 	database := indexDir(t, dir)
 
 	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
