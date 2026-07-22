@@ -7,7 +7,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestResolvePath(t *testing.T) {

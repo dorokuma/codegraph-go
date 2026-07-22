@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // SynthStats summarizes one SynthesizeAll pass.

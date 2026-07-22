@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dorokuma/codegraph-go/db"
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/db"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
 // Orchestrator manages the extraction pipeline.

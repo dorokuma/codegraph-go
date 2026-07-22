@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestToolStatus(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // Must match extraction.GoFrameRouteMarker (kept local to avoid import cycle).

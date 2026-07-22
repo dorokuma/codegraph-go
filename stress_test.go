@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 	codesync "github.com/dorokuma/codegraph-go/sync"
 )
 

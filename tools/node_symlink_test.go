@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestNodeSecurity_SymlinkEscape(t *testing.T) {

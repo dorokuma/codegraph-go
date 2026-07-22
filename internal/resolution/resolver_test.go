@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
 func indexDir(t *testing.T, dir string) *db.DB {
@@ -45,21 +45,21 @@ func assertGraphCall(t *testing.T, database *db.DB, caller, callee string) {
 
 func TestParityGoCrossFileCall(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "go"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "go"), dir)
 	database := indexDir(t, dir)
 	assertGraphCall(t, database, "Run", "Helper")
 }
 
 func TestParityTSCrossFileCall(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "ts"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "ts"), dir)
 	database := indexDir(t, dir)
 	assertGraphCall(t, database, "main", "greet")
 }
 
 func TestParityPyCrossFileCall(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "py"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "py"), dir)
 	database := indexDir(t, dir)
 	assertGraphCall(t, database, "main", "greet")
 }
@@ -107,7 +107,7 @@ func LateTarget() {}
 
 func TestResolveAllIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "go"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "go"), dir)
 	database := indexDir(t, dir)
 	st, err := resolution.ResolveAll(database, dir)
 	if err != nil {

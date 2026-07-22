@@ -5,15 +5,15 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
 func TestLoadCargoWorkspaceMembers(t *testing.T) {
 	dir := t.TempDir()
 	resolution.ClearCargoCache()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "cargo"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "cargo"), dir)
 
 	ws := resolution.LoadCargoWorkspace(dir)
 	if ws == nil {
@@ -38,7 +38,7 @@ func TestLoadCargoWorkspaceMembers(t *testing.T) {
 func TestResolveCargoImportPaths(t *testing.T) {
 	dir := t.TempDir()
 	resolution.ClearCargoCache()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "cargo"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "cargo"), dir)
 
 	from := filepath.Join(dir, "app", "src", "main.rs")
 	lib := filepath.Join(dir, "crates", "core", "src", "lib.rs")
@@ -63,7 +63,7 @@ func TestResolveCargoImportPaths(t *testing.T) {
 func TestParityCargoWorkspaceCall(t *testing.T) {
 	dir := t.TempDir()
 	resolution.ClearCargoCache()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "cargo"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "cargo"), dir)
 
 	database, err := db.Open(dir)
 	if err != nil {

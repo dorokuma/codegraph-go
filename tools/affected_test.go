@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestToolAffectedNoFiles(t *testing.T) {

@@ -5,15 +5,15 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
-	"github.com/dorokuma/codegraph-go/resolution"
+	"github.com/dorokuma/codegraph-go/internal/resolution"
 )
 
 // TestParityAliasAtSlash: @/lib/utils style import resolves and call edge is graph-linked.
 func TestParityAliasAtSlash(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "alias"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "alias"), dir)
 	database, err := db.Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestParityAliasAtSlash(t *testing.T) {
 // TestParityGoModulePath: go.mod module path + replace drive import resolution.
 func TestParityGoModulePath(t *testing.T) {
 	dir := t.TempDir()
-	copyTree(t, filepath.Join("..", "testdata", "parity", "gomod"), dir)
+	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "gomod"), dir)
 	database, err := db.Open(dir)
 	if err != nil {
 		t.Fatal(err)

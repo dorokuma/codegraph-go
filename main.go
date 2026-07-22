@@ -20,7 +20,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/dorokuma/codegraph-go/daemon"
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/extraction"
 	"github.com/dorokuma/codegraph-go/sync"
 	"github.com/dorokuma/codegraph-go/tools"

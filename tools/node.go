@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/dorokuma/codegraph-go/db"
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // NodeArgs are the arguments for the node tool (dual mode, official-aligned).
