@@ -83,7 +83,7 @@ func TestToolExploreQuery(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "foo", Max: 10})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "foo", Max: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestToolExploreOverview(t *testing.T) {
 	// create a marker file so overview has something
 	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Max: 10})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Max: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

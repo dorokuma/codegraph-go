@@ -161,7 +161,7 @@ func TestSynthReactFullFlow(t *testing.T) {
 	assertGraphCall(t, database, "StaticCanvas", "renderStaticScene")
 
 	// explore Flow must walk the whole chain among named symbols.
-	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
+	text, err := tools.ToolExplore(context.Background(), database, []string{dir}, dir, tools.ExploreArgs{
 		Query: "dirty render StaticCanvas renderStaticScene",
 	})
 	if err != nil {
@@ -183,7 +183,7 @@ func TestSynthCallbackExploreFlow(t *testing.T) {
 	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_callback"), dir)
 	database := indexDir(t, dir)
 
-	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
+	text, err := tools.ToolExplore(context.Background(), database, []string{dir}, dir, tools.ExploreArgs{
 		Query: "mutateElement triggerUpdate triggerRender paintCanvas",
 	})
 	if err != nil {
@@ -383,7 +383,7 @@ func TestSynthFnPointerExploreFlow(t *testing.T) {
 	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_fnptr"), dir)
 	database := indexDir(t, dir)
 
-	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
+	text, err := tools.ToolExplore(context.Background(), database, []string{dir}, dir, tools.ExploreArgs{
 		Query: "dispatch add_one",
 	})
 	if err != nil {
@@ -425,7 +425,7 @@ func TestSynthGoFrameExploreFlow(t *testing.T) {
 	copyTree(t, filepath.Join("..", "..", "testdata", "parity", "synth_goframe"), dir)
 	database := indexDir(t, dir)
 
-	text, err := tools.ToolExplore(context.Background(), database, dir, tools.ExploreArgs{
+	text, err := tools.ToolExplore(context.Background(), database, []string{dir}, dir, tools.ExploreArgs{
 		Query: "POST /user/sign-in SignIn finishSignIn",
 	})
 	if err != nil {

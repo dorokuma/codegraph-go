@@ -8,9 +8,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// resolvePath resolves p relative to the server's workdir.
+// resolvePath resolves p relative to the server's workdirs. It tries each
+// workdir in order; the first workdir under which p resolves is returned.
 func (s *Server) resolvePath(p string) (string, error) {
-	return s.resolvePathIn(s.Workdir, p)
+	for _, wd := range s.Workdirs {
+		if result, err := s.resolvePathIn(wd, p); err == nil {
+			return result, nil
+		}
+	}
+	return "", fmt.Errorf("path %q is outside all workdirs %v", p, s.Workdirs)
 }
 
 // resolvePathIn joins p under root and rejects escapes outside root.

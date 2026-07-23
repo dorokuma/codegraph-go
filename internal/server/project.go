@@ -19,52 +19,68 @@ type dbEntry struct {
 }
 
 // detectProject tries to find which project the user is asking about
-// by matching query/args against project directory names under Workdir.
-// Returns the project dir name (relative to Workdir) or empty string.
-// Results are cached per Workdir to avoid repeated os.ReadDir + stat.
+// by matching query/args against project directory names under any workdir.
+// Returns the full path to the detected project, or empty string.
+// Results are cached to avoid repeated os.ReadDir + stat per workdir.
 func (s *Server) detectProject(queries ...string) string {
-	if !extraction.IsBroadWorkdir(s.Workdir) {
+	// Check if ANY workdir is broad (home-mode).
+	anyBroad := false
+	for _, wd := range s.Workdirs {
+		if extraction.IsBroadWorkdir(wd) {
+			anyBroad = true
+			break
+		}
+	}
+	if !anyBroad {
 		return ""
 	}
-	// Populate cached project names; retry on failure (unlike sync.Once).
+
+	// Populate cached project directories from ALL workdirs.
 	s.DetectMu.Lock()
 	if !s.DetectDone {
-		entries, err := os.ReadDir(s.Workdir)
-		if err == nil {
+		for _, wd := range s.Workdirs {
+			entries, err := os.ReadDir(wd)
+			if err != nil {
+				continue
+			}
 			for _, e := range entries {
 				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 					continue
 				}
-				projectDir := filepath.Join(s.Workdir, e.Name())
+				projectDir := filepath.Join(wd, e.Name())
 				if extraction.HasProjectMarker(projectDir) {
-					s.DetectDirs = append(s.DetectDirs, e.Name())
+					s.DetectDirs = append(s.DetectDirs, projectDir)
 				}
 			}
-			s.DetectDone = true
 		}
-		// On failure, don't set DetectDone — retry next call
+		s.DetectDone = true
 	}
 	s.DetectMu.Unlock()
+
+	// Exact match against the base name.
 	for _, q := range queries {
 		q = strings.ToLower(strings.TrimSpace(q))
 		if q == "" {
 			continue
 		}
-		for _, name := range s.DetectDirs {
-			if strings.ToLower(name) == q {
-				return name
+		for _, fullPath := range s.DetectDirs {
+			base := strings.ToLower(filepath.Base(fullPath))
+			if base == q {
+				return fullPath
 			}
 		}
 	}
-	// Fuzzy: check if any project name appears as a word in the query
+
+	// Fuzzy: check if any project name appears as a word in the query.
 	for _, q := range queries {
 		q = strings.ToLower(strings.TrimSpace(q))
 		if q == "" {
 			continue
 		}
-		for _, name := range s.DetectDirs {
-			if isWordIn(strings.ToLower(name), q) {
-				return name
+		for _, fullPath := range s.DetectDirs {
+			base := strings.ToLower(filepath.Base(fullPath))
+			if isWordIn(base, q) {
+				return fullPath
 			}
 		}
 	}

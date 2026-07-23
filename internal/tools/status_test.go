@@ -18,7 +18,7 @@ func TestToolStatus(t *testing.T) {
 	database.UpsertFile("/a.go", 100, 1000.0)
 	database.UpsertFile("/b.go", 200, 2000.0)
 
-	result, err := ToolStatus(context.Background(), database, "/workdir", StatusArgs{}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestToolStatusWithPendingFiles(t *testing.T) {
 	defer cleanup()
 
 	pending := []string{"/a.go", "/b.go"}
-	result, err := ToolStatus(context.Background(), database, "/workdir", StatusArgs{}, pending)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, pending)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestToolStatusWithFileCheck(t *testing.T) {
 
 	database.UpsertFile("/workdir/main.go", 100, 1000.0)
 
-	result, err := ToolStatus(context.Background(), database, "/workdir", StatusArgs{Path: "main.go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "main.go"}, nil)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestToolStatusWithNonexistentFile(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	result, err := ToolStatus(context.Background(), database, "/workdir", StatusArgs{Path: "nonexistent.go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "nonexistent.go"}, nil)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}

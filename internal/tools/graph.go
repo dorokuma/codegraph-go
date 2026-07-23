@@ -236,7 +236,7 @@ func ToolImpactGraph(ctx context.Context, database *db.DB, workdir string, args 
 // ToolExplore builds an overview or a symbol-centered context pack (official primary tool).
 // With a multi-symbol query it surfaces Flow (call path) first, then source under a size budget.
 // DB reads now accept context via Context variants; cancellation is supported.
-func ToolExplore(ctx context.Context, database *db.DB, workdir string, args ExploreArgs) (string, error) {
+func ToolExplore(ctx context.Context, database *db.DB, workdirs []string, workdir string, args ExploreArgs) (string, error) {
 	root := workdir
 	if args.Path != "" {
 		p := args.Path
@@ -255,37 +255,51 @@ func ToolExplore(ctx context.Context, database *db.DB, workdir string, args Expl
 		if max <= 0 {
 			max = 30
 		}
-		return exploreOverview(ctx, database, workdir, root, max)
+		return exploreOverview(ctx, database, workdirs, workdir, root, max)
 	}
 	return exploreQuery(ctx, database, workdir, root, query, args.Max, args.SkipCode)
 }
 
-func exploreOverview(ctx context.Context, database *db.DB, workdir, root string, max int) (string, error) {
+func exploreOverview(ctx context.Context, database *db.DB, workdirs []string, workdir, root string, max int) (string, error) {
 	var b strings.Builder
 
-	// Home / broad workdir: list indexed project-like top-level dirs.
-	if extraction.IsBroadWorkdir(workdir) && root == workdir {
+	// Check if ANY workdir is broad (home-mode).
+	anyBroad := false
+	for _, w := range workdirs {
+		if extraction.IsBroadWorkdir(w) {
+			anyBroad = true
+			break
+		}
+	}
+
+	// Home / broad workdir: list indexed project-like top-level dirs across all workdirs.
+	if anyBroad && root == workdir {
 		fmt.Fprintf(&b, "# CodeGraph home-mode overview\n")
 		fmt.Fprintf(&b, "Index root: %s (only project-like top-level dirs)\n\n", workdir)
 		fmt.Fprintf(&b, "## Projects\n")
-		entries, err := os.ReadDir(workdir)
-		if err != nil {
-			return "", err
-		}
 		n := 0
-		for _, e := range entries {
-			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		for _, w := range workdirs {
+			entries, err := os.ReadDir(w)
+			if err != nil {
 				continue
 			}
-			full := filepath.Join(workdir, e.Name())
-			if extraction.ShouldSkipDirIn(workdir, full, e.Name()) {
-				continue
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				full := filepath.Join(w, e.Name())
+				if extraction.ShouldSkipDirIn(w, full, e.Name()) {
+					continue
+				}
+				if !extraction.HasProjectMarker(full) {
+					continue
+				}
+				fmt.Fprintf(&b, "- %s/\n", e.Name())
+				n++
+				if n >= max {
+					break
+				}
 			}
-			if !extraction.HasProjectMarker(full) {
-				continue
-			}
-			fmt.Fprintf(&b, "- %s/\n", e.Name())
-			n++
 			if n >= max {
 				break
 			}
