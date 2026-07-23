@@ -5,6 +5,21 @@
 - MINOR：新功能，向后兼容
 - PATCH：bug 修复，向后兼容
 
+## 0.6.0 (multi-workdir support + query layer fix)
+
+### MINOR（新功能）
+- YAML 配置文件支持（`-config` flag > `$CODEGRAPH_CONFIG` env > `./codegraph-config.yaml` > `~/.config/codegraph/config.yaml`）
+- 多 workdir 索引：`workdirs:` 列表中的额外目录会被索引到各自独立的 `.codegraph/codegraph.db`
+- `detectProject` 跨所有 workdir 扫描项目，存全路径映射
+- `ToolExplore` / `ToolStatus` 接受 `workdirs` 参数，home-mode 展示所有 workdir 下的项目
+- 跨项目 DB 缓存：`resolveProject` 通过 `FindNearestCodeGraphRoot` 自动找到正确 DB，LRU 缓存 + 引用计数
+- `resolvePath` 跨 workdir 尝试解析
+
+### PATCH（bug 修复）
+- 所有 tool handler 的 `detectProject` 调用追加 `args.Path`（之前只传 name/query，导致 `path=<项目名>` 不被识别）
+- `cmd/codegraph-go/main.go` 加 workdir 去重（对标 ctxmode）
+- `internal/config/config.go` prepend 判断从只看首元素改为遍历全列表
+
 ## 0.5.0 (audit fixes + concise output)
 
 ### MINOR（新功能）
