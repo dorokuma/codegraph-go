@@ -29,7 +29,9 @@ type ContentItem struct {
 
 // ToolStatus returns index health and statistics.
 // DB reads now accept context via Context variants; cancellation is supported.
-func ToolStatus(ctx context.Context, database *db.DB, workdir string, args StatusArgs, pendingFiles []string) (*StatusResult, error) {
+// workdirs is the full list of workspace roots (for broad-workdir detection);
+// workdir is the specific project root for this call.
+func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir string, args StatusArgs, pendingFiles []string) (*StatusResult, error) {
 	stats, err := database.GetStatsContext(ctx)
 	if err != nil {
 		return nil, err
@@ -60,20 +62,28 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 		b.WriteString(fmt.Sprintf("Pending: %d files\n", len(pendingFiles)))
 	}
 
-	// Home-mode: list which projects are indexed under workdir.
-	if extraction.IsBroadWorkdir(workdir) {
+	// Home-mode: list which projects are indexed under any workdir.
+	anyBroad := false
+	for _, wd := range workdirs {
+		if extraction.IsBroadWorkdir(wd) {
+			anyBroad = true
+			break
+		}
+	}
+	if anyBroad {
 		b.WriteString("\nIndexed projects:\n")
-		entries, readErr := os.ReadDir(workdir)
-		if readErr != nil {
-			b.WriteString(fmt.Sprintf("(error reading workdir: %v)\n", readErr))
-		} else {
-			found := 0
+		found := 0
+		for _, wd := range workdirs {
+			entries, readErr := os.ReadDir(wd)
+			if readErr != nil {
+				continue
+			}
 			for _, e := range entries {
 				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 					continue
 				}
-				full := filepath.Join(workdir, e.Name())
-				if extraction.ShouldSkipDirIn(workdir, full, e.Name()) {
+				full := filepath.Join(wd, e.Name())
+				if extraction.ShouldSkipDirIn(wd, full, e.Name()) {
 					continue
 				}
 				if !extraction.HasProjectMarker(full) {
@@ -82,9 +92,9 @@ func ToolStatus(ctx context.Context, database *db.DB, workdir string, args Statu
 				b.WriteString(fmt.Sprintf("- %s/\n", e.Name()))
 				found++
 			}
-			if found == 0 {
-				b.WriteString("(no project markers found)\n")
-			}
+		}
+		if found == 0 {
+			b.WriteString("(no project markers found)\n")
 		}
 	}
 

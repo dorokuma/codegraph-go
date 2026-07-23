@@ -23,6 +23,7 @@ import (
 // and cross-project cache.
 type Server struct {
 	Workdir      string
+	Workdirs     []string
 	Database     *db.DB
 	Orchestrator *extraction.Orchestrator
 	// Watcher is set from the background index goroutine after auto-sync starts.
@@ -64,7 +65,7 @@ func (o *onceRWC) Close() error {
 // RunDirect starts a single-process MCP server (stdio) from config.
 // It opens the server state and runs until the transport closes.
 func RunDirect(cfg config.Config) error {
-	s, cleanup := OpenServerState(cfg.Workdir, cfg.NoSync)
+	s, cleanup := OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
 	defer cleanup()
 
 	srv := NewMCPServer(s)
@@ -90,7 +91,7 @@ func RunDaemonProcess(cfg config.Config) error {
 	)
 	ensure := func() {
 		stateOnce.Do(func() {
-			s, cleanup = OpenServerState(cfg.Workdir, cfg.NoSync)
+			s, cleanup = OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
 			mcpSrv = NewMCPServer(s)
 		})
 	}
@@ -126,7 +127,12 @@ func RunDaemonProcess(cfg config.Config) error {
 }
 
 // OpenServerState opens DB + orchestrator and kicks background index/watcher.
-func OpenServerState(workdir string, noSync bool) (*Server, func()) {
+// workdir is the primary workspace root (first in the workdirs list) for
+// backward compatibility; workdirs is the full list of workspace roots.
+func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, func()) {
+	if workdirs == nil {
+		workdirs = []string{workdir}
+	}
 	database, err := db.Open(workdir)
 	if err != nil {
 		slog.Error("open database", "error", err)
@@ -140,6 +146,7 @@ func OpenServerState(workdir string, noSync bool) (*Server, func()) {
 	orch := extraction.NewOrchestrator(database, workdir)
 	s := &Server{
 		Workdir:      workdir,
+		Workdirs:     workdirs,
 		Database:     database,
 		Orchestrator: orch,
 		BgDone:       make(chan struct{}),
@@ -167,19 +174,19 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 	orch := s.Orchestrator
 	workdir := s.Workdir
 
-	// Check for shutdown before each expensive phase so cleanup can
-	// interrupt quickly rather than blocking until indexing finishes.
+	// --- Primary workdir indexing ---
 	select {
 	case <-s.BgDone:
 		return
 	default:
 	}
 
-	rebuild, oldVer, err := database.NeedsRebuild()
-	if err != nil {
-		slog.Warn("schema revision check", "error", err)
-	}
 	var files, nodes int
+	var err error
+	rebuild, oldVer, rebuildErr := database.NeedsRebuild()
+	if rebuildErr != nil {
+		slog.Warn("schema revision check", "error", rebuildErr)
+	}
 	if rebuild {
 		slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
 
@@ -205,7 +212,7 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 	if err != nil {
 		slog.Warn("index warning", "error", err)
 	}
-	slog.Info("indexed", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
+	slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 
 	// Optional git-status assist: catch edits missed while nothing was watching.
 	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
@@ -222,6 +229,49 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		}
 	}
 
+	// --- Additional workdirs indexing (open DB, index, close) ---
+	for i, wd := range s.Workdirs {
+		if i == 0 {
+			continue // primary already indexed
+		}
+		select {
+		case <-s.BgDone:
+			return
+		default:
+		}
+
+		otherDB, oerr := db.Open(wd)
+		if oerr != nil {
+			slog.Warn("open additional workdir DB", "workdir", wd, "error", oerr)
+			continue
+		}
+		otherOrch := extraction.NewOrchestrator(otherDB, wd)
+		rebuildNeeded, oldVer, rerr := otherDB.NeedsRebuild()
+		if rerr != nil {
+			slog.Warn("schema check", "workdir", wd, "error", rerr)
+			otherDB.Close()
+			continue
+		}
+		var f2, n2 int
+		if rebuildNeeded {
+			slog.Info("full rebuild", "workdir", wd, "from", oldVer, "to", db.SchemaRevision())
+			f2, n2, err = otherOrch.RebuildAll()
+		} else {
+			slog.Info("indexing", "workdir", wd)
+			f2, n2, err = otherOrch.IndexAll()
+			if err == nil {
+				_ = otherDB.SetSchemaRevision()
+			}
+		}
+		if err != nil {
+			slog.Warn("index warning", "workdir", wd, "error", err)
+		} else {
+			slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+		}
+		otherDB.Close()
+	}
+
+	// --- Watcher (primary workdir only) ---
 	if noSync {
 		return
 	}
@@ -231,13 +281,13 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		return
 	default:
 	}
-	watcher, err := sync.NewWatcher(orch, workdir)
-	if err != nil {
-		slog.Warn("watcher warning", "error", err)
+	watcher, wErr := sync.NewWatcher(orch, workdir)
+	if wErr != nil {
+		slog.Warn("watcher warning", "error", wErr)
 		return
 	}
-	if err := watcher.Start(); err != nil {
-		slog.Warn("watcher start warning", "error", err)
+	if wErr := watcher.Start(); wErr != nil {
+		slog.Warn("watcher start warning", "error", wErr)
 		return
 	}
 	s.Watcher.Store(watcher)

@@ -5,9 +5,12 @@ package config
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Env vars for extraction helpers (moved here so extraction packages don't
@@ -23,26 +26,84 @@ const DefaultLogLevel = "info"
 
 // Config holds the top-level application configuration.
 type Config struct {
-	Workdir string
-	NoSync  bool
-	LogLevel string
+	Workdir     string
+	Workdirs    []string
+	ConfigFile  string
+	NoSync      bool
+	LogLevel    string
 }
 
-// LoadConfig parses CLI flags, reads the environment, and returns a Config
-// with defaults applied.  It is safe to call multiple times (flag re‑parse
-// panics, so this should be called exactly once).
+// LoadConfig parses CLI flags, reads the environment and the optional
+// standalone YAML config, and returns a Config with defaults applied.
+// Config file priority: -config flag > $CODEGRAPH_CONFIG >
+// ./codegraph-config.yaml > ~/.config/codegraph/config.yaml.
+// The -workdir flag, when set, is prepended to Workdirs. If Workdirs is
+// still empty after all sources, the current working directory is used as
+// the sole workdir.
 func LoadConfig() Config {
 	var cfg Config
 
-	flag.StringVar(&cfg.Workdir, "workdir", "", "workspace root (default: cwd)")
+	flag.StringVar(&cfg.Workdir, "workdir", "", "workspace root (default: cwd; prepended to config workdirs)")
+	flag.StringVar(&cfg.ConfigFile, "config", "", "path to YAML config file")
 	flag.BoolVar(&cfg.NoSync, "no-sync", false, "disable auto-sync file watcher")
 	flag.Parse()
 
-	if cfg.Workdir == "" {
-		wd, err := os.Getwd()
-		if err == nil {
-			cfg.Workdir = wd
+	// Determine config file path.
+	configPath := cfg.ConfigFile
+	if configPath == "" {
+		configPath = os.Getenv("CODEGRAPH_CONFIG")
+	}
+	if configPath == "" {
+		if _, err := os.Stat("./codegraph-config.yaml"); err == nil {
+			configPath = "./codegraph-config.yaml"
 		}
+	}
+	if configPath == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			p := filepath.Join(home, ".config", "codegraph", "config.yaml")
+			if _, err := os.Stat(p); err == nil {
+				configPath = p
+			}
+		}
+	}
+
+	// Read YAML config file.
+	if configPath != "" {
+		data, err := os.ReadFile(configPath)
+		if err == nil {
+			var yamlCfg struct {
+				Workdirs []string `yaml:"workdirs"`
+			}
+			if err := yaml.Unmarshal(data, &yamlCfg); err == nil && len(yamlCfg.Workdirs) > 0 {
+				cfg.Workdirs = yamlCfg.Workdirs
+			}
+		}
+	}
+
+	// -workdir flag overrides: prepend to the list if not already present.
+	if cfg.Workdir != "" {
+		found := false
+		for _, wd := range cfg.Workdirs {
+			if wd == cfg.Workdir {
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.Workdirs = append([]string{cfg.Workdir}, cfg.Workdirs...)
+		}
+	}
+
+	// Fallback to single cwd workdir.
+	if len(cfg.Workdirs) == 0 {
+		if wd, err := os.Getwd(); err == nil {
+			cfg.Workdirs = []string{wd}
+		}
+	}
+
+	// Primary workdir for backward compatibility.
+	if len(cfg.Workdirs) > 0 {
+		cfg.Workdir = cfg.Workdirs[0]
 	}
 
 	cfg.LogLevel = LogLevel()

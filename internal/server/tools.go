@@ -159,7 +159,7 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		args.MaxResults = defaultSearchGlobal
 	}
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Pattern); p != "" {
+		if p := s.detectProject(args.Pattern, args.Path); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -259,6 +259,11 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	if args.Max == 0 {
 		args.Max = defaultFilesMax
 	}
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Path); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, _, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -268,7 +273,14 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	// Home/broad mode: rg would search the entire home directory (go/pkg/mod,
 	// other projects, etc.). Use the DB file list instead — it only contains
 	// files that passed the indexer's home-mode filtering.
-	if extraction.IsBroadWorkdir(s.Workdir) && args.ProjectPath == "" {
+	anyBroad := false
+	for _, wd := range s.Workdirs {
+		if extraction.IsBroadWorkdir(wd) {
+			anyBroad = true
+			break
+		}
+	}
+	if anyBroad && args.ProjectPath == "" {
 		// Narrow pattern if a path subdirectory is specified.
 		effectivePattern := pattern
 		if args.Path != "" {
@@ -368,7 +380,7 @@ func (s *Server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 		skipCode = *args.SkipCode
 	}
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Query); p != "" {
+		if p := s.detectProject(args.Query, args.Path); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -377,7 +389,7 @@ func (s *Server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 		return recoverableProjectErr(err)
 	}
 	defer s.releaseProject(root)
-	text, err := tools.ToolExplore(ctx, database, root, tools.ExploreArgs{
+	text, err := tools.ToolExplore(ctx, database, s.Workdirs, root, tools.ExploreArgs{
 		Query:    args.Query,
 		Path:     args.Path,
 		Max:      args.Max,
@@ -403,7 +415,7 @@ func (s *Server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		args.MaxResults = defaultSymbolMax
 	}
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name); p != "" {
+		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -438,7 +450,7 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		args.MaxResults = defaultSymbolMax
 	}
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name); p != "" {
+		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -525,7 +537,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		args.MaxResults = defaultSymbolMax
 	}
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name); p != "" {
+		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -566,7 +578,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 
 func (s *Server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args nodeArgs) (*mcp.CallToolResult, any, error) {
 	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name); p != "" {
+		if p := s.detectProject(args.Name, args.File); p != "" {
 			args.ProjectPath = p
 		}
 	}
@@ -628,7 +640,7 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 		}
 	}
 
-	result, err := tools.ToolStatus(ctx, database, root, tools.StatusArgs{
+	result, err := tools.ToolStatus(ctx, database, s.Workdirs, root, tools.StatusArgs{
 		Path: args.Path,
 	}, pendingFiles)
 	if err != nil {

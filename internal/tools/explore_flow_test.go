@@ -58,7 +58,7 @@ func TestExploreFlowTwoSymbols(t *testing.T) {
 	defer cleanup()
 
 	// foo → bar is a direct calls edge; bag query must surface Flow.
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "foo bar"})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "foo bar"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestExploreFlowThreeHop(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "main foo bar"})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "main foo bar"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestExploreFlowBridgeOneUnnamed(t *testing.T) {
 	database.UpsertFile(b, 10, 1)
 	database.UpsertFile(c, 10, 1)
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "AlphaEntry OmegaEnd"})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "AlphaEntry OmegaEnd"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestExploreFlowNoEdgeNoFlow(t *testing.T) {
 	database.UpsertFile(f1, 10, 1)
 	database.UpsertFile(f2, 10, 1)
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "AloneOne AloneTwo"})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "AloneOne AloneTwo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestExploreSingleSymbolStillHasSource(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()
 
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "foo", Max: 10})
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "foo", Max: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestExploreFlowRespectsPath(t *testing.T) {
 	database.UpsertFile(b2, 10, 1)
 
 	// Edge only exists under projA; path=projB must not paint a projA Flow.
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{
 		Query: "StartFlow EndFlow",
 		Path:  "projB",
 	})
@@ -235,7 +235,7 @@ func TestExploreFlowRespectsPath(t *testing.T) {
 	}
 
 	// path=projA should show the real chain, still without projB.
-	textA, err := ToolExplore(context.Background(), database, dir, ExploreArgs{
+	textA, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{
 		Query: "StartFlow EndFlow",
 		Path:  "projA",
 	})
@@ -255,7 +255,7 @@ func TestExploreMaxHonored(t *testing.T) {
 	defer cleanup()
 
 	// Explicit Max above tier default must not be silently clamped to 4/5.
-	text, err := ToolExplore(context.Background(), database, dir, ExploreArgs{
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{
 		Query: "main foo bar",
 		Max:   40,
 	})
@@ -267,7 +267,7 @@ func TestExploreMaxHonored(t *testing.T) {
 	}
 
 	// Zero Max → tier default (tiny repo → 4).
-	text0, err := ToolExplore(context.Background(), database, dir, ExploreArgs{Query: "foo bar"})
+	text0, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{Query: "foo bar"})
 	if err != nil {
 		t.Fatal(err)
 	}
