@@ -140,19 +140,19 @@ codegraph-go detects cross-language calls and creates bridge edges:
 ```
 codegraph-go/
 ├── cmd/codegraph-go/main.go    # Entry point
-├── db/
+├── internal/db/
 │   ├── schema.sql       # SQLite schema
 │   ├── connection.go    # Database connection
 │   ├── root.go          # FindNearestCodeGraphRoot
 │   └── query.go         # nodes, edges, files, unresolved_refs
-├── extraction/
+├── internal/extraction/
 │   ├── common.go        # Language detection
 │   ├── extractor.go     # Regex extraction (+ Rust use/fn)
 │   ├── treesitter.go    # Tree-sitter AST (Go, TS, JS, Python)
 │   ├── frameworks.go    # Framework route detection
 │   ├── bridge.go        # Cross-language bridging
 │   └── orchestrator.go  # Index builder → ResolveAll
-├── resolution/
+├── internal/resolution/
 │   ├── resolver.go      # pending refs → edges
 │   ├── name_matcher.go
 │   ├── import_resolver.go
@@ -160,14 +160,19 @@ codegraph-go/
 │   ├── go_module.go     # go.mod module + replace
 │   ├── workspace_packages.go
 │   └── cargo_workspace.go
-├── sync/
+├── internal/server/
+│   ├── server.go        # MCP server handler
+│   ├── tools.go         # Tool dispatcher
+│   ├── project.go       # Project management
+│   └── output.go        # Response formatting
+├── internal/sync/
 │   └── watcher.go       # File watcher with debounce
+├── internal/tools/
+│   ├── graph.go         # explore / callers / callees / impact
+│   ├── node.go
+│   ├── status.go
+│   └── affected.go
 ├── testdata/parity/     # go, ts, py, alias, gomod, cargo, synth_*
-└── tools/
-    ├── graph.go         # explore / callers / callees / impact
-    ├── node.go
-    ├── status.go
-    └── affected.go
 ```
 
 ## License
