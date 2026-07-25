@@ -30,7 +30,8 @@ func TestContentHashSkipUnchanged(t *testing.T) {
 	if n1 == 0 {
 		t.Fatal("expected nodes on first index")
 	}
-	hash, err := database.GetFileContentHash(src)
+	key := db.StoragePath(root, src)
+	hash, err := database.GetFileContentHash(key)
 	if err != nil || hash == "" {
 		t.Fatalf("hash after index: %q err=%v", hash, err)
 	}
@@ -54,7 +55,7 @@ func TestContentHashSkipUnchanged(t *testing.T) {
 	if n2 != 0 {
 		t.Fatalf("unchanged content should skip extract, got nodes=%d", n2)
 	}
-	hash2, _ := database.GetFileContentHash(src)
+	hash2, _ := database.GetFileContentHash(key)
 	if hash2 != hash {
 		t.Fatalf("hash changed on skip %q → %q", hash, hash2)
 	}
@@ -70,7 +71,7 @@ func TestContentHashSkipUnchanged(t *testing.T) {
 	if n3 == 0 {
 		t.Fatal("edited file should reindex")
 	}
-	hash3, _ := database.GetFileContentHash(src)
+	hash3, _ := database.GetFileContentHash(key)
 	if hash3 == hash {
 		t.Fatal("hash should change after edit")
 	}

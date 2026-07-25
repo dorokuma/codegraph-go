@@ -3,6 +3,26 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-07-25
+
+### Changed
+- Index schema **17**: store workdir-relative paths for files/nodes/edges (portable across machines/checkouts; forces full rebuild)
+- Display version **0.6.1**
+
+### Fixed
+- `affected`: same-package test discovery works with real indexes (relative storage keys + absolute BFS normalization)
+- `affected` / MCP: reject `stdin=true` at the MCP handler; CLI/offline may still use stdin in `ToolAffected`
+- Multi-workdir: secondary roots keep an open DB + file watcher (no longer cold-index-and-close only)
+- Multi-workdir: tool `projectPath` reuses the secondary watcher DB (no second Open / dual writer)
+- `files`: surface real `rg` failures instead of always reporting "no files matched"
+- Daemon spawn inherits parent `-config` and `-no-sync`
+- `CountFilesUnder`: escape LIKE wildcards; treat empty/"." as whole-index count
+- SQLite DSN: percent-escape path characters (`#`, `?`, spaces, `&`)
+- Import edges prefer `module` nodes over same-named functions
+- Config: log read/parse errors instead of silent ignore
+- README version/schema drift vs code
+- Restored `ResolveBestTarget` / `TruncateBody` unit tests (accidentally dropped during path refactor)
+
 ## [0.6.0] - 2026-07-23
 
 ### Added

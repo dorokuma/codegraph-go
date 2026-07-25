@@ -839,6 +839,28 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	dir = filepath.ToSlash(filepath.Clean(strings.TrimSpace(dir)))
+	if dir == "" || dir == "." {
+		// Direct children of workdir root: no slash in relative path.
+		rows, err := d.conn.QueryContext(ctx, `SELECT path FROM files ORDER BY path`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var files []string
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				return nil, fmt.Errorf("list files in dir scan: %w", err)
+			}
+			pSlash := filepath.ToSlash(p)
+			if !strings.Contains(pSlash, "/") {
+				files = append(files, p)
+			}
+		}
+		return files, rows.Err()
+	}
+
 	// Escape LIKE special chars in dir so _ and % are matched literally.
 	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(dir)
 	pattern := escaped + "/%"
@@ -857,7 +879,7 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 			return nil, fmt.Errorf("list files in dir scan: %w", err)
 		}
 		// Only include files directly in this directory, not subdirectories.
-		if filepath.Dir(p) == dir {
+		if filepath.ToSlash(filepath.Dir(filepath.ToSlash(p))) == dir {
 			files = append(files, p)
 		}
 	}
@@ -865,15 +887,28 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 }
 
 // CountFilesUnderContext returns the number of indexed files whose path
-// is under prefix (same directory or descendant).
+// is under prefix (same directory or descendant). Prefix may be absolute
+// (legacy) or workdir-relative (current storage). Empty/"." means whole index.
 func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	prefix = filepath.ToSlash(filepath.Clean(strings.TrimSpace(prefix)))
+	if prefix == "" || prefix == "." {
+		var count int
+		err := d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&count)
+		if err != nil {
+			return 0, fmt.Errorf("count files under: %w", err)
+		}
+		return count, nil
+	}
+
+	// Escape LIKE wildcards so path segments with _ or % match literally.
+	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(prefix)
 	var count int
 	err := d.conn.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM files WHERE path = ? OR path LIKE ?",
-		prefix, prefix+string(filepath.Separator)+"%").Scan(&count)
+		`SELECT COUNT(*) FROM files WHERE path = ? OR path LIKE ? ESCAPE '\'`,
+		prefix, escaped+"/%").Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count files under: %w", err)
 	}

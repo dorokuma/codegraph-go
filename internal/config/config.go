@@ -4,6 +4,7 @@ package config
 
 import (
 	"flag"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,11 +71,15 @@ func LoadConfig() Config {
 	// Read YAML config file.
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
-		if err == nil {
+		if err != nil {
+			log.Printf("config: read %s: %v", configPath, err)
+		} else {
 			var yamlCfg struct {
 				Workdirs []string `yaml:"workdirs"`
 			}
-			if err := yaml.Unmarshal(data, &yamlCfg); err == nil && len(yamlCfg.Workdirs) > 0 {
+			if err := yaml.Unmarshal(data, &yamlCfg); err != nil {
+				log.Printf("config: parse %s: %v (ignoring file)", configPath, err)
+			} else if len(yamlCfg.Workdirs) > 0 {
 				cfg.Workdirs = yamlCfg.Workdirs
 			}
 		}

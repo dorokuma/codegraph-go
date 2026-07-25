@@ -160,11 +160,18 @@ func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lan
 	})
 }
 
+// storePath is the workdir-relative index key for a filesystem path.
+func (o *Orchestrator) storePath(path string) string {
+	return db.StoragePath(o.workdir, path)
+}
+
 // indexIfNeeded reindexes path when the DB says it is stale.
 // On success returns (1, nodeCount) even if nodeCount is 0; skip/error returns (0, 0).
+// path is a filesystem path (usually absolute from Walk/watcher); the DB key is relative.
 func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string) (files int, nodes int) {
+	key := o.storePath(path)
 	if !o.force {
-		needsReindex, err := o.db.FileNeedsReindex(path, info.Size(), float64(info.ModTime().Unix()))
+		needsReindex, err := o.db.FileNeedsReindex(key, info.Size(), float64(info.ModTime().Unix()))
 		if err != nil || !needsReindex {
 			return 0, 0
 		}
@@ -342,16 +349,18 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 	if err != nil {
 		return n, err
 	}
-	if _, rerr := resolution.ResolveForFiles(o.db, o.workdir, []string{path}); rerr != nil {
+	key := o.storePath(path)
+	if _, rerr := resolution.ResolveForFiles(o.db, o.workdir, []string{key}); rerr != nil {
 		log.Printf("resolve after index %s: %v", path, rerr)
 	}
-	o.runSynthesis([]string{path})
+	o.runSynthesis([]string{key})
 	return n, nil
 }
 
 // DeleteFile removes a file from the index.
+// path may be absolute (watcher) or relative; both map to the storage key.
 func (o *Orchestrator) DeleteFile(path string) error {
-	return o.db.ClearFile(path)
+	return o.db.ClearFile(o.storePath(path))
 }
 
 func hashContent(data []byte) string {
@@ -360,37 +369,40 @@ func hashContent(data []byte) string {
 }
 
 func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
-	// Read file
+	// Read from the real filesystem path (Walk/watcher give absolute paths).
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
 	contentHash := hashContent(data)
+	// Portable index key: workdir-relative.
+	store := o.storePath(path)
 
 	// Content-hash short-circuit: mtime can change without edits (touch, checkout).
 	// Skip clear+re-extract when the bytes are identical (unless force rebuild).
 	if !o.force {
-		if same, herr := o.db.FileHasContentHash(path, contentHash); herr == nil && same {
+		if same, herr := o.db.FileHasContentHash(store, contentHash); herr == nil && same {
 			if info, serr := os.Stat(path); serr == nil {
 				// Refresh size/mtime so the cheap FileNeedsReindex stays quiet.
-				_ = o.db.TouchFileMeta(path, info.Size(), float64(info.ModTime().Unix()), contentHash)
+				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().Unix()), contentHash)
 			}
 			return 0, nil
 		}
 	}
 
 	// Clear old data for this file
-	if err := o.db.ClearFile(path); err != nil {
+	if err := o.db.ClearFile(store); err != nil {
 		return 0, err
 	}
 
 	// Try tree-sitter extractor first, fall back to regex.
+	// Pass store path so extractors embed portable File fields.
 	var result ExtractResult
 	tsExt := NewTreeSitterExtractor(lang)
 	if tsExt != nil {
-		result = tsExt.Extract(string(data), path)
+		result = tsExt.Extract(string(data), store)
 	} else {
-		result = NewExtractor(lang).Extract(string(data), path)
+		result = NewExtractor(lang).Extract(string(data), store)
 	}
 	nodes := result.Nodes
 	edges := result.Edges
@@ -398,7 +410,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 
 	// Detect framework routes (linked to handlers after node insert).
 	detector := NewFrameworkDetector()
-	routes := detector.DetectRoutes(string(data), path, lang)
+	routes := detector.DetectRoutes(string(data), store, lang)
 	for _, route := range routes {
 		handler := simplifyHandlerName(strings.TrimSpace(route.Handler))
 		nodes = append(nodes, ExtractedNode{
@@ -416,13 +428,13 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	// Create a file-level node to anchor import/bridge edges.
 	fileNodeID, err := o.db.UpsertNode(&db.Node{
 		Kind:     db.KindFile,
-		Name:     path,
-		File:     path,
+		Name:     store,
+		File:     store,
 		Line:     0,
 		Language: lang,
 	})
 	if err != nil {
-		log.Printf("upsert file node %s: %v", path, err)
+		log.Printf("upsert file node %s: %v", store, err)
 	}
 
 	// Insert nodes
@@ -437,7 +449,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		id, err := o.db.UpsertNode(&db.Node{
 			Kind:          n.Kind,
 			Name:          n.Name,
-			File:          path,
+			File:          store,
 			Line:          n.Line,
 			EndLine:       n.EndLine,
 			Body:          n.Body,
@@ -480,7 +492,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		if !ok {
 			continue
 		}
-		o.linkSameFileOrPark(routeID, handler, sameFileBare, path, lang, route.Line, 0, db.EdgeReferences)
+		o.linkSameFileOrPark(routeID, handler, sameFileBare, store, lang, route.Line, 0, db.EdgeReferences)
 	}
 
 	// Structural edges (imports, etc.)
@@ -492,7 +504,15 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 			}
 			var targetID int64
 			if len(targetNodes) > 0 {
+				// Prefer a module node so import edges don't attach to a
+				// same-named function/class by accident.
 				targetID = targetNodes[0].ID
+				for _, tn := range targetNodes {
+					if tn.Kind == "module" {
+						targetID = tn.ID
+						break
+					}
+				}
 			} else {
 				targetID, err = o.db.UpsertNode(&db.Node{
 					Kind:     "module",
@@ -510,7 +530,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 					SourceID:   fileNodeID,
 					TargetID:   targetID,
 					Kind:       "imports",
-					File:       path,
+					File:       store,
 					Line:       e.Line,
 					Provenance: "exact",
 				}); err != nil {
@@ -526,11 +546,11 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 			continue
 		}
 		if e.Kind == "calls" {
-			o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, path, lang, e.Line, e.Col, db.EdgeCalls)
+			o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, store, lang, e.Line, e.Col, db.EdgeCalls)
 			continue
 		}
 		// extends/implements: same-file only for now; else park.
-		o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, path, lang, e.Line, e.Col, e.Kind)
+		o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, store, lang, e.Line, e.Col, e.Kind)
 	}
 
 	// Pending call/type refs from extractors.
@@ -543,13 +563,13 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		if kind == "" {
 			kind = db.EdgeCalls
 		}
-		o.linkSameFileOrPark(sourceID, ref.ReferenceName, sameFileBare, path, lang, ref.Line, ref.Col, kind)
+		o.linkSameFileOrPark(sourceID, ref.ReferenceName, sameFileBare, store, lang, ref.Line, ref.Col, kind)
 	}
 
 	// Cross-language bridges: same-file source; target may be foreign placeholder
 	// (still written as edge so bridge tooling keeps working; full resolution in step 7).
 	bridgeDetector := NewCrossLanguageDetector()
-	bridges := bridgeDetector.Detect(string(data), path, lang)
+	bridges := bridgeDetector.Detect(string(data), store, lang)
 	for _, bridge := range bridges {
 		targetName := strings.TrimSpace(bridge.TargetFunc)
 		if targetName == "" {
@@ -581,14 +601,14 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 				SourceID:   sourceID,
 				TargetID:   tid,
 				Kind:       "bridge",
-				File:       path,
+				File:       store,
 				Line:       bridge.Line,
 				Provenance: "exact",
 			}); err != nil {
 				log.Printf("upsert bridge edge %s: %v", targetName, err)
 			}
 		} else {
-			o.parkUnresolved(sourceID, targetName, "bridge", path, lang, bridge.Line, 0)
+			o.parkUnresolved(sourceID, targetName, "bridge", store, lang, bridge.Line, 0)
 		}
 	}
 
@@ -598,14 +618,14 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		log.Printf("stat after index %s: %v", path, err)
 	} else {
 		if err := o.db.UpsertFileRecord(&db.FileRecord{
-			Path:        path,
+			Path:        store,
 			Size:        info.Size(),
 			Mtime:       float64(info.ModTime().Unix()),
 			ContentHash: contentHash,
 			Language:    lang,
 			NodeCount:   len(nodes),
 		}); err != nil {
-			log.Printf("upsert file record %s: %v", path, err)
+			log.Printf("upsert file record %s: %v", store, err)
 		}
 	}
 
@@ -631,9 +651,11 @@ func (o *Orchestrator) resolveSourceID(name string, line int, nodeIDMap map[stri
 }
 
 // IndexChanges indexes only files that have changed since last index.
+// files are filesystem paths (absolute from watcher/git); resolution uses storage keys.
 func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	totalFiles := 0
 	totalNodes := 0
+	storeKeys := make([]string, 0, len(files))
 
 	for _, path := range files {
 		info, err := os.Stat(path)
@@ -650,12 +672,13 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		filesN, nodes := o.indexIfNeeded(path, info, lang)
 		totalFiles += filesN
 		totalNodes += nodes
+		storeKeys = append(storeKeys, o.storePath(path))
 	}
 
-	if _, err := resolution.ResolveForFiles(o.db, o.workdir, files); err != nil {
+	if _, err := resolution.ResolveForFiles(o.db, o.workdir, storeKeys); err != nil {
 		log.Printf("resolve changes: %v", err)
 	}
-	o.runSynthesis(files)
+	o.runSynthesis(storeKeys)
 	return totalFiles, totalNodes, nil
 }
 

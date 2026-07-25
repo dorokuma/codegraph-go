@@ -127,7 +127,9 @@ func main() {
 	}
 
 	// Probe → spawn → dial shared daemon; on failure fall back to direct.
-	conn, br, hello, ok := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond)
+	// Pass parent -config / -no-sync so the detached writer matches this session.
+	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync}
+	conn, br, hello, ok := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
 	if ok {
 		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)
 		_ = daemon.RunProxy(conn, br, hello)

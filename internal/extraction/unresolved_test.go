@@ -134,8 +134,8 @@ func B() { MissingTwo() }
 		t.Fatal("expected unresolved refs after reindex")
 	}
 
-	// Inspect rows: only MissingTwo, no MissingOne.
-	refs, err := database.ListUnresolvedRefs(path, "")
+	// Inspect rows: only MissingTwo, no MissingOne (keys are workdir-relative).
+	refs, err := database.ListUnresolvedRefs(db.StoragePath(dir, path), "")
 	if err != nil {
 		t.Fatal(err)
 	}

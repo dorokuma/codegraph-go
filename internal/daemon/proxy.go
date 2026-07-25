@@ -104,11 +104,12 @@ func DialAnyCandidate(projectRoot string) (net.Conn, *bufio.Reader, Hello, bool)
 
 // EnsureAndDial probes for a live daemon, spawning one if needed, then dials.
 // Returns ok=false when the daemon path is unavailable (caller → direct mode).
-func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration) (net.Conn, *bufio.Reader, Hello, bool) {
+// opts is passed to SpawnDetached so -config / -no-sync match the parent.
+func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, opts *SpawnOpts) (net.Conn, *bufio.Reader, Hello, bool) {
 	if conn, br, hello, ok := DialAnyCandidate(projectRoot); ok {
 		return conn, br, hello, true
 	}
-	if err := SpawnDetached(projectRoot); err != nil {
+	if err := SpawnDetached(projectRoot, opts); err != nil {
 		log.Printf("spawn daemon: %v", err)
 		return nil, nil, Hello{}, false
 	}

@@ -48,6 +48,13 @@ type Server struct {
 	DetectMu   stdsync.Mutex
 	DetectDone bool
 	DetectDirs []string // cached project directory names under Workdir
+
+	// Extra workdirs: keep DB open + file watcher so secondary roots stay fresh
+	// (primary uses Database / Watcher above). Keyed by absolute workdir path.
+	// resolveProject reuses these handles so tools never open a second writer.
+	ExtraMu       stdsync.Mutex
+	ExtraDBs      map[string]*db.DB
+	ExtraWatchers map[string]*sync.Watcher
 }
 
 // onceRWC closes the underlying ReadWriteCloser at most once.
@@ -162,6 +169,20 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 		if w := s.Watcher.Load(); w != nil {
 			w.Stop()
 		}
+		s.ExtraMu.Lock()
+		for _, w := range s.ExtraWatchers {
+			if w != nil {
+				w.Stop()
+			}
+		}
+		for _, edb := range s.ExtraDBs {
+			if edb != nil {
+				_ = edb.Close()
+			}
+		}
+		s.ExtraWatchers = nil
+		s.ExtraDBs = nil
+		s.ExtraMu.Unlock()
 		s.closeProjectCache()
 		_ = database.Close()
 	}
@@ -265,13 +286,63 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		}
 		if err != nil {
 			slog.Warn("index warning", "workdir", wd, "error", err)
-		} else {
-			slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+			_ = otherDB.Close()
+			continue
 		}
-		otherDB.Close()
+		slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+
+		// Keep secondary DB open and watch for changes (parity with primary).
+		if !noSync {
+			select {
+			case <-s.BgDone:
+				_ = otherDB.Close()
+				return
+			default:
+			}
+			w2, wErr := sync.NewWatcher(otherOrch, wd)
+			if wErr != nil {
+				slog.Warn("watcher warning", "workdir", wd, "error", wErr)
+				_ = otherDB.Close()
+				continue
+			}
+			if wErr := w2.Start(); wErr != nil {
+				slog.Warn("watcher start warning", "workdir", wd, "error", wErr)
+				_ = otherDB.Close()
+				continue
+			}
+			s.ExtraMu.Lock()
+			if s.ExtraDBs == nil {
+				s.ExtraDBs = map[string]*db.DB{}
+			}
+			if s.ExtraWatchers == nil {
+				s.ExtraWatchers = map[string]*sync.Watcher{}
+			}
+			// Drop any stale cross-project cache handle for this root so we
+			// never keep two open connections to the same secondary index.
+			s.ProjectMu.Lock()
+			if e, ok := s.ProjectCache[wd]; ok {
+				delete(s.ProjectCache, wd)
+				s.removeProjectLRU(wd)
+				if atomic.LoadInt32(&e.refs) == 0 {
+					_ = e.db.Close()
+				} else {
+					if s.ProjectPendingClose == nil {
+						s.ProjectPendingClose = map[string]*dbEntry{}
+					}
+					s.ProjectPendingClose[wd] = e
+				}
+			}
+			s.ProjectMu.Unlock()
+			s.ExtraDBs[wd] = otherDB
+			s.ExtraWatchers[wd] = w2
+			s.ExtraMu.Unlock()
+			slog.Info("auto-sync enabled", "workdir", wd)
+		} else {
+			_ = otherDB.Close()
+		}
 	}
 
-	// --- Watcher (primary workdir only) ---
+	// --- Watcher (primary workdir) ---
 	if noSync {
 		return
 	}
@@ -291,7 +362,7 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		return
 	}
 	s.Watcher.Store(watcher)
-	slog.Info("auto-sync enabled")
+	slog.Info("auto-sync enabled", "workdir", workdir)
 }
 
 // closeProjectCache closes all cached cross-project DBs and pending-close

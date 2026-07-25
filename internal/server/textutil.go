@@ -84,8 +84,9 @@ func relativizeRgOutput(out string, projRoot string) string {
 }
 
 // countIndexedUnder returns the number of indexed files whose path is under the given root.
+// searchRoot is absolute on disk; the index stores workdir-relative keys.
 func countIndexedUnder(ctx context.Context, database *db.DB, projRoot, searchRoot string) (int, error) {
-	return database.CountFilesUnderContext(ctx, searchRoot)
+	return database.CountFilesUnderContext(ctx, db.StoragePath(projRoot, searchRoot))
 }
 
 func readLines(path string) ([]string, error) {

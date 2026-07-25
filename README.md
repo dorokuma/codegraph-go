@@ -4,13 +4,13 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.5.3** (alignment in progress). Index logic version **15**.
+Current version: **0.6.1** (alignment in progress). Index logic version **17**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
 
 ## Features
 
-Alignment: steps **1–9** done incl. 7.5 (logic **15**, **243** tests). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
+Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
 
 - **9 MCP tools:** explore (PRIMARY), node (SECONDARY dual-mode), search, callers, callees, impact, files, status, affected (extension). `context` / `trace` / `search_fts` removed from MCP.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
@@ -33,7 +33,8 @@ Alignment: steps **1–9** done incl. 7.5 (logic **15**, **243** tests). Not ful
 - **Shared daemon (optional):** one process per project root owns SQLite + watcher; MCP hosts attach via Unix socket proxy. `CODEGRAPH_NO_DAEMON=1` keeps the old embedded mode. Idle exit default 300s (`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`).
 - **content_hash incremental:** SHA-256 of file bytes; unchanged content skips re-extract even if mtime moved
 - **Git-assist sync:** after cold index, `git status` picks up edits missed while nothing was watching (no hooks installed)
-- **Auto-sync:** file watcher with 2-second debounce; new directories are watched recursively
+- **Portable index paths:** files/nodes stored relative to workdir (schema 17+); safe to move/copy the tree after reindex
+- **Auto-sync:** file watcher with 2-second debounce on every configured workdir; new directories are watched recursively
 - **Staleness warning:** warns when referenced files are pending sync
 - **Respects .gitignore:** uses ripgrep for file operations
 
@@ -44,9 +45,8 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.5.3 |
-| Index logic | 15 |
-| Tests | 243 passed |
+| Display version | 0.6.1 |
+| Index logic | 17 |
 | Feature parity | **not claimed** (step 10 open) |
 
 Single source of truth: `/root/codegraph-go-comparison.md`.

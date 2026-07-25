@@ -15,10 +15,12 @@ import (
 
 // AffectedArgs are the arguments for the affected tool.
 type AffectedArgs struct {
-	Files  []string `json:"files" jsonschema:"list of changed source files"`
-	Stdin  bool     `json:"stdin,omitempty" jsonschema:"read file list from stdin,optional"`
-	Depth  int      `json:"depth,omitempty" jsonschema:"max dependency traversal depth (default 5),optional"`
-	Filter string   `json:"filter,omitempty" jsonschema:"custom glob to identify test files,optional"`
+	Files []string `json:"files" jsonschema:"list of changed source files"`
+	// Stdin reads extra paths from process stdin (CLI/offline only).
+	// MCP handlers must not set this — stdio is the protocol stream.
+	Stdin  bool   `json:"stdin,omitempty" jsonschema:"CLI only: read file list from stdin; unsupported over MCP,optional"`
+	Depth  int    `json:"depth,omitempty" jsonschema:"max dependency traversal depth (default 5),optional"`
+	Filter string `json:"filter,omitempty" jsonschema:"custom glob to identify test files,optional"`
 }
 
 // AffectedResult is the result of the affected tool.
@@ -39,16 +41,13 @@ var testPatterns = map[string][]string{
 
 // ToolAffected finds test files affected by changes.
 // DB reads now accept context via Context variants; cancellation is supported.
+// Stdin is for offline/CLI helpers only. MCP must pass files= and never set Stdin
+// (server layer rejects stdin — process stdio is the MCP protocol stream).
 func ToolAffected(ctx context.Context, database *db.DB, workdir string, args AffectedArgs) (*AffectedResult, error) {
-	if len(args.Files) == 0 && !args.Stdin {
-		return nil, fmt.Errorf("files list is required (or use stdin)")
-	}
-
 	if args.Depth == 0 {
 		args.Depth = 5
 	}
 
-	// Read files from stdin if requested
 	files := args.Files
 	if args.Stdin {
 		scanner := bufio.NewScanner(os.Stdin)
@@ -58,6 +57,9 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 				files = append(files, line)
 			}
 		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("files list is required (or use stdin in CLI mode)")
 	}
 
 	// Resolve all files to absolute paths; reject escapes outside workdir.
@@ -96,20 +98,14 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			// import-closure BFS would miss them.
 			if !isTestFile(file, workdir, args.Filter) {
 				dir := filepath.Dir(file)
-				// dir is absolute (absFiles are workdir-absolute); convert
-				// to workdir-relative because the files table stores paths
-				// relative to workdir, and ListFilesInDir uses LIKE matching.
-				relDir, relErr := filepath.Rel(workdir, dir)
-				if relErr == nil {
-					dirFiles, dirErr := database.ListFilesInDirContext(ctx, relDir)
-					if dirErr == nil {
-						for _, df := range dirFiles {
-							// df is relative; join back to absolute to match
-							// the internal absFiles format.
-							absDf := filepath.Join(workdir, df)
-							if absDf != file && isTestFile(absDf, workdir, args.Filter) && !affected[absDf] {
-								affected[absDf] = true
-							}
+				// files table stores workdir-relative paths; query with relative dir.
+				relDir := db.StoragePath(workdir, dir)
+				dirFiles, dirErr := database.ListFilesInDirContext(ctx, relDir)
+				if dirErr == nil {
+					for _, df := range dirFiles {
+						absDf := db.AbsPath(workdir, df)
+						if absDf != file && isTestFile(absDf, workdir, args.Filter) && !affected[absDf] {
+							affected[absDf] = true
 						}
 					}
 				}
@@ -121,8 +117,13 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 				continue // DB failure for one file shouldn't block the whole traversal
 			}
 			for _, importer := range importers {
-				if !affected[importer] {
-					nextQueue = append(nextQueue, importer)
+				// Normalize importer paths (relative storage keys → absolute).
+				imp := importer
+				if !filepath.IsAbs(imp) {
+					imp = db.AbsPath(workdir, imp)
+				}
+				if !affected[imp] {
+					nextQueue = append(nextQueue, imp)
 				}
 			}
 		}
@@ -163,17 +164,7 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 
 // findImporters finds files that import the given file's package.
 func findImporters(database *db.DB, targetFile string) ([]string, error) {
-	// Get the package/module path from the file
-	targetPkg := fileToPackage(targetFile)
-	if targetPkg == "" {
-		return nil, nil
-	}
-
-	files, err := database.FindImporters(targetPkg)
-	if err != nil {
-		return nil, err
-	}
-	return files, nil
+	return findImportersCtx(context.Background(), database, targetFile)
 }
 
 // findImportersCtx is like findImporters but accepts a context for cancellation.

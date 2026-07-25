@@ -33,12 +33,8 @@ func Open(workdir string) (*DB, error) {
 	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
 	// not just the first one in the pool (database/sql may open new connections
 	// concurrently, and default is foreign_keys=OFF / busy_timeout=0).
-	// Guard against paths containing '?' which would be misinterpreted as the
-	// start of the query component in a file:// URI.
-	if strings.Contains(dbPath, "?") {
-		return nil, fmt.Errorf("db path contains '?' which conflicts with DSN query separator: %s", dbPath)
-	}
-	dsn := "file://" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	// Escape URI-special characters in the path so spaces / # / ? / & work.
+	dsn := sqliteFileDSN(dbPath)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -136,6 +132,21 @@ func (d *DB) Close() error {
 // Path returns the database file path.
 func (d *DB) Path() string {
 	return d.path
+}
+
+// sqliteFileDSN builds a modernc.org/sqlite URI with path characters escaped
+// so spaces, #, ?, and & in the filesystem path are not parsed as URI syntax.
+func sqliteFileDSN(dbPath string) string {
+	// Percent-encode URI-significant characters only; keep path separators.
+	esc := strings.NewReplacer(
+		"%", "%25",
+		"?", "%3F",
+		"#", "%23",
+		"&", "%26",
+		" ", "%20",
+	).Replace(dbPath)
+	// file:///abs/path form: "file://" + "/abs/..." → three slashes.
+	return "file://" + esc + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
 // ensureFTSTokenize checks whether nodes_fts has the tokenize clause and

@@ -14,8 +14,8 @@ func stringsContainsNoSuchTable(err error) bool {
 // that old rows become wrong/incomplete (e.g. route→handler references,
 // call-edge line numbers switched to call-site, anonymous-closure calls now
 // captured). On mismatch the server wipes symbol data and does a full reindex.
-// Bumped 15→16 for the S-3/S-4 call-graph extraction fixes.
-const IndexSchemaRevision = "16"
+// Bumped 16→17: index stores workdir-relative paths (portable; fixes affected).
+const IndexSchemaRevision = "17"
 
 const metaSchemaKey = "index_schema_revision"
 

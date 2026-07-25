@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -31,6 +32,12 @@ func setupToolServer(t *testing.T) (*Server, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { database.Close(); os.RemoveAll(dir) })
+
+	// On-disk files so node file-mode Read works with workdir-relative index keys.
+	_ = os.WriteFile(filepath.Join(dir, "alpha.go"), []byte("package p\nfunc Alpha() {}\ntype Gamma struct {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "beta.go"), []byte("package p\nfunc Beta() {}\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "sub", "delta.go"), []byte("package sub\nfunc Delta() {}\n"), 0o644)
 
 	// Insert test nodes and edges
 	idA, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Alpha", File: "alpha.go", Line: 1, EndLine: 10, Language: "go", Body: "func Alpha() {}", Signature: "func Alpha()"})
@@ -110,12 +117,13 @@ func TestToolNodeByName(t *testing.T) {
 
 func TestToolNodeByFileLine(t *testing.T) {
 	s, _ := setupToolServer(t)
-	result, _, err := s.toolNode(context.Background(), nil, nodeArgs{File: "alpha.go", Line: 1})
+	// Symbol mode with file/line pin (file alone is whole-file Read mode).
+	result, _, err := s.toolNode(context.Background(), nil, nodeArgs{Name: "Alpha", File: "alpha.go", Line: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := textContent(result)
-	if !strings.Contains(text, "alpha.go:1") && !strings.Contains(text, "alpha.go") {
+	if !strings.Contains(text, "alpha.go") {
 		t.Fatalf("expected alpha.go in result, got:\n%s", text)
 	}
 }
@@ -137,6 +145,17 @@ func TestToolNodeNoArgs(t *testing.T) {
 	_, _, err := s.toolNode(context.Background(), nil, nodeArgs{})
 	if err == nil {
 		t.Fatal("expected error for empty args")
+	}
+}
+
+func TestToolAffectedRejectsStdinOverMCP(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolAffected(context.Background(), nil, affectedArgs{
+		Stdin: true,
+		Files: []string{"alpha.go"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "stdin") {
+		t.Fatalf("expected MCP stdin rejection, got %v", err)
 	}
 }
 

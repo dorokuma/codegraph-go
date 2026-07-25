@@ -72,7 +72,7 @@ type statusArgs struct {
 
 type affectedArgs struct {
 	Files       []string `json:"files"                jsonschema:"list of changed source files"`
-	Stdin       bool     `json:"stdin,omitempty"      jsonschema:"read file list from stdin,optional"`
+	Stdin       bool     `json:"stdin,omitempty"      jsonschema:"unsupported over MCP (stdio is the protocol); pass files instead,optional"`
 	Depth       int      `json:"depth,omitempty"      jsonschema:"max dependency traversal depth (default 5),optional"`
 	Filter      string   `json:"filter,omitempty"     jsonschema:"custom glob to identify test files,optional"`
 	ProjectPath string   `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
@@ -314,9 +314,15 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, root)
 	out, err := rg.Output()
 	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "no files matched"}},
-		}, nil, nil
+		// rg exits 1 when nothing matched; other failures must surface.
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: "no files matched"}},
+			}, nil, nil
+		}
+		if len(out) == 0 {
+			return nil, nil, fmt.Errorf("rg files: %w", err)
+		}
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) > args.Max {
@@ -344,9 +350,9 @@ func (s *Server) listFilesByGlob(pattern string, max int) (string, error) {
 	}
 	root := s.Workdir
 	var matched []string
-	for _, abs := range allFiles {
-		rel, rerr := filepath.Rel(root, abs)
-		if rerr != nil || strings.HasPrefix(rel, "..") {
+	for _, p := range allFiles {
+		rel := db.RelPath(root, p)
+		if rel == "" || strings.HasPrefix(rel, "..") {
 			continue
 		}
 		if !globMatch(pattern, rel) {
@@ -657,6 +663,10 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 }
 
 func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args affectedArgs) (*mcp.CallToolResult, any, error) {
+	// Never read process stdin here — it is the MCP JSON-RPC stream.
+	if args.Stdin {
+		return nil, nil, fmt.Errorf("stdin is not supported over MCP; pass files as a list instead")
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -664,7 +674,7 @@ func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 	defer s.releaseProject(root)
 	result, err := tools.ToolAffected(ctx, database, root, tools.AffectedArgs{
 		Files:  args.Files,
-		Stdin:  args.Stdin,
+		Stdin:  false,
 		Depth:  args.Depth,
 		Filter: args.Filter,
 	})

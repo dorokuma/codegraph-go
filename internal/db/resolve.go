@@ -106,13 +106,67 @@ func ResolveBestTarget(candidates []Node, fromFile string, preferCallTarget bool
 	return bestID
 }
 
-// RelPath makes paths shorter for agent-facing output.
-func RelPath(workdir, file string) string {
+// StoragePath returns the workdir-relative, slash-normalized path used as the
+// index key for files/nodes/edges. Storing relative paths keeps the DB portable
+// across machines and checkouts. Paths outside workdir fall back to a cleaned
+// absolute form so callers still have a stable key.
+func StoragePath(workdir, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
 	if workdir == "" {
+		return filepath.ToSlash(filepath.Clean(path))
+	}
+	wd := filepath.Clean(workdir)
+	target := path
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(wd, target)
+	}
+	target = filepath.Clean(target)
+	rel, err := filepath.Rel(wd, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(target)
+	}
+	if rel == "." {
+		return "."
+	}
+	return filepath.ToSlash(rel)
+}
+
+// AbsPath joins a storage key (relative or absolute) under workdir for disk I/O.
+func AbsPath(workdir, stored string) string {
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return workdir
+	}
+	if filepath.IsAbs(stored) {
+		return filepath.Clean(stored)
+	}
+	if workdir == "" {
+		return filepath.Clean(stored)
+	}
+	if stored == "." {
+		return filepath.Clean(workdir)
+	}
+	return filepath.Clean(filepath.Join(workdir, filepath.FromSlash(stored)))
+}
+
+// RelPath makes paths shorter for agent-facing output.
+// Handles both absolute indexed paths (legacy) and workdir-relative keys.
+func RelPath(workdir, file string) string {
+	if file == "" {
 		return file
 	}
-	if rel, err := filepath.Rel(workdir, file); err == nil && !strings.HasPrefix(rel, "..") {
-		return rel
+	if workdir == "" {
+		return filepath.ToSlash(file)
+	}
+	// Already a storage-relative key.
+	if !filepath.IsAbs(file) {
+		return filepath.ToSlash(filepath.Clean(file))
+	}
+	if rel, err := filepath.Rel(workdir, file); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(rel)
 	}
 	return file
 }

@@ -122,11 +122,7 @@ func TestToolAffectedSamePackageTests(t *testing.T) {
 
 	workdir := "/workdir"
 
-	// Populate the files table with paths RELATIVE to workdir.
-	// This matches the real daemon, which indexes files relative to workdir.
-	// The earlier version of this test stored absolute paths (workdir + f),
-	// which masked the bug where ListFilesInDirContext was called with absolute
-	// dirs but the files table uses relative paths (LIKE mismatch).
+	// Populate the files table with workdir-relative paths (real indexer keys).
 	// Same-package test files don't import their own package, so the import-
 	// closure BFS alone would miss them. The fix adds same-dir test files
 	// when a non-test source file is visited.

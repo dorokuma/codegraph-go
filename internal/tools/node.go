@@ -305,7 +305,9 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 
 	// Read current bytes from disk (same shape as Read). Never leave workdir
 	// (including via symlink escape — resolve to real path before read).
-	abs, ok := safeReadPath(workdir, resolved)
+	// resolved may be a workdir-relative storage key.
+	diskPath := db.AbsPath(workdir, resolved)
+	abs, ok := safeReadPath(workdir, diskPath)
 	if !ok {
 		return "(path outside workspace)\n", nil
 	}
@@ -366,10 +368,12 @@ func resolveIndexedFile(ctx context.Context, database *db.DB, workdir, fileArg s
 	}
 
 	// Scope to workdir when present — never surface/read outside the project root.
+	// Indexed paths are workdir-relative (or legacy absolute); resolve before check.
 	if workdir != "" {
 		var scoped []string
 		for _, f := range all {
-			if _, ok := pathWithinRoot(workdir, f); ok {
+			abs := db.AbsPath(workdir, f)
+			if _, ok := pathWithinRoot(workdir, abs); ok {
 				scoped = append(scoped, f)
 			}
 		}
@@ -405,13 +409,15 @@ func fileHintMatches(filePath, hint, workdir string) bool {
 	nf := normPath(filePath)
 	hint = strings.TrimSpace(hint)
 
-	// Candidate forms of the hint.
+	// Candidate forms of the hint (absolute, storage-relative, cleaned slash).
 	var forms []string
 	forms = append(forms, normPath(hint))
 	if workdir != "" {
 		if abs, ok := resolveHintUnderRoot(workdir, hint); ok {
 			forms = append(forms, normPath(abs))
+			forms = append(forms, normPath(db.StoragePath(workdir, abs)))
 		}
+		forms = append(forms, normPath(db.StoragePath(workdir, hint)))
 	}
 	// Relative multi-segment as cleaned slash path without forcing abs.
 	hSlash := normPath(filepath.ToSlash(hint))

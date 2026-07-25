@@ -118,6 +118,17 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 	if resolved == s.Workdir {
 		return s.Workdir, s.Database, nil
 	}
+	// Secondary configured workdirs already hold a long-lived DB for the
+	// file watcher — reuse it (no second Open, no ProjectCache refcount).
+	s.ExtraMu.Lock()
+	if s.ExtraDBs != nil {
+		if edb, ok := s.ExtraDBs[resolved]; ok && edb != nil {
+			s.ExtraMu.Unlock()
+			return resolved, edb, nil
+		}
+	}
+	s.ExtraMu.Unlock()
+
 	s.ProjectMu.Lock()
 	defer s.ProjectMu.Unlock()
 	if s.ProjectCache == nil {
@@ -169,11 +180,21 @@ func (s *Server) touchProjectLRU(root string) {
 
 // releaseProject decrements the refcount on a cross-project DB and closes
 // it when the count reaches zero AND the entry has been evicted from the
-// cache (pending-close). For the session-default DB this is a no-op.
+// cache (pending-close). Session-default and Extra (watched secondary)
+// roots are no-ops — those DBs are owned for the process lifetime.
 func (s *Server) releaseProject(root string) {
 	if root == s.Workdir {
 		return
 	}
+	s.ExtraMu.Lock()
+	if s.ExtraDBs != nil {
+		if _, ok := s.ExtraDBs[root]; ok {
+			s.ExtraMu.Unlock()
+			return
+		}
+	}
+	s.ExtraMu.Unlock()
+
 	s.ProjectMu.Lock()
 	defer s.ProjectMu.Unlock()
 	if e, ok := s.ProjectPendingClose[root]; ok {
@@ -185,5 +206,15 @@ func (s *Server) releaseProject(root string) {
 	}
 	if e, ok := s.ProjectCache[root]; ok {
 		atomic.AddInt32(&e.refs, -1)
+	}
+}
+
+// removeProjectLRU drops root from the LRU list (must hold ProjectMu).
+func (s *Server) removeProjectLRU(root string) {
+	for i, r := range s.ProjectLRU {
+		if r == root {
+			s.ProjectLRU = append(s.ProjectLRU[:i], s.ProjectLRU[i+1:]...)
+			return
+		}
 	}
 }

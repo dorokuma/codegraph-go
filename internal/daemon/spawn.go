@@ -10,9 +10,16 @@ import (
 	"syscall"
 )
 
+// SpawnOpts carries parent CLI flags the detached daemon should inherit.
+type SpawnOpts struct {
+	ConfigFile string // -config path (optional)
+	NoSync     bool   // -no-sync
+}
+
 // SpawnDetached launches this binary as the shared daemon for root.
 // Stdio goes to .codegraph/daemon.log; the child is in its own session.
-func SpawnDetached(root string) error {
+// opts may be nil.
+func SpawnDetached(root string, opts *SpawnOpts) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
@@ -40,7 +47,16 @@ func SpawnDetached(root string) error {
 		logFile = nil
 	}
 
-	cmd := exec.Command(self, "-workdir", root)
+	args := []string{"-workdir", root}
+	if opts != nil {
+		if opts.ConfigFile != "" {
+			args = append(args, "-config", opts.ConfigFile)
+		}
+		if opts.NoSync {
+			args = append(args, "-no-sync")
+		}
+	}
+	cmd := exec.Command(self, args...)
 	env := os.Environ()
 	// Mark as daemon; scrub any stale host-ppid markers.
 	filtered := make([]string, 0, len(env)+1)
