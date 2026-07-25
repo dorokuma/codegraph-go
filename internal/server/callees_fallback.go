@@ -89,7 +89,7 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		"byte": true, "rune": true, "uint": true, "int64": true,
 		"uint8": true, "uint16": true, "uint32": true, "uint64": true,
 		"int8": true, "int16": true, "int32": true,
-		"float32": true,
+		"float32":   true,
 		"complex64": true, "complex128": true, "uintptr": true,
 	}
 

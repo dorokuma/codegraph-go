@@ -128,11 +128,11 @@ func mount(r *gin.Engine) {
 
 func TestSimplifyHandlerName(t *testing.T) {
 	cases := map[string]string{
-		"listUsers":              "listUsers",
-		"pkg.Handler":            "Handler",
-		"UsersController@index":  "index",
-		"(*User).Create":         "Create",
-		"h.ServeHTTP":            "ServeHTTP",
+		"listUsers":             "listUsers",
+		"pkg.Handler":           "Handler",
+		"UsersController@index": "index",
+		"(*User).Create":        "Create",
+		"h.ServeHTTP":           "ServeHTTP",
 	}
 	for in, want := range cases {
 		if got := simplifyHandlerName(in); got != want {

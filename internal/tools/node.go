@@ -13,13 +13,13 @@ import (
 
 // NodeArgs are the arguments for the node tool (dual mode, official-aligned).
 type NodeArgs struct {
-	Name         string `json:"name,omitempty" jsonschema:"symbol name (symbol mode). Omit and pass file alone to read a whole file like Read.,optional"`
-	File         string `json:"file,omitempty" jsonschema:"file path or basename. Alone = file-read mode; with name = disambiguate overload.,optional"`
-	Line         int    `json:"line,omitempty" jsonschema:"symbol mode: pin definition at/around this line,optional"`
-	IncludeCode *bool `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default false). File mode always returns source unless symbolsOnly.,optional"`
-	SymbolsOnly bool  `json:"symbolsOnly,omitempty" jsonschema:"file mode: return symbol map + dependents only, no source,optional"`
-	Offset      int   `json:"offset,omitempty" jsonschema:"file mode: 1-based start line (like Read),optional"`
-	Limit       int   `json:"limit,omitempty" jsonschema:"file mode: max lines to return (default whole file, cap 2000),optional"`
+	Name        string `json:"name,omitempty" jsonschema:"symbol name (symbol mode). Omit and pass file alone to read a whole file like Read.,optional"`
+	File        string `json:"file,omitempty" jsonschema:"file path or basename. Alone = file-read mode; with name = disambiguate overload.,optional"`
+	Line        int    `json:"line,omitempty" jsonschema:"symbol mode: pin definition at/around this line,optional"`
+	IncludeCode *bool  `json:"includeCode,omitempty" jsonschema:"symbol mode: include body (default false). File mode always returns source unless symbolsOnly.,optional"`
+	SymbolsOnly bool   `json:"symbolsOnly,omitempty" jsonschema:"file mode: return symbol map + dependents only, no source,optional"`
+	Offset      int    `json:"offset,omitempty" jsonschema:"file mode: 1-based start line (like Read),optional"`
+	Limit       int    `json:"limit,omitempty" jsonschema:"file mode: max lines to return (default whole file, cap 2000),optional"`
 }
 
 // NodeResult is the result of the node tool.

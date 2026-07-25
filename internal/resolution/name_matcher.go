@@ -19,12 +19,12 @@ const (
 const ambiguousCeiling = 80
 
 var callTargetKinds = map[string]bool{
-	db.KindFunction: true,
-	db.KindMethod:   true,
-	"route":         true,
-	db.KindClass:    true,
-	db.KindStruct:   true,
-	db.KindInterface: true,
+	db.KindFunction:    true,
+	db.KindMethod:      true,
+	"route":            true,
+	db.KindClass:       true,
+	db.KindStruct:      true,
+	db.KindInterface:   true,
 	"foreign_function": true,
 }
 

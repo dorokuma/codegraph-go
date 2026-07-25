@@ -60,7 +60,7 @@ go version      # Go 1.25+
 
 # Build
 cd codegraph-go
-go build -o codegraph-go .
+go build -o codegraph-go ./cmd/codegraph-go
 
 # Install
 cp codegraph-go /usr/local/bin/codegraph-go
@@ -139,7 +139,7 @@ codegraph-go detects cross-language calls and creates bridge edges:
 
 ```
 codegraph-go/
-├── main.go              # MCP server + 12 tools + projectPath routing
+├── cmd/codegraph-go/main.go    # Entry point
 ├── db/
 │   ├── schema.sql       # SQLite schema
 │   ├── connection.go    # Database connection

@@ -149,10 +149,10 @@ func NameTail(name string) string {
 // ---------- Go extraction ----------
 
 var (
-	goFuncRe    = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(`)
-	goTypeRe    = regexp.MustCompile(`^type\s+(\w+)\s+(struct|interface)\b`)
-	goCallRe    = regexp.MustCompile(`\b(\w+)\s*\(`)
-	goImportRe  = regexp.MustCompile(`"([^"]+)"`)
+	goFuncRe   = regexp.MustCompile(`^func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(`)
+	goTypeRe   = regexp.MustCompile(`^type\s+(\w+)\s+(struct|interface)\b`)
+	goCallRe   = regexp.MustCompile(`\b(\w+)\s*\(`)
+	goImportRe = regexp.MustCompile(`"([^"]+)"`)
 )
 
 func (e *Extractor) extractGo(source string, filePath string) ([]ExtractedNode, []ExtractedEdge) {
@@ -352,9 +352,9 @@ func (e *Extractor) extractJS(source string, filePath string) ([]ExtractedNode, 
 // ---------- Python extraction ----------
 
 var (
-	pyFuncRe  = regexp.MustCompile(`^def\s+(\w+)\s*\(`)
-	pyClassRe = regexp.MustCompile(`^class\s+(\w+)`)
-	pyCallRe  = regexp.MustCompile(`\b(\w+)\s*\(`)
+	pyFuncRe   = regexp.MustCompile(`^def\s+(\w+)\s*\(`)
+	pyClassRe  = regexp.MustCompile(`^class\s+(\w+)`)
+	pyCallRe   = regexp.MustCompile(`\b(\w+)\s*\(`)
 	pyImportRe = regexp.MustCompile(`(?:from\s+(\S+)\s+import|import\s+(\S+))`)
 )
 
@@ -886,9 +886,9 @@ func isPythonKeyword(s string) bool {
 // ---------- Objective-C extraction ----------
 
 var (
-	objcMethodRe  = regexp.MustCompile(`^[-+]\s*\([^)]+\)\s*(\w+)`)
-	objcClassRe   = regexp.MustCompile(`@interface\s+(\w+)`)
-	objcImportRe  = regexp.MustCompile(`#import\s+[<"]([^>"]+)[>"]`)
+	objcMethodRe = regexp.MustCompile(`^[-+]\s*\([^)]+\)\s*(\w+)`)
+	objcClassRe  = regexp.MustCompile(`@interface\s+(\w+)`)
+	objcImportRe = regexp.MustCompile(`#import\s+[<"]([^>"]+)[>"]`)
 )
 
 func (e *Extractor) extractObjC(source string, filePath string) ([]ExtractedNode, []ExtractedEdge) {
@@ -1044,10 +1044,10 @@ func (e *Extractor) extractLua(source string, filePath string) ([]ExtractedNode,
 // ---------- Pascal/Delphi extraction ----------
 
 var (
-	pascalFuncRe    = regexp.MustCompile(`(?i)function\s+(\w+)\s*(?:\([^)]*\))?\s*:`)
-	pascalProcRe    = regexp.MustCompile(`(?i)procedure\s+(\w+)\s*(?:\([^)]*\))?\s*;`)
-	pascalClassRe   = regexp.MustCompile(`(?i)(\w+)\s*=\s*class`)
-	pascalUnitRe    = regexp.MustCompile(`(?i)unit\s+(\w+)\s*;`)
+	pascalFuncRe  = regexp.MustCompile(`(?i)function\s+(\w+)\s*(?:\([^)]*\))?\s*:`)
+	pascalProcRe  = regexp.MustCompile(`(?i)procedure\s+(\w+)\s*(?:\([^)]*\))?\s*;`)
+	pascalClassRe = regexp.MustCompile(`(?i)(\w+)\s*=\s*class`)
+	pascalUnitRe  = regexp.MustCompile(`(?i)unit\s+(\w+)\s*;`)
 )
 
 func (e *Extractor) extractPascal(source string, filePath string) ([]ExtractedNode, []ExtractedEdge) {

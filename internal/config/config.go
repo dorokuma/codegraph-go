@@ -16,9 +16,9 @@ import (
 // Env vars for extraction helpers (moved here so extraction packages don't
 // read env vars directly).
 const (
-	EnvIndexWorkers  = "CODEGRAPH_INDEX_WORKERS"
-	EnvHomeIndexAll  = "CODEGRAPH_GO_HOME_INDEX_ALL"
-	EnvLogLevel      = "CODEGRAPH_LOG_LEVEL"
+	EnvIndexWorkers = "CODEGRAPH_INDEX_WORKERS"
+	EnvHomeIndexAll = "CODEGRAPH_GO_HOME_INDEX_ALL"
+	EnvLogLevel     = "CODEGRAPH_LOG_LEVEL"
 )
 
 // Default log level when the env var is not set.
@@ -26,11 +26,11 @@ const DefaultLogLevel = "info"
 
 // Config holds the top-level application configuration.
 type Config struct {
-	Workdir     string
-	Workdirs    []string
-	ConfigFile  string
-	NoSync      bool
-	LogLevel    string
+	Workdir    string
+	Workdirs   []string
+	ConfigFile string
+	NoSync     bool
+	LogLevel   string
 }
 
 // LoadConfig parses CLI flags, reads the environment and the optional

@@ -26,9 +26,9 @@ type ClientHello struct {
 }
 
 const (
-	maxHelloLineBytes    = 4096
-	clientHelloTimeout   = 3 * time.Second
-	handshakeProtocol = 1
+	maxHelloLineBytes  = 4096
+	clientHelloTimeout = 3 * time.Second
+	handshakeProtocol  = 1
 )
 
 // WriteHello sends the daemon hello line.

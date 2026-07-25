@@ -25,8 +25,8 @@ type AliasMap struct {
 }
 
 var (
-	aliasCacheMu sync.Mutex
-	aliasCache   = map[string]*aliasCacheEntry{}
+	aliasCacheMu    sync.Mutex
+	aliasCache      = map[string]*aliasCacheEntry{}
 	trailingCommaRe = regexp.MustCompile(`,(\s*[}\]])`)
 )
 

@@ -26,16 +26,16 @@ const (
 )
 
 var (
-	registrarNameRe  = regexp.MustCompile(`^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$`)
-	dispatcherNameRe = regexp.MustCompile(`(?i)(emit|trigger|notify|dispatch|fire|publish|flush)`)
-	registrarFieldRe = regexp.MustCompile(`this\.(\w+)\.(?:add|push|set)\(`)
-	dispatcherForOf  = regexp.MustCompile(`\bof\s+(?:Array\.from\(\s*)?this\.(\w+)`)
+	registrarNameRe   = regexp.MustCompile(`^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$`)
+	dispatcherNameRe  = regexp.MustCompile(`(?i)(emit|trigger|notify|dispatch|fire|publish|flush)`)
+	registrarFieldRe  = regexp.MustCompile(`this\.(\w+)\.(?:add|push|set)\(`)
+	dispatcherForOf   = regexp.MustCompile(`\bof\s+(?:Array\.from\(\s*)?this\.(\w+)`)
 	dispatcherForEach = regexp.MustCompile(`this\.(\w+)\.forEach\(`)
-	onEventRe        = regexp.MustCompile(`\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))`)
-	emitEventRe      = regexp.MustCompile(`\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]`)
-	setStateRe       = regexp.MustCompile(`this\.setState\s*\(`)
-	jsxTagRe         = regexp.MustCompile(`<([A-Z][A-Za-z0-9_]*)[\s/>]`)
-	wordParenRe      = regexp.MustCompile(`\b\w+\s*\(`)
+	onEventRe         = regexp.MustCompile(`\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))`)
+	emitEventRe       = regexp.MustCompile(`\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]`)
+	setStateRe        = regexp.MustCompile(`this\.setState\s*\(`)
+	jsxTagRe          = regexp.MustCompile(`<([A-Z][A-Za-z0-9_]*)[\s/>]`)
+	wordParenRe       = regexp.MustCompile(`\b\w+\s*\(`)
 )
 
 // SynthesizeAll runs whole-graph dynamic-dispatch synthesis after base resolution.
@@ -112,7 +112,6 @@ func edgeKey(src, tgt int64, kind string) string {
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
-
 
 type synthEdge struct {
 	SourceID int64
@@ -398,7 +397,9 @@ func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db
 var argReCache sync.Map
 
 // getArgRe returns a compiled regex that matches calls to name, e.g.
-//   name( this.callback )
+//
+//	name( this.callback )
+//
 // Cached by name so repeated hits on the same registrar don't recompile.
 func getArgRe(name string) *regexp.Regexp {
 	if v, ok := argReCache.Load(name); ok {
@@ -532,7 +533,7 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 		file string
 		line int
 	}
-	emitsByEvent := map[string]map[int64]dispHit{} // event → dispatcher id → hit
+	emitsByEvent := map[string]map[int64]dispHit{}   // event → dispatcher id → hit
 	handlersByEvent := map[string]map[int64]string{} // handler id → registeredAt
 
 	for _, file := range ctx.allFiles {

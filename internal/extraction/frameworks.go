@@ -210,7 +210,7 @@ var (
 	// NestJS Controller prefix
 	nestjsControllerRe = regexp.MustCompile(`@Controller\s*\(\s*['"]([^'"]+)['"]\s*\)`)
 	// React Router v5/v6 JSX: <Route path="/x" component={Comp}/> or element={<Comp/>}
-	reactRouteTagRe = regexp.MustCompile(`<Route\b`)
+	reactRouteTagRe  = regexp.MustCompile(`<Route\b`)
 	reactRoutePathRe = regexp.MustCompile(`\bpath\s*=\s*["']([^"']+)["']`)
 	reactRouteCompRe = regexp.MustCompile(`\bcomponent\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)`)
 	reactRouteElemRe = regexp.MustCompile(`\belement\s*=\s*\{\s*<\s*([A-Z][A-Za-z0-9_]*)`)

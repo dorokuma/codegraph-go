@@ -77,9 +77,9 @@ func TestIsTestFile(t *testing.T) {
 
 func TestIsTestFileWithCustomFilter(t *testing.T) {
 	tests := []struct {
-		file    string
-		filter  string
-		want    bool
+		file   string
+		filter string
+		want   bool
 	}{
 		{"/workdir/pkg/foo_test.go", "*_test.go", true},
 		{"/workdir/pkg/bar_test.go", "*_test.go", true},

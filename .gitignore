@@ -1,6 +1,6 @@
 # binary
-codegraph-go
-codegraph-go.bak
+/codegraph-go
+/codegraph-go.bak
 
 # Go build/test artifacts
 *.test

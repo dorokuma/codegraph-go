@@ -29,12 +29,12 @@ func TruncateBody(body string) string {
 
 // callTargetKinds are symbol kinds that make sense as call targets.
 var callTargetKinds = map[string]bool{
-	KindFunction:  true,
-	KindMethod:    true,
-	"route":       true,
-	KindClass:     true, // constructors / type refs
-	KindStruct:    true,
-	KindInterface: true,
+	KindFunction:       true,
+	KindMethod:         true,
+	"route":            true,
+	KindClass:          true, // constructors / type refs
+	KindStruct:         true,
+	KindInterface:      true,
 	"foreign_function": true,
 }
 

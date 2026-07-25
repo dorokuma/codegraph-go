@@ -25,8 +25,8 @@ type GraphQueryArgs struct {
 
 // ExploreArgs drives the primary explore tool (official-style).
 type ExploreArgs struct {
-	Query    string `json:"query,omitempty"`    // symbol names / free text; empty = overview
-	Path     string `json:"path,omitempty"`     // optional project subdir (home mode)
+	Query    string `json:"query,omitempty"` // symbol names / free text; empty = overview
+	Path     string `json:"path,omitempty"`  // optional project subdir (home mode)
 	Max      int    `json:"max,omitempty"`
 	SkipCode bool   `json:"skipCode,omitempty"` // when true, omit source bodies; show location + trail only
 }
@@ -169,8 +169,8 @@ func ToolImpactGraph(ctx context.Context, database *db.DB, workdir string, args 
 	fileHits := map[string]*hit{}
 	visited := map[int64]bool{}
 	queue := make([]struct {
-		id  int64
-		d   int
+		id int64
+		d  int
 	}, 0, len(defs))
 	for _, d := range defs {
 		queue = append(queue, struct {
@@ -508,7 +508,7 @@ func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query str
 		}
 		if necessary {
 			// Spine/named files get a bit more room but still bounded.
-			spineCap := budget.MaxCharsPerFile*5/2
+			spineCap := budget.MaxCharsPerFile * 5 / 2
 			if spineCap > remaining && remaining > 0 {
 				spineCap = remaining
 			}

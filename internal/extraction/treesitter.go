@@ -38,21 +38,21 @@ type treeSitterLangFactory struct {
 
 // registry is populated by init() in treesitter_extended.go and the built-in set below.
 var tsLangRegistry = map[string]treeSitterLangFactory{
-	"go":       {get: golang.GetLanguage},
+	"go":         {get: golang.GetLanguage},
 	"typescript": {get: typescript.GetLanguage},
 	"javascript": {get: typescript.GetLanguage},
-	"python":    {get: python.GetLanguage},
-	"c":         {get: c.GetLanguage},
-	"cpp":       {get: cpp.GetLanguage},
-	"java":      {get: java.GetLanguage},
-	"kotlin":    {get: kotlin.GetLanguage},
-	"rust":      {get: rust.GetLanguage},
-	"ruby":      {get: ruby.GetLanguage},
-	"php":       {get: php.GetLanguage},
-	"csharp":    {get: csharp.GetLanguage},
-	"scala":     {get: scala.GetLanguage},
-	"swift":     {get: swift.GetLanguage},
-	"lua":       {get: lua.GetLanguage},
+	"python":     {get: python.GetLanguage},
+	"c":          {get: c.GetLanguage},
+	"cpp":        {get: cpp.GetLanguage},
+	"java":       {get: java.GetLanguage},
+	"kotlin":     {get: kotlin.GetLanguage},
+	"rust":       {get: rust.GetLanguage},
+	"ruby":       {get: ruby.GetLanguage},
+	"php":        {get: php.GetLanguage},
+	"csharp":     {get: csharp.GetLanguage},
+	"scala":      {get: scala.GetLanguage},
+	"swift":      {get: swift.GetLanguage},
+	"lua":        {get: lua.GetLanguage},
 }
 
 // tsParserPools caches sync.Pool per language so parsers are reused across files

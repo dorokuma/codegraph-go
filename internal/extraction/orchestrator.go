@@ -212,12 +212,12 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 	}
 
 	var (
-		mu          sync.Mutex
-		totalFiles  int
-		totalNodes  int
-		done        int
-		wg          sync.WaitGroup
-		ch          = make(chan indexJob, workers*2)
+		mu         sync.Mutex
+		totalFiles int
+		totalNodes int
+		done       int
+		wg         sync.WaitGroup
+		ch         = make(chan indexJob, workers*2)
 	)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)

@@ -78,7 +78,7 @@ func TestSpecMatchesFile(t *testing.T) {
 		{"src/components_old/Button.tsx", "components", false},
 		{"src/util_extra.ts", "util", false},
 		// spec with slashes
-		{"src/lib/utils.ts", "lib/utils", false}, // "lib/utils" not a single segment
+		{"src/lib/utils.ts", "lib/utils", false},  // "lib/utils" not a single segment
 		{"lib/utils/index.ts", "lib/utils", true}, // starts with "lib/utils/"
 		{"src/lib/utils.ts", "lib/utils", false},  // does not start with "lib/utils/"
 	}
