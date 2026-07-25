@@ -4,7 +4,7 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.6.1** (alignment in progress). Index logic version **17**.
+Current version: **0.6.2** (alignment in progress). Index logic version **17**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
 
@@ -45,7 +45,7 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.6.1 |
+| Display version | 0.6.2 |
 | Index logic | 17 |
 | Feature parity | **not claimed** (step 10 open) |
 
@@ -65,6 +65,10 @@ go build -o codegraph-go ./cmd/codegraph-go
 # Install
 cp codegraph-go /usr/local/bin/codegraph-go
 ```
+
+## Pi integration
+
+A Pi-specific TypeScript adapter is maintained in [`integrations/pi/`](integrations/pi/README.md). The Go binary remains a generic stdio MCP server; the adapter owns Pi lifecycle, tool registration, dynamic index-root context, and output budgets.
 
 ## Usage
 

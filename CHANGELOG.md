@@ -3,6 +3,16 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-07-25
+
+### Added
+- A versioned Pi-specific adapter under `integrations/pi/` with installation and configuration documentation.
+- GitHub Actions CI for tests, vetting, and binary builds.
+
+### Changed
+- Pi runtime context now injects only dynamic index information; fixed tool workflow guidance remains in tool metadata and skills.
+- Display and daemon wire version updated to 0.6.2.
+
 ## [0.6.1] - 2026-07-25
 
 ### Changed
