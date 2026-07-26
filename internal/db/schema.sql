@@ -102,3 +102,20 @@ CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
+
+-- Agent-accessible fact storage: cross-session findings attached to code symbols.
+CREATE TABLE IF NOT EXISTS facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_file TEXT NOT NULL,
+    target_symbol TEXT,
+    target_line INTEGER,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL UNIQUE,
+    author TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    superseded_by INTEGER REFERENCES facts(id),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK(status IN ('active', 'superseded', 'retracted'))
+);
+CREATE INDEX IF NOT EXISTS idx_facts_target ON facts(target_file, target_symbol);

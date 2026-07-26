@@ -37,6 +37,7 @@ Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parit
 - **Auto-sync:** file watcher with 2-second debounce on every configured workdir; new directories are watched recursively
 - **Staleness warning:** warns when referenced files are pending sync
 - **Respects .gitignore:** uses ripgrep for file operations
+- **Agent fact storage:** `store_fact` / `search_facts` tools let agents attach cross-session findings, decisions, and notes to code symbols; facts survive index rebuilds
 
 
 ## Progress
@@ -100,6 +101,8 @@ All tools accept optional `projectPath` (absolute path inside a project). The se
 | `files` | List files matching a glob pattern |
 | `status` | Index health: node/edge/file counts, pending sync |
 | `affected` | **Extension.** Find test files affected by changed source files |
+| `store_fact` | **Facts.** Store an agent finding/decision attached to a code symbol; dedup by hash; supports supersede chains |
+| `search_facts` | **Facts.** Search stored facts by content, file, symbol, or status |
 
 ## Indexing
 

@@ -3,6 +3,15 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Agent fact storage: `facts` table in SQLite + `store_fact` / `search_facts` MCP tools.
+  - `store_fact`: write agent findings attached to code symbols; SHA-256 dedup; supersede chain support; returns same-target facts for contradiction detection.
+  - `search_facts`: query by content substring, file, symbol, or status.
+  - Facts survive `WipeIndex` (index rebuilds don't delete them).
+  - Absolute paths are normalized to workdir-relative before storing.
+
 ## [0.6.2] - 2026-07-25
 
 ### Added
