@@ -37,6 +37,15 @@ var provenanceWeight = map[string]float64{
 	"heuristic": 0.1,
 }
 
+// weightFor returns the edge weight for a provenance string, defaulting to 0.5
+// for unknown/empty provenance (consistent everywhere).
+func weightFor(provenance string) float64 {
+	if w, ok := provenanceWeight[provenance]; ok {
+		return w
+	}
+	return 0.5
+}
+
 // CommunityInfo holds one detected community for output formatting.
 type CommunityInfo struct {
 	ID            int               `json:"id"`
@@ -115,11 +124,7 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 		if sid > tid {
 			sid, tid = tid, sid
 		}
-		w := provenanceWeight[e.Provenance]
-		if w == 0 {
-			w = 0.5 // unknown provenance
-		}
-		edgeWeights[[2]int64{sid, tid}] += w
+		edgeWeights[[2]int64{sid, tid}] += weightFor(e.Provenance)
 	}
 
 	totalWeightedEdges := 0
@@ -165,9 +170,6 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	}
 
 	// Step 5: Enrich each community with statistics.
-	type enrichedComm struct {
-		info CommunityInfo
-	}
 	infos := make([]CommunityInfo, 0, len(commList))
 	for _, ce := range commList {
 		info := buildCommunityInfo(ce.id, ce.nodes, ce.dbIDs, nodeIndex, reverseIndex, snapshot)
@@ -262,10 +264,10 @@ func buildCommunityInfo(id int, nodes []graph.Node, dbIDs []int64,
 		}
 		// Accumulate weighted degree (undirected: add to both).
 		if compactSet[srcC] {
-			weightedDeg[e.SourceID] += provenanceWeight[e.Provenance]
+			weightedDeg[e.SourceID] += weightFor(e.Provenance)
 		}
 		if compactSet[tgtC] && e.SourceID != e.TargetID {
-			weightedDeg[e.TargetID] += provenanceWeight[e.Provenance]
+			weightedDeg[e.TargetID] += weightFor(e.Provenance)
 		}
 	}
 

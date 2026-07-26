@@ -7,6 +7,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Added
 - `communities` MCP tool: Louvain community detection on the project call graph to reveal module/component boundaries for global architecture questions ("how is this project organized?", "what are the main modules?"). Uses gonum's `graph/community.Modularize` with fixed seed for deterministic results, projects directed edges as undirected with provenance-based weights (exact=1.0, import=0.8, proximity=0.3, heuristic=0.1), excludes `contains` edges, and caps output by community size.
+- Agent fact storage: `facts` table in SQLite + `store_fact` / `search_facts` MCP tools.
+  - `store_fact`: write agent findings attached to code symbols; SHA-256 dedup; supersede chain support; returns same-target facts for contradiction detection.
+  - `search_facts`: query by content substring, file, symbol, or status.
+  - Facts survive `WipeIndex` (index rebuilds don't delete them).
+  - Absolute paths are normalized to workdir-relative before storing.
 
 ## [0.6.2] - 2026-07-25
 

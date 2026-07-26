@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -302,4 +303,149 @@ func TestToolExplorePath(t *testing.T) {
 	if !strings.Contains(text, "delta.go") && !strings.Contains(text, "sub") {
 		t.Fatalf("expected delta.go or sub in path result, got:\n%s", text)
 	}
+}
+
+func TestToolStoreFactHappyPath(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile:   "alpha.go",
+		TargetSymbol: "Alpha",
+		TargetLine:   10,
+		Content:      "Alpha is the main entry point",
+		Author:       "test-agent",
+	})
+	if err != nil {
+		t.Fatalf("store_fact: %v", err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "Alpha is the main entry point") {
+		t.Fatalf("expected content in response, got:\n%s", text)
+	}
+	if strings.Contains(text, `"duplicate":true`) {
+		t.Fatalf("unexpected duplicate in response:\n%s", text)
+	}
+}
+
+func TestToolStoreFactDuplicate(t *testing.T) {
+	s, _ := setupToolServer(t)
+	// Store once
+	s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "Same content",
+		Author:     "agent1",
+	})
+	// Store same content again
+	result, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: "beta.go",
+		Content:    "Same content",
+		Author:     "agent2",
+	})
+	if err != nil {
+		t.Fatalf("second store_fact: %v", err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, `"duplicate":true`) {
+		t.Fatalf("expected duplicate=true in response:\n%s", text)
+	}
+}
+
+func TestToolStoreFactRequiredFields(t *testing.T) {
+	s, _ := setupToolServer(t)
+	// Missing targetFile
+	_, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		Content: "some fact",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing targetFile")
+	}
+
+	// Missing content
+	_, _, err = s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: "a.go",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing content")
+	}
+}
+
+func TestToolSearchFacts(t *testing.T) {
+	s, _ := setupToolServer(t)
+	// Insert a couple facts via DB directly
+	s.Database.InsertFact(&db.Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo",
+		Content: "Foo handles requests", ContentHash: "h1", Status: "active",
+	})
+	s.Database.InsertFact(&db.Fact{
+		TargetFile: "b.go", TargetSymbol: "Bar",
+		Content: "Bar does validation", ContentHash: "h2", Status: "active",
+	})
+
+	// Search by content substring
+	result, _, err := s.toolSearchFacts(context.Background(), nil, searchFactsArgs{
+		Query: "handles",
+	})
+	if err != nil {
+		t.Fatalf("search_facts: %v", err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "Foo handles requests") {
+		t.Fatalf("expected 'Foo handles requests' in result, got:\n%s", text)
+	}
+}
+
+func TestToolSearchFactsNotFound(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolSearchFacts(context.Background(), nil, searchFactsArgs{
+		Query: "nonexistent",
+	})
+	if err != nil {
+		t.Fatalf("search_facts: %v", err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "no facts found") {
+		t.Fatalf("expected 'no facts found', got:\n%s", text)
+	}
+}
+
+func TestToolStoreFactWithSupersedes(t *testing.T) {
+	s, _ := setupToolServer(t)
+
+	// Store first fact
+	res1, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "Old version",
+	})
+	if err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+
+	// Parse the id from the response JSON
+	// The response is JSON: {"duplicate":false,"fact":{...},"same_target":[...]}
+	type storeResp struct {
+		Duplicate bool     `json:"duplicate"`
+		Fact      *db.Fact `json:"fact"`
+	}
+	var r1 storeResp
+	if err := json.Unmarshal([]byte(textContent(res1)), &r1); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	oldID := r1.Fact.ID
+
+	// Store superseding fact
+	res2, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "New version",
+		Supersedes: oldID,
+	})
+	if err != nil {
+		t.Fatalf("second store: %v", err)
+	}
+
+	// Verify old fact is now superseded
+	oldFact, _ := s.Database.GetFactByHash(r1.Fact.ContentHash)
+	if oldFact.Status != "superseded" {
+		t.Fatalf("expected old fact to be superseded, got %q", oldFact.Status)
+	}
+
+	_ = res2
 }

@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -84,6 +87,25 @@ type communitiesArgs struct {
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
+type storeFactArgs struct {
+	TargetFile    string `json:"targetFile"             jsonschema:"file path the fact pertains to (required)"`
+	TargetSymbol  string `json:"targetSymbol,omitempty"  jsonschema:"symbol name within the file,optional"`
+	TargetLine    int    `json:"targetLine,omitempty"    jsonschema:"line number within the file,optional"`
+	Content       string `json:"content"                jsonschema:"fact content (required)"`
+	Author        string `json:"author,omitempty"        jsonschema:"who wrote this fact,optional"`
+	Supersedes    int64  `json:"supersedes,omitempty"    jsonschema:"fact id this replaces (creates a supersede chain),optional"`
+	ProjectPath   string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to write to (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
+}
+
+type searchFactsArgs struct {
+	Query        string `json:"query,omitempty"       jsonschema:"search term in fact content (case-insensitive substring match),optional"`
+	TargetFile   string `json:"targetFile,omitempty"   jsonschema:"filter by target file path,optional"`
+	TargetSymbol string `json:"targetSymbol,omitempty" jsonschema:"filter by target symbol,optional"`
+	Status       string `json:"status,omitempty"       jsonschema:"filter by status (default 'active'; pass 'all' for all statuses),optional"`
+	Max          int    `json:"max,omitempty"           jsonschema:"max results (default 20),optional"`
+	ProjectPath  string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
+}
+
 // ---------- newMCPServer ----------
 
 // NewMCPServer registers the official 8 + affected tools and returns the MCP server.
@@ -146,13 +168,27 @@ func NewMCPServer(s *Server) *mcp.Server {
 	}, s.toolStatus)
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "store_fact",
+		Description: "Store a fact (finding / decision / note) attached to a code symbol. " +
+			"If content hash already exists, returns the existing record with duplicate=true. " +
+			"If supersedes is provided, marks the superseded fact as 'superseded' and links it. " +
+			"Returns the stored fact plus any other active facts for the same target, letting the " +
+			"calling LLM detect contradiction/update scenarios.",
+	}, s.toolStoreFact)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "search_facts",
+		Description: "Search stored facts by content, file, symbol, or status. Facts survive index rebuilds.",
+	}, s.toolSearchFacts)
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "affected",
 		Description: "SECONDARY extension (not on official MCP). Which tests are affected by changed source files? Pass files= after edits; not the main navigation path — prefer explore/node first.",
 	}, s.toolAffected)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "communities",
-		Description: "Run community detection on the project call graph to reveal module/component boundaries. 'lobal architecture questions: how is this project organized, what are the main modules, what's the architecture backbone. Uses Louvain modularity (resolution=1.0) on a weighted undirected graph projected from directed edges (contains edges excluded). Communities sorted by size, each showing top symbols by weighted degree, top files, and kind distribution.",
+		Description: "Run community detection on the project call graph to reveal module/component boundaries. Global architecture questions: how is this project organized, what are the main modules, what's the architecture backbone. Uses Louvain modularity (resolution=1.0) on a weighted undirected graph projected from directed edges (contains edges excluded). Communities sorted by size, each showing top symbols by weighted degree, top files, and kind distribution.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -732,5 +768,127 @@ func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, ar
 	text = s.addStalenessWarning(text)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+	}, nil, nil
+}
+
+// ---------- store_fact ----------
+
+func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args storeFactArgs) (*mcp.CallToolResult, any, error) {
+	if args.TargetFile == "" {
+		return nil, nil, fmt.Errorf("targetFile is required")
+	}
+	if args.Content == "" {
+		return nil, nil, fmt.Errorf("content is required")
+	}
+
+	root, database, err := s.resolveProject(args.ProjectPath)
+	if err != nil {
+		return recoverableProjectErr(err)
+	}
+	defer s.releaseProject(root)
+
+	// Normalize absolute path to workdir-relative
+	targetFile := args.TargetFile
+	if filepath.IsAbs(targetFile) {
+		rel, err := filepath.Rel(root, targetFile)
+		if err == nil && !strings.HasPrefix(rel, "..") {
+			targetFile = filepath.ToSlash(rel)
+		}
+	}
+
+	// SHA-256 of content
+	h := sha256.Sum256([]byte(args.Content))
+	hash := hex.EncodeToString(h[:])
+
+	// Check duplicate by hash
+	existing, err := database.GetFactByHash(hash)
+	if err != nil {
+		return nil, nil, fmt.Errorf("check hash: %w", err)
+	}
+	if existing != nil {
+		sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
+		out := map[string]interface{}{
+			"duplicate":   true,
+			"fact":        existing,
+			"same_target": sameTargetFacts,
+		}
+		b, _ := json.Marshal(out)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		}, nil, nil
+	}
+
+	f := &db.Fact{
+		TargetFile:   targetFile,
+		TargetSymbol: args.TargetSymbol,
+		TargetLine:   args.TargetLine,
+		Content:      args.Content,
+		ContentHash:  hash,
+		Author:       args.Author,
+		Status:       "active",
+	}
+	newID, err := database.InsertFact(f)
+	if err != nil {
+		return nil, nil, fmt.Errorf("insert fact: %w", err)
+	}
+
+	// Handle supersedes after insert so we can link the new ID
+	var supersedeErr string
+	if args.Supersedes > 0 {
+		if err := database.SupersedeFact(args.Supersedes, newID); err != nil {
+			supersedeErr = err.Error()
+		}
+	}
+
+	inserted, _ := database.GetFactByHash(hash)
+	sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
+
+	resp := map[string]interface{}{
+		"duplicate":   false,
+		"fact":        inserted,
+		"same_target": sameTargetFacts,
+	}
+	if supersedeErr != "" {
+		resp["supersede_warning"] = supersedeErr
+	}
+
+	b, _ := json.Marshal(resp)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+	}, nil, nil
+}
+
+// ---------- search_facts ----------
+
+func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, args searchFactsArgs) (*mcp.CallToolResult, any, error) {
+	root, database, err := s.resolveProject(args.ProjectPath)
+	if err != nil {
+		return recoverableProjectErr(err)
+	}
+	defer s.releaseProject(root)
+
+	max := args.Max
+	if max <= 0 {
+		max = 20
+	}
+	status := args.Status
+	if status == "" {
+		status = "active"
+	}
+
+	facts, err := database.SearchFacts(args.Query, args.TargetFile, args.TargetSymbol, status, max)
+	if err != nil {
+		return nil, nil, fmt.Errorf("search facts: %w", err)
+	}
+
+	if len(facts) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no facts found"}},
+		}, nil, nil
+	}
+
+	b, _ := json.Marshal(facts)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
 	}, nil, nil
 }

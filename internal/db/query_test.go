@@ -591,3 +591,360 @@ func TestFTSBackfillOnUpgrade(t *testing.T) {
 		t.Fatalf("expected LegacyFn backfilled, got %+v", nodes)
 	}
 }
+
+func TestInsertFact(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	f := &Fact{
+		TargetFile:   "alpha.go",
+		TargetSymbol: "Alpha",
+		TargetLine:   10,
+		Content:      "Alpha is the entry point for parsing",
+		ContentHash:  "abc123",
+		Author:       "agent",
+		Status:       "active",
+	}
+	id, err := database.InsertFact(f)
+	if err != nil {
+		t.Fatalf("insert fact: %v", err)
+	}
+	if id == 0 {
+		t.Fatal("expected non-zero id")
+	}
+
+	// Duplicate hash should fail (UNIQUE constraint)
+	f2 := *f
+	_, err = database.InsertFact(&f2)
+	if err == nil {
+		t.Fatal("expected error on duplicate hash")
+	}
+}
+
+func TestGetFactByHash(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	f := &Fact{
+		TargetFile:   "beta.go",
+		TargetSymbol: "Beta",
+		Content:      "Beta processes user input",
+		ContentHash:  "def456",
+		Status:       "active",
+	}
+	id, err := database.InsertFact(f)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	got, err := database.GetFactByHash("def456")
+	if err != nil {
+		t.Fatalf("get by hash: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected fact, got nil")
+	}
+	if got.ID != id {
+		t.Fatalf("expected id %d, got %d", id, got.ID)
+	}
+	if got.Content != "Beta processes user input" {
+		t.Fatalf("content mismatch: %q", got.Content)
+	}
+	if got.TargetFile != "beta.go" {
+		t.Fatalf("file mismatch: %q", got.TargetFile)
+	}
+
+	// Non-existent hash
+	nilFact, err := database.GetFactByHash("nonexistent")
+	if err != nil {
+		t.Fatalf("get nonexistent: %v", err)
+	}
+	if nilFact != nil {
+		t.Fatal("expected nil for nonexistent hash")
+	}
+}
+
+func TestGetFactsByTarget(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	database.InsertFact(&Fact{
+		TargetFile: "gamma.go", TargetSymbol: "Gamma", Content: "fact1", ContentHash: "h1", Status: "active",
+	})
+	database.InsertFact(&Fact{
+		TargetFile: "gamma.go", TargetSymbol: "Gamma", Content: "fact2", ContentHash: "h2", Status: "active",
+	})
+	database.InsertFact(&Fact{
+		TargetFile: "gamma.go", TargetSymbol: "Delta", Content: "fact3", ContentHash: "h3", Status: "active",
+	})
+
+	// Filter by file only
+	facts, err := database.GetFactsByTarget("gamma.go", "")
+	if err != nil {
+		t.Fatalf("get by target: %v", err)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("expected 3 facts, got %d", len(facts))
+	}
+
+	// Filter by file + symbol
+	facts, err = database.GetFactsByTarget("gamma.go", "Gamma")
+	if err != nil {
+		t.Fatalf("get by target+symbol: %v", err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("expected 2 facts for Gamma, got %d", len(facts))
+	}
+
+	// No match
+	facts, err = database.GetFactsByTarget("nonexistent.go", "")
+	if err != nil {
+		t.Fatalf("get nonexistent: %v", err)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("expected 0 facts, got %d", len(facts))
+	}
+}
+
+func TestSearchFacts(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	database.InsertFact(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo", Content: "Foo is a handler for /foo route", ContentHash: "h1", Status: "active",
+	})
+	database.InsertFact(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Bar", Content: "Bar validates the request body", ContentHash: "h2", Status: "active",
+	})
+	database.InsertFact(&Fact{
+		TargetFile: "b.go", TargetSymbol: "Foo", Content: "Foo helper does logging", ContentHash: "h3", Status: "superseded",
+	})
+
+	// Search content substring (case-insensitive LIKE)
+	facts, err := database.SearchFacts("handler", "", "", "", 20)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact matching 'handler', got %d", len(facts))
+	}
+
+	// Filter by file
+	facts, err = database.SearchFacts("", "a.go", "", "", 20)
+	if err != nil {
+		t.Fatalf("search by file: %v", err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("expected 2 facts for a.go, got %d", len(facts))
+	}
+
+	// Filter by symbol
+	facts, err = database.SearchFacts("", "", "Foo", "", 20)
+	if err != nil {
+		t.Fatalf("search by symbol: %v", err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("expected 2 facts for symbol Foo, got %d", len(facts))
+	}
+
+	// Filter by status
+	facts, err = database.SearchFacts("", "", "", "active", 20)
+	if err != nil {
+		t.Fatalf("search by status: %v", err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("expected 2 active facts, got %d", len(facts))
+	}
+
+	// status=all returns everything
+	facts, err = database.SearchFacts("", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search all: %v", err)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("expected 3 facts for 'all', got %d", len(facts))
+	}
+
+	// Default max
+	facts, err = database.SearchFacts("", "", "", "", 0)
+	if err != nil {
+		t.Fatalf("search default max: %v", err)
+	}
+	if len(facts) > 20 {
+		t.Fatalf("expected at most 20 facts, got %d", len(facts))
+	}
+}
+
+func TestSupersedeFact(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	id1, _ := database.InsertFact(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo", Content: "old claim", ContentHash: "h1", Status: "active",
+	})
+	id2, _ := database.InsertFact(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo", Content: "corrected claim", ContentHash: "h2", Status: "active",
+	})
+
+	// Supersede
+	if err := database.SupersedeFact(id1, id2); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	// old should be superseded
+	f1, err := database.GetFactByHash("h1")
+	if err != nil {
+		t.Fatalf("get old: %v", err)
+	}
+	if f1.Status != "superseded" {
+		t.Fatalf("expected 'superseded', got %q", f1.Status)
+	}
+	if f1.SupersededBy != id2 {
+		t.Fatalf("expected superseded_by=%d, got %d", id2, f1.SupersededBy)
+	}
+
+	// Re-superseding should fail (already inactive)
+	if err := database.SupersedeFact(id1, id2); err == nil {
+		t.Fatal("expected error on superseding inactive fact")
+	}
+}
+
+func TestRetractFact(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	id, _ := database.InsertFact(&Fact{
+		TargetFile: "a.go", Content: "wrong", ContentHash: "h1", Status: "active",
+	})
+
+	if err := database.RetractFact(id); err != nil {
+		t.Fatalf("retract: %v", err)
+	}
+
+	f, err := database.GetFactByHash("h1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if f.Status != "retracted" {
+		t.Fatalf("expected 'retracted', got %q", f.Status)
+	}
+
+	// Double retract should fail
+	if err := database.RetractFact(id); err == nil {
+		t.Fatal("expected error on retracting inactive fact")
+	}
+}
+
+func TestFactsSurviveWipeIndex(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert a fact
+	id, err := database.InsertFact(&Fact{
+		TargetFile:   "survivor.go",
+		TargetSymbol: "Survivor",
+		Content:      "this fact must survive WipeIndex",
+		ContentHash:  "survive-hash",
+		Status:       "active",
+	})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Also insert a node (will be wiped)
+	database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "willBeWiped", File: "/gone.go", Line: 1,
+	})
+
+	// WipeIndex should only delete unresolved_refs/edges/nodes/files
+	if err := database.WipeIndex(); err != nil {
+		t.Fatalf("WipeIndex: %v", err)
+	}
+
+	// Fact should still exist
+	f, err := database.GetFactByHash("survive-hash")
+	if err != nil {
+		t.Fatalf("get fact after wipe: %v", err)
+	}
+	if f == nil {
+		t.Fatal("fact disappeared after WipeIndex")
+	}
+	if f.ID != id {
+		t.Fatalf("expected id %d, got %d", id, f.ID)
+	}
+	if f.Status != "active" {
+		t.Fatalf("expected active, got %q", f.Status)
+	}
+
+	// Nodes table should be empty
+	stats, err := database.GetStats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.NodeCount != 0 {
+		t.Fatalf("expected 0 nodes after wipe, got %d", stats.NodeCount)
+	}
+}
+
+func TestFactsRelPath(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert with absolute path — stored as-is; RelPath conversion happens at the tool layer
+	id, err := database.InsertFact(&Fact{
+		TargetFile:   "/home/user/project/src/main.go",
+		TargetSymbol: "Main",
+		Content:      "Main starts the server",
+		ContentHash:  "abs-path-hash",
+		Status:       "active",
+	})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	f, err := database.GetFactByHash("abs-path-hash")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if f.TargetFile != "/home/user/project/src/main.go" {
+		t.Fatalf("expected absolute path, got %q", f.TargetFile)
+	}
+	_ = id
+}
+
+func TestSupersedeChain(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	id1, _ := database.InsertFact(&Fact{
+		TargetFile: "x.go", TargetSymbol: "X", Content: "v1", ContentHash: "v1-hash", Status: "active",
+	})
+	id2, _ := database.InsertFact(&Fact{
+		TargetFile: "x.go", TargetSymbol: "X", Content: "v2", ContentHash: "v2-hash", Status: "active",
+	})
+	id3, _ := database.InsertFact(&Fact{
+		TargetFile: "x.go", TargetSymbol: "X", Content: "v3", ContentHash: "v3-hash", Status: "active",
+	})
+
+	// v1 → v2 → v3
+	if err := database.SupersedeFact(id1, id2); err != nil {
+		t.Fatalf("v1→v2: %v", err)
+	}
+	if err := database.SupersedeFact(id2, id3); err != nil {
+		t.Fatalf("v2→v3: %v", err)
+	}
+
+	f1, _ := database.GetFactByHash("v1-hash")
+	f2, _ := database.GetFactByHash("v2-hash")
+	f3, _ := database.GetFactByHash("v3-hash")
+
+	if f1.Status != "superseded" || f1.SupersededBy != id2 {
+		t.Fatalf("v1 wrong: status=%q superseded_by=%d", f1.Status, f1.SupersededBy)
+	}
+	if f2.Status != "superseded" || f2.SupersededBy != id3 {
+		t.Fatalf("v2 wrong: status=%q superseded_by=%d", f2.Status, f2.SupersededBy)
+	}
+	if f3.Status != "active" || f3.SupersededBy != 0 {
+		t.Fatalf("v3 wrong: status=%q superseded_by=%d", f3.Status, f3.SupersededBy)
+	}
+}

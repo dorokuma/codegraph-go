@@ -12,7 +12,7 @@ Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise
 
 Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
 
-- **10 MCP tools:** explore (PRIMARY), node (SECONDARY dual-mode), search, callers, callees, impact, files, status, affected (extension), communities (extension). `context` / `trace` / `search_fts` removed from MCP.
+- **12 MCP tools:** explore (PRIMARY), node (SECONDARY dual-mode), search, callers, callees, impact, files, status, affected / communities (extensions), store_fact / search_facts (agent fact storage). `context` / `trace` / `search_fts` removed from MCP.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
 - **projectPath on every tool:** walk up to nearest `.codegraph/` and query that project’s index (no cross-project DB bleed)
 - **Graph-first queries:** callers / callees / impact walk the SQLite call graph (rg only as labeled fallback); optional `file` pins overloads
@@ -37,6 +37,7 @@ Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parit
 - **Auto-sync:** file watcher with 2-second debounce on every configured workdir; new directories are watched recursively
 - **Staleness warning:** warns when referenced files are pending sync
 - **Respects .gitignore:** uses ripgrep for file operations
+- **Agent fact storage:** `store_fact` / `search_facts` tools let agents attach cross-session findings, decisions, and notes to code symbols; facts survive index rebuilds
 
 
 ## Progress
@@ -101,6 +102,8 @@ All tools accept optional `projectPath` (absolute path inside a project). The se
 | `status` | Index health: node/edge/file counts, pending sync |
 | `affected` | **Extension.** Find test files affected by changed source files |
 | `communities` | **Extension.** Louvain community detection on the call graph to reveal module/component boundaries for global architecture questions |
+| `store_fact` | **Facts.** Store an agent finding/decision attached to a code symbol; dedup by hash; supports supersede chains |
+| `search_facts` | **Facts.** Search stored facts by content, file, symbol, or status |
 
 ## Indexing
 

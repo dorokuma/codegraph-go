@@ -78,6 +78,21 @@ type FileRecord struct {
 	NodeCount   int
 }
 
+// Fact is an agent-annotated fact attached to a code symbol.
+type Fact struct {
+	ID           int64
+	TargetFile   string
+	TargetSymbol string
+	TargetLine   int
+	Content      string
+	ContentHash  string
+	Author       string
+	Status       string // active | superseded | retracted
+	SupersededBy int64 // 0 = none
+	CreatedAt    int64 // unix seconds
+	UpdatedAt    int64 // unix seconds
+}
+
 // UnresolvedRef is a pending/failed reference awaiting resolution.
 type UnresolvedRef struct {
 	ID            int64
@@ -141,6 +156,211 @@ func (d *DB) UpsertNode(n *Node) (int64, error) {
 
 // nullInt stores 0 columns as NULL so "unset" stays distinguishable later if needed.
 func nullInt(v int) interface{} {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// InsertFact stores a new fact. contentHash is a SHA-256 hex string.
+// The caller must already have computed it. Returns the new row ID and nil.
+func (d *DB) InsertFact(f *Fact) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now().Unix()
+	result, err := d.conn.Exec(`
+		INSERT INTO facts (target_file, target_symbol, target_line, content, content_hash,
+			author, status, superseded_by, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, f.TargetFile, nullString(f.TargetSymbol), nullInt(f.TargetLine),
+		f.Content, f.ContentHash, nullString(f.Author),
+		statusOrDefault(f.Status), nullInt64(f.SupersededBy), now, now)
+	if err != nil {
+		return 0, fmt.Errorf("insert fact: %w", err)
+	}
+	return result.LastInsertId()
+}
+
+// GetFactByHash looks up a fact by its content hash. Returns nil when not found.
+func (d *DB) GetFactByHash(hash string) (*Fact, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	row := d.conn.QueryRow(`
+		SELECT id, target_file, target_symbol, target_line, content, content_hash,
+			author, status, COALESCE(superseded_by,0), created_at, updated_at
+		FROM facts WHERE content_hash = ?
+	`, hash)
+	return scanFact(row)
+}
+
+// GetFactsByTarget returns all facts for a given target_file and optionally target_symbol.
+// Pass symbol="" to ignore symbol filter.
+func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	q := `SELECT id, target_file, target_symbol, target_line, content, content_hash,
+		author, status, COALESCE(superseded_by,0), created_at, updated_at
+		FROM facts WHERE target_file = ?`
+	args := []interface{}{file}
+	if symbol != "" {
+		q += ` AND target_symbol = ?`
+		args = append(args, symbol)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := d.conn.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFacts(rows)
+}
+
+// SearchFacts searches facts by content substring (case-insensitive LIKE),
+// optionally filtered by target_file, target_symbol, status, and max rows.
+// status "" returns all statuses.
+func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if max <= 0 {
+		max = 20
+	}
+	var wheres []string
+	var args []interface{}
+	if query != "" {
+		wheres = append(wheres, `content LIKE ?`)
+		args = append(args, "%"+query+"%")
+	}
+	if file != "" {
+		wheres = append(wheres, `target_file = ?`)
+		args = append(args, file)
+	}
+	if symbol != "" {
+		wheres = append(wheres, `target_symbol = ?`)
+		args = append(args, symbol)
+	}
+	if status != "" && status != "all" {
+		wheres = append(wheres, `status = ?`)
+		args = append(args, status)
+	}
+	q := `SELECT id, target_file, target_symbol, target_line, content, content_hash,
+		author, status, COALESCE(superseded_by,0), created_at, updated_at
+		FROM facts`
+	if len(wheres) > 0 {
+		q += ` WHERE ` + strings.Join(wheres, ` AND `)
+	}
+	q += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, max)
+	rows, err := d.conn.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFacts(rows)
+}
+
+// SupersedeFact marks oldID as superseded and links it to newID (the replacing fact).
+// Both IDs must exist and oldID must be active.
+func (d *DB) SupersedeFact(oldID, newID int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	result, err := d.conn.Exec(`
+		UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
+		WHERE id = ? AND status = 'active'
+	`, newID, time.Now().Unix(), oldID)
+	if err != nil {
+		return fmt.Errorf("supersede fact: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("fact %d not found or not active", oldID)
+	}
+	return nil
+}
+
+// RetractFact marks a fact as retracted (agent later determined it was wrong).
+func (d *DB) RetractFact(id int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	result, err := d.conn.Exec(`
+		UPDATE facts SET status = 'retracted', updated_at = ?
+		WHERE id = ? AND status = 'active'
+	`, time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("retract fact: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("fact %d not found or not active", id)
+	}
+	return nil
+}
+
+// scanFact scans a single fact row. Returns nil when the row is sql.ErrNoRows.
+func scanFact(row *sql.Row) (*Fact, error) {
+	var f Fact
+	var targetSymbol, author sql.NullString
+	var targetLine, supersededBy sql.NullInt64
+	if err := row.Scan(&f.ID, &f.TargetFile, &targetSymbol, &targetLine,
+		&f.Content, &f.ContentHash, &author, &f.Status, &supersededBy,
+		&f.CreatedAt, &f.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	f.TargetSymbol = targetSymbol.String
+	f.TargetLine = int(targetLine.Int64)
+	f.Author = author.String
+	f.SupersededBy = supersededBy.Int64
+	return &f, nil
+}
+
+// scanFacts scans fact rows.
+func scanFacts(rows *sql.Rows) ([]Fact, error) {
+	defer rows.Close()
+	var out []Fact
+	for rows.Next() {
+		var f Fact
+		var targetSymbol, author sql.NullString
+		var targetLine, supersededBy sql.NullInt64
+		if err := rows.Scan(&f.ID, &f.TargetFile, &targetSymbol, &targetLine,
+			&f.Content, &f.ContentHash, &author, &f.Status, &supersededBy,
+			&f.CreatedAt, &f.UpdatedAt); err != nil {
+			return nil, err
+		}
+		f.TargetSymbol = targetSymbol.String
+		f.TargetLine = int(targetLine.Int64)
+		f.Author = author.String
+		f.SupersededBy = supersededBy.Int64
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// statusOrDefault returns "active" when s is empty.
+func statusOrDefault(s string) string {
+	if s == "" {
+		return "active"
+	}
+	return s
+}
+
+// nullString returns nil for empty strings so SQLite stores NULL.
+func nullString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// nullInt64 returns nil for 0 so SQLite stores NULL.
+func nullInt64(v int64) interface{} {
 	if v == 0 {
 		return nil
 	}
