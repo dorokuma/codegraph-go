@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-07-26
+
+### Added
+- `communities` / `store_fact` / `search_facts` now accept a `path` arg as a home-mode project selector (directory name under a broad workdir), retargeted via `detectProject` — same convention as `search`/`callers`/`explore`. Fixes pi-extension clients that pass `path` instead of `projectPath`.
+
 ## [0.7.0] - 2026-07-26
 
 ### Added

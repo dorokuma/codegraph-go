@@ -84,6 +84,7 @@ type affectedArgs struct {
 type communitiesArgs struct {
 	Max         int    `json:"max,omitempty"      jsonschema:"max communities to report (default 20),optional"`
 	MinSize     int    `json:"minSize,omitempty"  jsonschema:"minimum community size (nodes) to include in output (default 3),optional"`
+	Path        string `json:"path,omitempty"     jsonschema:"home-mode project selector: a project directory name under a broad workdir (e.g. \"myrepo\"); ignored for subdirectory scoping since community detection is graph-wide,optional"`
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
@@ -94,6 +95,7 @@ type storeFactArgs struct {
 	Content       string `json:"content"                jsonschema:"fact content (required)"`
 	Author        string `json:"author,omitempty"        jsonschema:"who wrote this fact,optional"`
 	Supersedes    int64  `json:"supersedes,omitempty"    jsonschema:"fact id this replaces (creates a supersede chain),optional"`
+	Path          string `json:"path,omitempty"         jsonschema:"home-mode project selector: a project directory name under a broad workdir (e.g. \"myrepo\"),optional"`
 	ProjectPath   string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to write to (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
@@ -103,6 +105,7 @@ type searchFactsArgs struct {
 	TargetSymbol string `json:"targetSymbol,omitempty" jsonschema:"filter by target symbol,optional"`
 	Status       string `json:"status,omitempty"       jsonschema:"filter by status (default 'active'; pass 'all' for all statuses),optional"`
 	Max          int    `json:"max,omitempty"           jsonschema:"max results (default 20),optional"`
+	Path         string `json:"path,omitempty"         jsonschema:"home-mode project selector: a project directory name under a broad workdir (e.g. \"myrepo\"),optional"`
 	ProjectPath  string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
@@ -194,6 +197,7 @@ func NewMCPServer(s *Server) *mcp.Server {
 			Properties: map[string]*jsonschema.Schema{
 				"max":         {Type: "integer", Description: "max communities to report (default 20)"},
 				"minSize":     {Type: "integer", Description: "minimum community size to include in output (default 3)"},
+				"path":        {Type: "string", Description: "home-mode project selector: project directory name under a broad workdir"},
 				"projectPath": {Type: "string", Description: "absolute path to the project to query"},
 			},
 		},
@@ -747,6 +751,11 @@ func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 }
 
 func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, args communitiesArgs) (*mcp.CallToolResult, any, error) {
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Path); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -781,6 +790,11 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		return nil, nil, fmt.Errorf("content is required")
 	}
 
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Path, args.TargetFile); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -861,6 +875,11 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 // ---------- search_facts ----------
 
 func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, args searchFactsArgs) (*mcp.CallToolResult, any, error) {
+	if args.ProjectPath == "" {
+		if p := s.detectProject(args.Path, args.TargetFile); p != "" {
+			args.ProjectPath = p
+		}
+	}
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
