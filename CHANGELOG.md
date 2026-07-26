@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `communities` MCP tool: Louvain community detection on the project call graph to reveal module/component boundaries for global architecture questions ("how is this project organized?", "what are the main modules?"). Uses gonum's `graph/community.Modularize` with fixed seed for deterministic results, projects directed edges as undirected with provenance-based weights (exact=1.0, import=0.8, proximity=0.3, heuristic=0.1), excludes `contains` edges, and caps output by community size.
+
 ## [0.6.2] - 2026-07-25
 
 ### Added

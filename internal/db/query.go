@@ -1144,3 +1144,70 @@ func scanOneNode(row *sql.Row) (*Node, error) {
 	}
 	return &n, nil
 }
+
+// GraphSnapshot contains all nodes and edges loaded from the index for
+// graph-level algorithms like community detection.
+type GraphSnapshot struct {
+	Nodes []Node
+	Edges []Edge
+}
+
+// GetGraphSnapshot returns all nodes and edges in one call, protected by RLock.
+// Returns an error if edge count exceeds 500k (safety cap to prevent OOM).
+func (d *DB) GetGraphSnapshot() (*GraphSnapshot, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var edgeCount int
+	if err := d.conn.QueryRow("SELECT COUNT(*) FROM edges").Scan(&edgeCount); err != nil {
+		return nil, fmt.Errorf("count edges: %w", err)
+	}
+	if edgeCount > 500_000 {
+		return nil, fmt.Errorf(
+			"graph too large for community detection: %d edges (max 500k); "+
+				"this limit exists to prevent OOM and can be adjusted in code",
+			edgeCount,
+		)
+	}
+
+	nodes, err := func() ([]Node, error) {
+		rows, err := d.conn.Query(`SELECT ` + nodeSelectCols + ` FROM nodes`)
+		if err != nil {
+			return nil, fmt.Errorf("query nodes: %w", err)
+		}
+		defer rows.Close()
+		return scanNodes(rows)
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	edges, err := func() ([]Edge, error) {
+		rows, err := d.conn.Query(`SELECT id, source_id, target_id, kind, file, line, col, provenance, metadata FROM edges`)
+		if err != nil {
+			return nil, fmt.Errorf("query edges: %w", err)
+		}
+		defer rows.Close()
+		var out []Edge
+		for rows.Next() {
+			var e Edge
+			var file, provenance, metadata sql.NullString
+			var line, col sql.NullInt64
+			if err := rows.Scan(&e.ID, &e.SourceID, &e.TargetID, &e.Kind, &file, &line, &col, &provenance, &metadata); err != nil {
+				return nil, err
+			}
+			e.File = file.String
+			e.Line = int(line.Int64)
+			e.Col = int(col.Int64)
+			e.Provenance = provenance.String
+			e.Metadata = metadata.String
+			out = append(out, e)
+		}
+		return out, rows.Err()
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	return &GraphSnapshot{Nodes: nodes, Edges: edges}, nil
+}

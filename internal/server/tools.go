@@ -78,6 +78,12 @@ type affectedArgs struct {
 	ProjectPath string   `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
+type communitiesArgs struct {
+	Max         int    `json:"max,omitempty"      jsonschema:"max communities to report (default 20),optional"`
+	MinSize     int    `json:"minSize,omitempty"  jsonschema:"minimum community size (nodes) to include in output (default 3),optional"`
+	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
+}
+
 // ---------- newMCPServer ----------
 
 // NewMCPServer registers the official 8 + affected tools and returns the MCP server.
@@ -143,6 +149,19 @@ func NewMCPServer(s *Server) *mcp.Server {
 		Name:        "affected",
 		Description: "SECONDARY extension (not on official MCP). Which tests are affected by changed source files? Pass files= after edits; not the main navigation path — prefer explore/node first.",
 	}, s.toolAffected)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "communities",
+		Description: "Run community detection on the project call graph to reveal module/component boundaries. 'lobal architecture questions: how is this project organized, what are the main modules, what's the architecture backbone. Uses Louvain modularity (resolution=1.0) on a weighted undirected graph projected from directed edges (contains edges excluded). Communities sorted by size, each showing top symbols by weighted degree, top files, and kind distribution.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"max":         {Type: "integer", Description: "max communities to report (default 20)"},
+				"minSize":     {Type: "integer", Description: "minimum community size to include in output (default 3)"},
+				"projectPath": {Type: "string", Description: "absolute path to the project to query"},
+			},
+		},
+	}, s.toolCommunities)
 
 	return srv
 }
@@ -688,5 +707,30 @@ func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: result.Content[0].Text}},
+	}, nil, nil
+}
+
+func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, args communitiesArgs) (*mcp.CallToolResult, any, error) {
+	root, database, err := s.resolveProject(args.ProjectPath)
+	if err != nil {
+		return recoverableProjectErr(err)
+	}
+	defer s.releaseProject(root)
+	result, err := tools.ToolCommunity(ctx, database, root, tools.CommunityArgs{
+		Max:     args.Max,
+		MinSize: args.MinSize,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if result == nil || len(result.Content) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no community data found"}},
+		}, nil, nil
+	}
+	text := truncateOutput(result.Content[0].Text, defaultOutputChars)
+	text = s.addStalenessWarning(text)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
 }
