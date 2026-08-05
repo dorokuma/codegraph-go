@@ -716,7 +716,9 @@ ${projectLine}
 }
 
 function registerTools(pi: ExtensionAPI, getClient: () => CodeGraphClient | null) {
-	const run = async (name: string, params: Record<string, unknown>) => {
+	// MCP v0.8+ exposes a single tool "codegraph" (action=…). Pi uses the same name;
+	// the adapter only bridges stdio + budgets — no per-action MCP fan-out.
+	const run = async (params: Record<string, unknown>) => {
 		const c = getClient()
 		if (!c) {
 			return {
@@ -730,7 +732,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => CodeGraphClient | null
 			}
 		}
 		try {
-			const result = await c.callTool(name, params)
+			const result = await c.callTool("codegraph", params)
 			return { content: [{ type: "text" as const, text: result }], details: {} }
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err)
@@ -742,232 +744,61 @@ function registerTools(pi: ExtensionAPI, getClient: () => CodeGraphClient | null
 	}
 
 	pi.registerTool({
-		name: "codegraph_search",
-		label: "CodeGraph Search",
-		description: "按正则/文本搜代码，返回 file:line。可加 path/glob 收窄；结果有上限。",
-		promptSnippet: "Search code by pattern with file:line results",
-		promptGuidelines: [
-			"Use codegraph_search for code search. It respects .gitignore and returns structured file:line results.",
-			"Use codegraph_search when looking for function definitions, class declarations, string literals, or any code pattern.",
-			"When the user names a project under a home workdir, pass path= that project yourself — do not ask the user for paths.",
-		],
-		parameters: Type.Object({
-			pattern: Type.String({ description: "regex or literal pattern (ripgrep syntax)" }),
-			path: Type.Optional(Type.String({ description: "optional subdirectory under workspace" })),
-			glob: Type.Optional(Type.String({ description: 'optional file glob filter, e.g. "*.go"' })),
-			max_results: Type.Optional(
-				Type.Number({
-					description: `global match cap (default ${DEFAULT_SEARCH_MAX}, hard max ${HARD_SEARCH_MAX})`,
-				}),
-			),
-			ignore_case: Type.Optional(Type.Boolean({ description: "case-insensitive search" })),
-		}),
-		async execute(_id, params) {
-			return run("search", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_files",
-		label: "CodeGraph Files",
-		description: "按 glob 列文件。结果有上限。",
-		promptSnippet: "List files by glob pattern",
-		promptGuidelines: [
-			"Use codegraph_files for finding files. It respects .gitignore and supports glob patterns.",
-		],
-		parameters: Type.Object({
-			pattern: Type.Optional(Type.String({ description: 'glob pattern, e.g. "src/**/*.go"' })),
-			path: Type.Optional(Type.String({ description: "optional subdirectory under workspace" })),
-			max: Type.Optional(
-				Type.Number({ description: `cap (default ${DEFAULT_FILES_MAX}, hard max ${HARD_FILES_MAX})` }),
-			),
-		}),
-		async execute(_id, params) {
-			return run("files", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_explore",
-		label: "CodeGraph Explore",
+		name: "codegraph",
+		label: "CodeGraph",
 		description:
-			"主工具。空 query=项目概览；query=符号名则一次返回位置+调用关系（默认不返回源码，要源码加 skipCode=false）。家目录模式可加 path=项目名。",
-		promptSnippet: "Get project structure overview",
+			'CodeGraph: code search & call-graph analysis. Actions: search(pattern,[glob],[path]), files(glob,[path]), explore([query],[path]), callees(name,[file]), callers(name,[file]), impact(name,[file]), node(file|[name],[line]), status([path]), affected(files,[depth]), communities([path]), store_fact(targetFile,content), search_facts([query],[targetFile]). Common params: path, glob, max.',
+		promptSnippet: "Code search & call-graph analysis via unified action router",
 		promptGuidelines: [
-			"When asked about a codebase or project, use codegraph_explore FIRST before doing anything else.",
-			"For 'how does X work' pass query=X — explore returns locations + callers/callees (no source by default). Add skipCode: false to include source.",
-			"In home mode, pass path=<project> to focus one repo.",
+			"Use codegraph with action='explore' FIRST for codebase/symbol overview. Empty query = project overview.",
+			"Use action='search' for regex/literal code search (file:line results).",
+			"Use action='files' to list files by glob.",
+			"Use action='callees'/'callers'/'impact' for call-graph analysis.",
+			"Use action='node' for full symbol detail (location, signature, deps) or file reading with line numbers.",
+			"Use action='affected' after editing to find tests to run.",
+			"Use action='communities' for global architecture/module structure questions.",
+			"Use action='store_fact'/'search_facts' for cross-session knowledge persistence.",
+			"Use action='status' when results are unexpectedly empty to check index health.",
+			"When the user names a project under a home workdir, pass path= that project yourself.",
 		],
 		parameters: Type.Object({
-			query: Type.Optional(
-				Type.String({ description: "symbol or free-text; empty = overview" }),
-			),
-			path: Type.Optional(Type.String({ description: "optional project subdirectory (home mode)" })),
-			max: Type.Optional(
-				Type.Number({
-					description: `cap on entries (default ${DEFAULT_EXPLORE_MAX}, hard max ${HARD_EXPLORE_MAX})`,
-				}),
-			),
-			skipCode: Type.Optional(
-				Type.Boolean({
-					description: "omit source code from results (default true). Set false to include implementation bodies.",
-				}),
-			),
+			action: Type.String({
+				description: "Action to perform",
+				enum: [
+					"search", "files", "explore", "callees", "callers", "impact",
+					"node", "status", "affected", "communities", "store_fact", "search_facts",
+				],
+			}),
+			pattern: Type.Optional(Type.String({ description: "search: regex or literal pattern (ripgrep syntax)" })),
+			name: Type.Optional(Type.String({ description: "callees/callers/impact/node: symbol name" })),
+			file: Type.Optional(Type.String({ description: "node/callees/callers/impact: file path or basename to pin" })),
+			query: Type.Optional(Type.String({ description: "explore/search_facts: symbol or free-text / search term" })),
+			path: Type.Optional(Type.String({ description: "Most actions: subdirectory or project name (home mode)" })),
+			glob: Type.Optional(Type.String({ description: 'search/files/callees/callers/impact: file glob filter, e.g. "*.go"' })),
+			max: Type.Optional(Type.Number({ description: "search/files/explore/callees/callers/impact/communities/search_facts: result cap" })),
+			ignore_case: Type.Optional(Type.Boolean({ description: "search: case-insensitive search" })),
+			line: Type.Optional(Type.Number({ description: "node: pin definition at/around this line" })),
+			includeCode: Type.Optional(Type.Boolean({ description: "node: include source body (default false)" })),
+			symbolsOnly: Type.Optional(Type.Boolean({ description: "node: symbol map + dependents only" })),
+			offset: Type.Optional(Type.Number({ description: "node: 1-based start line" })),
+			limit: Type.Optional(Type.Number({ description: "node: max lines (cap 2000)" })),
+			skipCode: Type.Optional(Type.Boolean({ description: "explore: omit source code (default true)" })),
+			files: Type.Optional(Type.Array(Type.String(), { description: "affected: list of changed source files" })),
+			depth: Type.Optional(Type.Number({ description: "affected: max dependency traversal depth (default 5, max 10)" })),
+			filter: Type.Optional(Type.String({ description: "affected: custom glob to identify test files" })),
+			minSize: Type.Optional(Type.Number({ description: "communities: minimum community size (default 3)" })),
+			targetFile: Type.Optional(Type.String({ description: "store_fact/search_facts: target file path" })),
+			targetSymbol: Type.Optional(Type.String({ description: "store_fact/search_facts: target symbol" })),
+			targetLine: Type.Optional(Type.Number({ description: "store_fact: target line number" })),
+			content: Type.Optional(Type.String({ description: "store_fact: fact content" })),
+			author: Type.Optional(Type.String({ description: "store_fact: author" })),
+			supersedes: Type.Optional(Type.Number({ description: "store_fact: fact id to replace" })),
+			status: Type.Optional(Type.String({ description: "search_facts: filter by status (default 'active')" })),
+			projectPath: Type.Optional(Type.String({ description: "absolute path inside a project (nearest .codegraph/)" })),
 		}),
 		async execute(_id, params) {
-			return run("explore", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_callees",
-		label: "CodeGraph Callees",
-		description: "列出某符号调用了谁（优先调用图，缺边时才回退解析函数体）。",
-		promptSnippet: "Find what a function calls",
-		promptGuidelines: [
-			"Use codegraph_callees to understand what a function depends on / calls. Graph-first; body-parse is fallback only.",
-		],
-		parameters: Type.Object({
-			name: Type.String({ description: "symbol name to look for" }),
-			file: Type.Optional(
-				Type.String({ description: "pin definition to this file (path or basename) when overloaded" }),
-			),
-			path: Type.Optional(Type.String({ description: "optional subdirectory" })),
-			glob: Type.Optional(Type.String({ description: 'optional file glob filter, e.g. "*.go"' })),
-			max_results: Type.Optional(
-				Type.Number({
-					description: `cap (default ${DEFAULT_SYMBOL_MAX}, hard max ${HARD_SYMBOL_MAX})`,
-				}),
-			),
-		}),
-		async execute(_id, params) {
-			return run("callees", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_callers",
-		label: "CodeGraph Callers",
-		description: "查找谁调用了某符号（优先调用图，缺边时才回退 ripgrep）。",
-		promptSnippet: "Find all references to a symbol",
-		promptGuidelines: [
-			"Use codegraph_callers BEFORE renaming or modifying a symbol. Graph-first; results labeled if rg fallback.",
-		],
-		parameters: Type.Object({
-			name: Type.String({ description: "symbol name to look for" }),
-			file: Type.Optional(
-				Type.String({ description: "pin definition to this file (path or basename) when overloaded" }),
-			),
-			path: Type.Optional(Type.String({ description: "optional subdirectory" })),
-			glob: Type.Optional(Type.String({ description: 'optional file glob filter, e.g. "*.go"' })),
-			max_results: Type.Optional(
-				Type.Number({
-					description: `cap (default ${DEFAULT_SYMBOL_MAX}, hard max ${HARD_SYMBOL_MAX})`,
-				}),
-			),
-		}),
-		async execute(_id, params) {
-			return run("callers", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_impact",
-		label: "CodeGraph Impact",
-		description: "改某个符号的影响面（调用图 BFS；缺边时回退 rg 计数）。",
-		promptSnippet: "Assess impact radius of changing a symbol",
-		promptGuidelines: [
-			"Use codegraph_impact before changing a symbol. Prefers graph blast-radius over plain text counts.",
-		],
-		parameters: Type.Object({
-			name: Type.String({ description: "symbol name to look for" }),
-			file: Type.Optional(
-				Type.String({ description: "pin definition to this file (path or basename) when overloaded" }),
-			),
-			path: Type.Optional(Type.String({ description: "optional subdirectory" })),
-			glob: Type.Optional(Type.String({ description: 'optional file glob filter, e.g. "*.go"' })),
-			max_results: Type.Optional(
-				Type.Number({
-					description: `cap (default ${DEFAULT_SYMBOL_MAX}, hard max ${HARD_SYMBOL_MAX})`,
-				}),
-			),
-		}),
-		async execute(_id, params) {
-			return run("impact", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_node",
-		label: "CodeGraph Node",
-		description:
-			"双模式。(1) 只传 file = 像 Read 一样读整文件（带行号）+ 谁依赖它；(2) 传 name = 符号位置+签名+调用链（默认不返回源码，要源码加 includeCode=true）。重名一次返回全部。",
-		promptSnippet: "Get symbol details with source, callers, callees",
-		promptGuidelines: [
-			"Use codegraph_node when you need the full picture of one symbol — location, signature, and who calls it / what it calls.",
-			"By default, codegraph_node does NOT return source code. Add includeCode: true when you need to read the implementation.",
-			"Prefer codegraph_node over separately calling callers + callees for the same symbol.",
-			"Pass file alone (no name) instead of the Read tool for source files — numbered lines + dependents.",
-			"For an overloaded name it returns every matching body in one call; pass file/line to pin one.",
-		],
-		parameters: Type.Object({
-			name: Type.Optional(Type.String({ description: "symbol name (symbol mode). Omit and pass file alone to read a whole file." })),
-			file: Type.Optional(
-				Type.String({
-					description:
-						"file path or basename. Alone = file-read mode; with name = disambiguate overload",
-				}),
-			),
-			line: Type.Optional(
-				Type.Number({ description: "symbol mode: pin definition at/around this line" }),
-			),
-			includeCode: Type.Optional(
-				Type.Boolean({ description: "symbol mode: include source body (default false). Set true to see implementation." }),
-			),
-			symbolsOnly: Type.Optional(
-				Type.Boolean({ description: "file mode: symbol map + dependents only" }),
-			),
-			offset: Type.Optional(Type.Number({ description: "file mode: 1-based start line (like Read)" })),
-			limit: Type.Optional(Type.Number({ description: "file mode: max lines (cap 2000)" })),
-		}),
-		async execute(_id, params) {
-			return run("node", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_status",
-		label: "CodeGraph Status",
-		description: "索引健康状况：节点/边/文件数、待同步。",
-		promptSnippet: "Check CodeGraph index health and stats",
-		promptGuidelines: [
-			"Use codegraph_status to verify the index is ready, see node/edge/file counts, or check if a specific file is indexed.",
-			"If search/node return empty unexpectedly, check codegraph_status for pending sync or empty index.",
-		],
-		parameters: Type.Object({
-			path: Type.Optional(Type.String({ description: "optional path to check specific file index status" })),
-		}),
-		async execute(_id, params) {
-			return run("status", params as Record<string, unknown>)
-		},
-	})
-
-	pi.registerTool({
-		name: "codegraph_affected",
-		label: "CodeGraph Affected",
-		description: "根据改动的源文件，找出可能受影响的测试。",
-		promptSnippet: "Find tests affected by changed source files",
-		promptGuidelines: [
-			"Use codegraph_affected after editing source files to decide which tests to run.",
-			"Pass the list of changed source paths in files; optionally set depth or a custom test filter glob.",
-		],
-		parameters: Type.Object({
-			files: Type.Array(Type.String(), { description: "list of changed source files" }),
-			depth: Type.Optional(Type.Number({ description: "max dependency traversal depth (default 5, max 10)" })),
-			filter: Type.Optional(Type.String({ description: "custom glob to identify test files" })),
-		}),
-		async execute(_id, params) {
-			return run("affected", params as Record<string, unknown>)
+			// Forward the full payload (including action) to MCP tool "codegraph".
+			return run(params as Record<string, unknown>)
 		},
 	})
 }

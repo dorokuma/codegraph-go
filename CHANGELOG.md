@@ -3,6 +3,25 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-08-05
+
+### Changed
+- **Breaking:** MCP surface is a **single tool** `codegraph` with required `action`
+  (`explore`|`search`|`files`|`node`|`callers`|`callees`|`impact`|`status`|`affected`|
+  `communities`|`store_fact`|`search_facts`). Former top-level tools (`explore`,
+  `search`, …) are no longer registered — same handlers, one schema (less model
+  noise / tokens). Any MCP host (Grok, Pi, others) uses this entry directly.
+- Server instructions and Pi adapter updated: Pi calls MCP tool `codegraph` with
+  the full payload (including `action`); no per-action MCP name fan-out.
+- Display / daemon wire version **0.8.0**.
+
+### Migration
+- Replace `tools/call` name=`explore` with name=`codegraph` + `action`=`explore`
+  (same for other former tool names).
+- Grok: `cg__codegraph` / `cg-eqi12__codegraph` + `action` (server keys `cg` / `cg-eqi12`).
+- Pi: keep tool name `codegraph`; install adapter from `integrations/pi/` and
+  binary ≥ 0.8.0 together.
+
 ## [0.7.1] - 2026-07-26
 
 ### Added

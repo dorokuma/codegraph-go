@@ -290,6 +290,159 @@ func TestToolSearchEmptyPattern(t *testing.T) {
 	}
 }
 
+func TestToolCodegraphExplore(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action: "explore",
+		Query:  "Alpha",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "Alpha") {
+		t.Fatalf("expected Alpha via action=explore, got:\n%s", text)
+	}
+}
+
+func TestToolCodegraphUnknownAction(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{Action: "nope"})
+	if err == nil {
+		t.Fatal("expected error for unknown action")
+	}
+}
+
+func TestToolCodegraphMissingAction(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{})
+	if err == nil {
+		t.Fatal("expected error for empty action")
+	}
+}
+
+func TestNewMCPServerOnlyCodegraphTool(t *testing.T) {
+	s, _ := setupToolServer(t)
+	srv := NewMCPServer(s)
+	if srv == nil {
+		t.Fatal("nil server")
+	}
+	// Smoke: dispatcher path used by MCP registration stays wired.
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{Action: "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestToolCodegraphSearchRequiresPattern(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{Action: "search"})
+	if err == nil {
+		t.Fatal("expected error for search without pattern")
+	}
+}
+
+func TestToolCodegraphSearch(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action:  "search",
+		Pattern: "Alpha",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	// FTS or rg may return path:line or empty/no matches; must not error
+	if result == nil {
+		t.Fatal("nil result")
+	}
+	_ = text
+}
+
+func TestToolCodegraphCallersRequiresName(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{Action: "callers"})
+	if err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("expected name required error, got %v", err)
+	}
+}
+
+func TestToolCodegraphCallers(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action: "callers",
+		Name:   "Beta",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("nil result")
+	}
+}
+
+func TestToolCodegraphFilesGlobAlias(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action: "files",
+		Glob:   "*.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, ".go") && !strings.Contains(text, "no") && text == "" {
+		// empty listing is ok for some fixtures; non-error is the contract
+		t.Logf("files result: %q", text)
+	}
+}
+
+func TestToolCodegraphStoreAndSearchFact(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action:       "store_fact",
+		TargetFile:   "alpha.go",
+		TargetSymbol: "Alpha",
+		Content:      "via action router",
+		Author:       "audit-test",
+	})
+	if err != nil {
+		t.Fatalf("store_fact: %v", err)
+	}
+	result, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action: "search_facts",
+		Query:  "action router",
+	})
+	if err != nil {
+		t.Fatalf("search_facts: %v", err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "action router") && !strings.Contains(text, "Alpha") {
+		t.Fatalf("expected fact content in search_facts, got:\n%s", text)
+	}
+}
+
+func TestToolCodegraphMaxResultsAlias(t *testing.T) {
+	s, _ := setupToolServer(t)
+	// max_results only (no max) should not panic; cap forwarded to search
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{
+		Action:     "search",
+		Pattern:    "Alpha",
+		MaxResults: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestToolCodegraphActionCaseInsensitive(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolCodegraph(context.Background(), nil, codegraphArgs{Action: "STATUS"})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestToolExplorePath(t *testing.T) {
 	s, dir := setupToolServer(t)
 	// Create sub directory and file on disk

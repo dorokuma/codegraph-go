@@ -4,37 +4,41 @@ package server
 const serverInstructions = `# Codegraph-go — code intelligence over an indexed knowledge graph
 
 Codegraph-go is a SQLite knowledge graph of symbols, edges, and files in the
-workspace. Reach for it BEFORE and while editing — one call returns verbatim
-source PLUS who calls it and what it affects. More accurate context, fewer
-tokens and round-trips than a Read/Grep loop.
+workspace. One MCP tool — **codegraph** — with an **action** parameter (not a
+dozen near-duplicate tools). Lower prompt noise, same capabilities.
 
-## Primary: explore
+## Primary: codegraph action=explore
 
 - Almost any question ("how does X work", architecture, a bug, survey) →
-  **explore** with a natural-language question or bag of symbol/file names.
-  ONE call returns source grouped by file + Flow path. Treat that source as
-  already Read — do NOT re-open those files.
-- Flow from X to Y → explore naming both ends (e.g. "mutateElement renderScene").
+  **codegraph** with action=explore and query= a natural-language question or
+  bag of symbol/file names. ONE call returns source grouped by file + Flow.
+  Treat that source as already Read — do NOT re-open those files.
+- Empty query = project overview. Flow from X to Y → query naming both ends.
 
-## Secondary: node / search / graph
+## Other actions (same tool)
 
-- Read one file like Read → **node** with file only (line-numbered source +
-  dependents). offset/limit work like Read; symbolsOnly for a cheap map.
-- One named symbol (body + caller/callee trail) → **node** with name.
-  Overloads return every body in one call; pass file/line to pin one.
-- Find a name → **search** (simple identifiers hit the index FTS first).
-- Who calls / what it calls / blast radius → **callers** / **callees** / **impact**
-  (pass file when the name is overloaded). Prefer explore for multi-hop flows.
-- Layout → **files**. Index health → **status**. After edits, which tests →
-  **affected** (extension; not the main navigation path).
+- **node** — file alone = Read-like numbered source + dependents; name = body
+  trail (includeCode to see implementation).
+- **search** — pattern; simple identifiers hit FTS first.
+- **callers** / **callees** / **impact** — call graph (pass file when overloaded).
+- **files** — glob listing. **status** — index health.
+- **affected** — tests after edits. **communities** — module structure.
+- **store_fact** / **search_facts** — cross-session notes on symbols.
+
+Common args: path (home-mode project name), projectPath (absolute), max, glob.
 
 ## Anti-patterns
 
 - Don't re-verify codegraph with grep — the index is AST-based.
 - Don't Read/Grep first for indexed code — explore/node already return source.
 - Don't reconstruct a flow by hand — name the endpoints in one explore.
-- If a tool says a project isn't indexed, stop calling codegraph for THAT
-  project this session and use built-in tools there; other projectPath targets
-  still work. Indexing is the user's decision (codegraph-go init).
+- If a project isn't indexed, stop calling codegraph for THAT project this
+  session and use built-in tools there; other projectPath targets still work.
 - Index lags writes by ~1–2s via the file watcher.
+
+## Host notes
+
+- MCP tool name is always **codegraph** (action=…). Grok prefixes the server
+  config key (e.g. cg__codegraph / cg-eqi12__codegraph). Pi may register the
+  same name via an adapter that calls this MCP tool.
 `

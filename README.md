@@ -4,7 +4,7 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.7.1** (alignment in progress). Index logic version **17**.
+Current version: **0.8.0**. Index logic version **17**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
 
@@ -12,7 +12,7 @@ Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise
 
 Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
 
-- **12 MCP tools:** explore (PRIMARY), node (SECONDARY dual-mode), search, callers, callees, impact, files, status, affected / communities (extensions), store_fact / search_facts (agent fact storage). `context` / `trace` / `search_fts` removed from MCP.
+- **1 MCP tool `codegraph` (action router):** `action=explore` (PRIMARY), `node`, `search`, `callers`/`callees`/`impact`, `files`, `status`, `affected`/`communities`, `store_fact`/`search_facts`. Same capabilities as 0.7 multi-tool surface; one schema for lower prompt cost.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
 - **projectPath on every tool:** walk up to nearest `.codegraph/` and query that project’s index (no cross-project DB bleed)
 - **Graph-first queries:** callers / callees / impact walk the SQLite call graph (rg only as labeled fallback); optional `file` pins overloads
@@ -46,7 +46,7 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.7.1 |
+| Display version | 0.8.0 |
 | Index logic | 17 |
 | Feature parity | **not claimed** (step 10 open) |
 
@@ -86,24 +86,31 @@ codegraph-go -workdir /path/to/project
 | `-workdir` | current directory | Workspace root |
 | `-no-sync` | false | Disable auto-sync file watcher |
 
-## MCP Tools
+## MCP Tool
 
-All tools accept optional `projectPath` (absolute path inside a project). The server walks up to the nearest `.codegraph/` and opens that index. Omit it to use the session default workdir.
+**One tool:** `codegraph`. Required: `action`. Optional common fields: `path`, `projectPath`, `max` / `max_results`, `glob`, etc. (see tool schema).
 
-| Tool | Purpose |
-|------|---------|
+| action | Purpose |
+|--------|---------|
 | `explore` | **PRIMARY.** Overview or `query=` bag of names → Flow + source (treat as already Read) |
-| `node` | **SECONDARY.** `file` alone = Read-like source + dependents; `name` = body + trail (all overloads) |
-| `search` | Symbol FTS (simple names) or ripgrep (regex/path/glob) |
-| `callers` | Who calls this symbol (graph first, rg fallback); optional `file` pin |
-| `callees` | What it calls (graph first, body-parse fallback); optional `file` pin |
-| `impact` | Blast radius via call-graph BFS; optional `file` pin |
-| `files` | List files matching a glob pattern |
-| `status` | Index health: node/edge/file counts, pending sync |
-| `affected` | **Extension.** Find test files affected by changed source files |
-| `communities` | **Extension.** Louvain community detection on the call graph to reveal module/component boundaries for global architecture questions |
-| `store_fact` | **Facts.** Store an agent finding/decision attached to a code symbol; dedup by hash; supports supersede chains |
-| `search_facts` | **Facts.** Search stored facts by content, file, symbol, or status |
+| `node` | `file` alone = Read-like source + dependents; `name` = body + trail |
+| `search` | Symbol FTS or ripgrep (`pattern`) |
+| `callers` / `callees` / `impact` | Call graph; optional `file` pin |
+| `files` | Glob listing |
+| `status` | Index health |
+| `affected` | Tests affected by changed `files` |
+| `communities` | Module/community structure |
+| `store_fact` / `search_facts` | Cross-session facts |
+
+`projectPath` (absolute path inside a project) selects the nearest `.codegraph/` index.
+
+### Hosts
+
+| Host | Invoke |
+|------|--------|
+| Any MCP client | tool `codegraph` + `action` |
+| Grok | `cg__codegraph` or `cg-eqi12__codegraph` + `action` (config keys `mcp_servers.cg` / `cg-eqi12`) |
+| Pi | extension tool `codegraph` + `action` (see `integrations/pi/`) |
 
 ## Indexing
 

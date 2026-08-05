@@ -1,39 +1,38 @@
 # Pi integration
 
-This directory contains the Pi-specific adapter for the generic `codegraph-go` stdio MCP server.
+Thin stdio bridge from Pi to the **codegraph-go** MCP server.
 
-- `codegraph-go.ts` starts and supervises the Go binary.
-- It registers CodeGraph tools with `@earendil-works/pi-coding-agent`.
-- It applies Pi-side parameter caps and output budgets.
-- It injects only runtime-dependent index information, such as the active root and home-mode projects. Fixed usage guidance belongs in tool metadata and Pi skills instead of a per-turn system prompt.
+- Starts/supervises the Go binary.
+- Registers **one** Pi tool: `codegraph` (same name and `action=` surface as MCP v0.8+).
+- Forwards the full argument object to MCP `tools/call` name=`codegraph` (no per-action fan-out).
+- Applies Pi-side output budgets; optional dynamic index root in `before_agent_start`.
 
-The adapter is not required by other MCP clients.
+Any MCP client (Grok, Pi, others) should call the Go server’s single tool **`codegraph`** with **`action`**. The adapter is only required for Pi’s extension model.
 
 ## Install
-
-Build and install the binary first:
 
 ```bash
 go build -o codegraph-go ./cmd/codegraph-go
 install -m 755 codegraph-go ~/.local/bin/codegraph-go
-```
+# or /usr/local/bin/codegraph-go
 
-Then copy the adapter into Pi's user extension directory:
-
-```bash
 install -m 644 integrations/pi/codegraph-go.ts ~/.pi/agent/extensions/codegraph-go.ts
 ```
 
-Restart Pi or run `/reload`.
+Restart Pi or `/reload`. **Requires codegraph-go ≥ 0.8.0** (MCP only exposes `codegraph`).
 
 ## Runtime configuration
 
-The adapter resolves `codegraph-go` from `PATH`. The principal optional variables are:
+- `CODEGRAPH_GO_BIN`: binary path.
+- `CODEGRAPH_GO_START_TIMEOUT_MS` / `CODEGRAPH_GO_REQUEST_TIMEOUT_MS`.
+- `CODEGRAPH_GO_OUTPUT_CHARS` / `CODEGRAPH_GO_OUTPUT_LINES`.
+- `CODEGRAPH_GO_SEARCH_MAX` / `FILES` / `SYMBOL` / `EXPLORE` and corresponding `_HARD` caps.
 
-- `CODEGRAPH_GO_BIN`: explicit binary path.
-- `CODEGRAPH_GO_START_TIMEOUT_MS` and `CODEGRAPH_GO_REQUEST_TIMEOUT_MS`: process and request timeouts.
-- `CODEGRAPH_GO_OUTPUT_CHARS` and `CODEGRAPH_GO_OUTPUT_LINES`: Pi-side output caps.
-- `CODEGRAPH_GO_SEARCH_MAX`, `CODEGRAPH_GO_FILES_MAX`, `CODEGRAPH_GO_SYMBOL_MAX`, and `CODEGRAPH_GO_EXPLORE_MAX`: default result limits.
-- Corresponding `_HARD` variables: upper limits accepted from tool calls.
+## Grok vs Pi (same MCP)
 
-The Go server keeps its own generic configuration and can be used directly by any stdio MCP client.
+| Host | How you invoke |
+|------|----------------|
+| Pi | Tool `codegraph` + `action` (this extension) |
+| Grok | MCP `cg__codegraph` or `cg-eqi12__codegraph` + `action` |
+
+Semantics are identical; only the host’s MCP server config key differs on Grok.

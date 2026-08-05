@@ -89,14 +89,14 @@ type communitiesArgs struct {
 }
 
 type storeFactArgs struct {
-	TargetFile    string `json:"targetFile"             jsonschema:"file path the fact pertains to (required)"`
-	TargetSymbol  string `json:"targetSymbol,omitempty"  jsonschema:"symbol name within the file,optional"`
-	TargetLine    int    `json:"targetLine,omitempty"    jsonschema:"line number within the file,optional"`
-	Content       string `json:"content"                jsonschema:"fact content (required)"`
-	Author        string `json:"author,omitempty"        jsonschema:"who wrote this fact,optional"`
-	Supersedes    int64  `json:"supersedes,omitempty"    jsonschema:"fact id this replaces (creates a supersede chain),optional"`
-	Path          string `json:"path,omitempty"         jsonschema:"home-mode project selector: a project directory name under a broad workdir (e.g. \"myrepo\"),optional"`
-	ProjectPath   string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to write to (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
+	TargetFile   string `json:"targetFile"             jsonschema:"file path the fact pertains to (required)"`
+	TargetSymbol string `json:"targetSymbol,omitempty"  jsonschema:"symbol name within the file,optional"`
+	TargetLine   int    `json:"targetLine,omitempty"    jsonschema:"line number within the file,optional"`
+	Content      string `json:"content"                jsonschema:"fact content (required)"`
+	Author       string `json:"author,omitempty"        jsonschema:"who wrote this fact,optional"`
+	Supersedes   int64  `json:"supersedes,omitempty"    jsonschema:"fact id this replaces (creates a supersede chain),optional"`
+	Path         string `json:"path,omitempty"         jsonschema:"home-mode project selector: a project directory name under a broad workdir (e.g. \"myrepo\"),optional"`
+	ProjectPath  string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to write to (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
 type searchFactsArgs struct {
@@ -109,101 +109,182 @@ type searchFactsArgs struct {
 	ProjectPath  string `json:"projectPath,omitempty"  jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
+// codegraphArgs is the single MCP entry (action router). Same surface for every MCP host
+// (Grok, Pi, etc.): one tool schema instead of N near-duplicate tools.
+type codegraphArgs struct {
+	Action       string   `json:"action" jsonschema:"Action to perform: explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts"`
+	Pattern      string   `json:"pattern,omitempty" jsonschema:"search: regex or literal pattern,optional"`
+	Name         string   `json:"name,omitempty" jsonschema:"callees/callers/impact/node: symbol name,optional"`
+	File         string   `json:"file,omitempty" jsonschema:"node/callees/callers/impact: file path or basename to pin,optional"`
+	Query        string   `json:"query,omitempty" jsonschema:"explore/search_facts: free-text or search term,optional"`
+	Path         string   `json:"path,omitempty" jsonschema:"subdirectory or home-mode project name,optional"`
+	Glob         string   `json:"glob,omitempty" jsonschema:"search/files/callees/callers/impact: file glob,optional"`
+	Max          int      `json:"max,omitempty" jsonschema:"result cap (search/files/explore/graph/communities/search_facts),optional"`
+	MaxResults   int      `json:"max_results,omitempty" jsonschema:"alias of max for search/callers/callees/impact,optional"`
+	IgnoreCase   bool     `json:"ignore_case,omitempty" jsonschema:"search: case-insensitive,optional"`
+	Line         int      `json:"line,omitempty" jsonschema:"node: pin definition line,optional"`
+	IncludeCode  *bool    `json:"includeCode,omitempty" jsonschema:"node: include source body (default false),optional"`
+	SymbolsOnly  bool     `json:"symbolsOnly,omitempty" jsonschema:"node file mode: symbol map only,optional"`
+	Offset       int      `json:"offset,omitempty" jsonschema:"node file mode: 1-based start line,optional"`
+	Limit        int      `json:"limit,omitempty" jsonschema:"node file mode: max lines,optional"`
+	SkipCode     *bool    `json:"skipCode,omitempty" jsonschema:"explore: omit source bodies (default true),optional"`
+	Files        []string `json:"files,omitempty" jsonschema:"affected: changed source files,optional"`
+	Depth        int      `json:"depth,omitempty" jsonschema:"affected: traversal depth,optional"`
+	Filter       string   `json:"filter,omitempty" jsonschema:"affected: test file glob,optional"`
+	MinSize      int      `json:"minSize,omitempty" jsonschema:"communities: min community size,optional"`
+	TargetFile   string   `json:"targetFile,omitempty" jsonschema:"store_fact/search_facts: target file,optional"`
+	TargetSymbol string   `json:"targetSymbol,omitempty" jsonschema:"store_fact/search_facts: target symbol,optional"`
+	TargetLine   int      `json:"targetLine,omitempty" jsonschema:"store_fact: line,optional"`
+	Content      string   `json:"content,omitempty" jsonschema:"store_fact: fact text,optional"`
+	Author       string   `json:"author,omitempty" jsonschema:"store_fact: author,optional"`
+	Supersedes   int64    `json:"supersedes,omitempty" jsonschema:"store_fact: fact id to replace,optional"`
+	Status       string   `json:"status,omitempty" jsonschema:"search_facts: status filter,optional"`
+	ProjectPath  string   `json:"projectPath,omitempty" jsonschema:"absolute path inside a project (nearest .codegraph/),optional"`
+	Stdin        bool     `json:"stdin,omitempty" jsonschema:"affected: unsupported over MCP,optional"`
+}
+
+// codegraphActions lists valid action values for errors and docs.
+var codegraphActions = []string{
+	"explore", "search", "files", "node", "callers", "callees", "impact",
+	"status", "affected", "communities", "store_fact", "search_facts",
+}
+
 // ---------- newMCPServer ----------
 
-// NewMCPServer registers the official 8 + affected tools and returns the MCP server.
+// NewMCPServer registers the single aggregated MCP tool and returns the server.
+// Breaking (v0.8+): former top-level tools (explore, search, …) are only available
+// as action= on tool "codegraph".
 func NewMCPServer(s *Server) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: daemon.PackageVersion}, &mcp.ServerOptions{
 		Instructions: serverInstructions,
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "explore",
-		Description: "PRIMARY TOOL — call FIRST for almost any question or before an edit: how does X work, architecture, a bug, where/what is X, or the symbols you are about to change. " +
-			"Returns verbatim source of relevant symbols PLUS the call path among them (Flow). Query can be a natural-language question OR a bag of symbol/file names. " +
-			"Treat returned source as already Read — do NOT re-open those files. Usually the ONLY call you need.",
+		Name: "codegraph",
+		Description: "PRIMARY — single entry for code search & call-graph analysis (low tool-list noise). " +
+			"Pass action= to select capability. Prefer action=explore FIRST for almost any question or before an edit " +
+			"(query= symbol bag or free text; empty query = overview). " +
+			"Actions: explore, search(pattern), files(pattern), node(file|name), callers/callees/impact(name), " +
+			"status, affected(files), communities, store_fact, search_facts. " +
+			"Common: path (home-mode project), projectPath (absolute), max, glob. " +
+			"Treat explore/node source as already Read.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"query":       {Type: "string", Description: "symbol or free-text; empty = overview"},
-				"path":        {Type: "string", Description: "optional project subdirectory (home mode)"},
-				"max":         {Type: "integer", Description: "cap on entries (default 30, hard max 60)"},
-				"skipCode":    {Type: "boolean", Description: "omit source code from results (default true). Set false to include implementation bodies."},
-				"projectPath": {Type: "string", Description: "absolute path to the project to query"},
+				"action": {
+					Type:        "string",
+					Description: "explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts",
+					Enum:        []interface{}{"explore", "search", "files", "node", "callers", "callees", "impact", "status", "affected", "communities", "store_fact", "search_facts"},
+				},
+				"pattern":      {Type: "string", Description: "search: regex or literal; files: glob pattern"},
+				"name":         {Type: "string", Description: "symbol name for node/callers/callees/impact"},
+				"file":         {Type: "string", Description: "file path/basename pin for node/graph actions"},
+				"query":        {Type: "string", Description: "explore/search_facts free text"},
+				"path":         {Type: "string", Description: "subdir or home-mode project name"},
+				"glob":         {Type: "string", Description: "file glob filter"},
+				"max":          {Type: "integer", Description: "result cap"},
+				"max_results":  {Type: "integer", Description: "alias of max"},
+				"ignore_case":  {Type: "boolean", Description: "search: case-insensitive"},
+				"line":         {Type: "integer", Description: "node: pin line"},
+				"includeCode":  {Type: "boolean", Description: "node: include body"},
+				"symbolsOnly":  {Type: "boolean", Description: "node file mode: map only"},
+				"offset":       {Type: "integer", Description: "node file mode start line"},
+				"limit":        {Type: "integer", Description: "node file mode max lines"},
+				"skipCode":     {Type: "boolean", Description: "explore: omit bodies (default true)"},
+				"files":        {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "affected: changed sources"},
+				"depth":        {Type: "integer", Description: "affected depth"},
+				"filter":       {Type: "string", Description: "affected test glob"},
+				"minSize":      {Type: "integer", Description: "communities min size"},
+				"targetFile":   {Type: "string", Description: "store_fact/search_facts file"},
+				"targetSymbol": {Type: "string", Description: "store_fact/search_facts symbol"},
+				"targetLine":   {Type: "integer", Description: "store_fact line"},
+				"content":      {Type: "string", Description: "store_fact content"},
+				"author":       {Type: "string", Description: "store_fact author"},
+				"supersedes":   {Type: "integer", Description: "store_fact supersede id"},
+				"status":       {Type: "string", Description: "search_facts status filter"},
+				"projectPath":  {Type: "string", Description: "absolute path inside project"},
 			},
+			Required: []string{"action"},
 		},
-	}, s.toolExplore)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "node",
-		Description: "SECONDARY. Two modes. (1) READ A FILE — pass `file` alone (no name): on-disk source with line numbers like Read (`<n>\\t<line>`), plus which files depend on it; offset/limit like Read; symbolsOnly for a cheap map. " +
-			"(2) ONE SYMBOL — pass `name`: location, body (includeCode default false; set true to include source), caller/callee trail. Overloaded names return EVERY matching body in one call; pass file/line to pin one. Prefer explore for multi-symbol flows.",
-	}, s.toolNode)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "search",
-		Description: "Find symbols or text. Simple identifier → indexed FTS first (replaces a separate search_fts tool); regex/path/glob use ripgrep. Prefer explore when you already know related names.",
-	}, s.toolSearch)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "callers",
-		Description: "Who calls this symbol? Graph first; rg fallback if no edges. Pass file to pin an overloaded name. For full flow use explore.",
-	}, s.toolCallers)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "callees",
-		Description: "What does this symbol call? Graph first; body-parse fallback if no edges. Pass file to pin an overloaded name. For full flow use explore.",
-	}, s.toolCallees)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "impact",
-		Description: "Blast radius if you change this symbol. Graph BFS first; rg counts as fallback. Pass file to pin an overloaded name.",
-	}, s.toolImpact)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "files",
-		Description: "List files matching a glob (supports **). Uses ripgrep; respects .gitignore.",
-	}, s.toolFiles)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "status",
-		Description: "Index health: node/edge/file counts and pending sync files. Skip unless debugging.",
-	}, s.toolStatus)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "store_fact",
-		Description: "Store a fact (finding / decision / note) attached to a code symbol. " +
-			"If content hash already exists, returns the existing record with duplicate=true. " +
-			"If supersedes is provided, marks the superseded fact as 'superseded' and links it. " +
-			"Returns the stored fact plus any other active facts for the same target, letting the " +
-			"calling LLM detect contradiction/update scenarios.",
-	}, s.toolStoreFact)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "search_facts",
-		Description: "Search stored facts by content, file, symbol, or status. Facts survive index rebuilds.",
-	}, s.toolSearchFacts)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "affected",
-		Description: "SECONDARY extension (not on official MCP). Which tests are affected by changed source files? Pass files= after edits; not the main navigation path — prefer explore/node first.",
-	}, s.toolAffected)
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "communities",
-		Description: "Run community detection on the project call graph to reveal module/component boundaries. Global architecture questions: how is this project organized, what are the main modules, what's the architecture backbone. Uses Louvain modularity (resolution=1.0) on a weighted undirected graph projected from directed edges (contains edges excluded). Communities sorted by size, each showing top symbols by weighted degree, top files, and kind distribution.",
-		InputSchema: &jsonschema.Schema{
-			Type: "object",
-			Properties: map[string]*jsonschema.Schema{
-				"max":         {Type: "integer", Description: "max communities to report (default 20)"},
-				"minSize":     {Type: "integer", Description: "minimum community size to include in output (default 3)"},
-				"path":        {Type: "string", Description: "home-mode project selector: project directory name under a broad workdir"},
-				"projectPath": {Type: "string", Description: "absolute path to the project to query"},
-			},
-		},
-	}, s.toolCommunities)
+	}, s.toolCodegraph)
 
 	return srv
+}
+
+// toolCodegraph routes action= to the internal handlers (same implementations as pre-0.8 tools).
+func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (*mcp.CallToolResult, any, error) {
+	action := strings.ToLower(strings.TrimSpace(args.Action))
+	if action == "" {
+		return nil, nil, fmt.Errorf("action is required (one of: %s)", strings.Join(codegraphActions, ", "))
+	}
+	// max preferred; max_results accepted as alias (legacy multi-tool clients).
+	cap := args.Max
+	if cap == 0 {
+		cap = args.MaxResults
+	}
+
+	switch action {
+	case "explore":
+		return s.toolExplore(ctx, req, exploreArgs{
+			Query: args.Query, Path: args.Path, Max: cap, SkipCode: args.SkipCode, ProjectPath: args.ProjectPath,
+		})
+	case "search":
+		return s.toolSearch(ctx, req, searchArgs{
+			Pattern: args.Pattern, Path: args.Path, Glob: args.Glob, MaxResults: cap,
+			IgnoreCase: args.IgnoreCase, ProjectPath: args.ProjectPath,
+		})
+	case "files":
+		pattern := args.Pattern
+		if pattern == "" && args.Glob != "" {
+			pattern = args.Glob
+		}
+		return s.toolFiles(ctx, req, filesArgs{
+			Pattern: pattern, Path: args.Path, Max: cap, ProjectPath: args.ProjectPath,
+		})
+	case "node":
+		return s.toolNode(ctx, req, nodeArgs{
+			Name: args.Name, File: args.File, Line: args.Line, IncludeCode: args.IncludeCode,
+			SymbolsOnly: args.SymbolsOnly, Offset: args.Offset, Limit: args.Limit, ProjectPath: args.ProjectPath,
+		})
+	case "callers":
+		return s.toolCallers(ctx, req, nameArgs{
+			Name: args.Name, File: args.File, Path: args.Path, Glob: args.Glob,
+			MaxResults: cap, ProjectPath: args.ProjectPath,
+		})
+	case "callees":
+		return s.toolCallees(ctx, req, nameArgs{
+			Name: args.Name, File: args.File, Path: args.Path, Glob: args.Glob,
+			MaxResults: cap, ProjectPath: args.ProjectPath,
+		})
+	case "impact":
+		return s.toolImpact(ctx, req, nameArgs{
+			Name: args.Name, File: args.File, Path: args.Path, Glob: args.Glob,
+			MaxResults: cap, ProjectPath: args.ProjectPath,
+		})
+	case "status":
+		return s.toolStatus(ctx, req, statusArgs{Path: args.Path, ProjectPath: args.ProjectPath})
+	case "affected":
+		return s.toolAffected(ctx, req, affectedArgs{
+			Files: args.Files, Stdin: args.Stdin, Depth: args.Depth, Filter: args.Filter, ProjectPath: args.ProjectPath,
+		})
+	case "communities":
+		return s.toolCommunities(ctx, req, communitiesArgs{
+			Max: cap, MinSize: args.MinSize, Path: args.Path, ProjectPath: args.ProjectPath,
+		})
+	case "store_fact":
+		return s.toolStoreFact(ctx, req, storeFactArgs{
+			TargetFile: args.TargetFile, TargetSymbol: args.TargetSymbol, TargetLine: args.TargetLine,
+			Content: args.Content, Author: args.Author, Supersedes: args.Supersedes,
+			Path: args.Path, ProjectPath: args.ProjectPath,
+		})
+	case "search_facts":
+		return s.toolSearchFacts(ctx, req, searchFactsArgs{
+			Query: args.Query, TargetFile: args.TargetFile, TargetSymbol: args.TargetSymbol,
+			Status: args.Status, Max: cap, Path: args.Path, ProjectPath: args.ProjectPath,
+		})
+	default:
+		return nil, nil, fmt.Errorf("unknown action %q; want one of: %s", args.Action, strings.Join(codegraphActions, ", "))
+	}
 }
 
 // ---------- tool implementations ----------
