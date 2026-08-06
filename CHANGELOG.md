@@ -3,6 +3,33 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] - 2026-08-06
+
+### Fixed
+- rg fallback error handling: exit-1 (no matches) is now distinct from a
+  missing ripgrep binary or a timed-out search, so failures no longer surface
+  as "no results".
+- Symlink escape guard: the index skips symlinked files, and `callees` reads
+  only paths resolved inside the project root (path jail).
+- `ListUnresolvedRefsByFiles` queries are chunked by 400 files to stay within
+  the SQLite variable limit.
+- Index worker panics are counted as extraction errors and no longer mark the
+  schema revision as rebuilt on interrupted or failed passes.
+- A failed extraction keeps the previously indexed symbols and skips writing
+  the new content hash, so the next pass automatically retries.
+- Partial failures are counted and surfaced as a startup warning instead of a
+  silent pass.
+- `DefReCache` is a bounded cache (no unbounded memory growth).
+- `affected` and root-directory queries honor their LIMIT at the boundary.
+- Daemon startup failure releases the pidfile lock, so no zombie lock holder
+  blocks the next start.
+- Proxy hello failure exits non-zero instead of hanging in direct mode.
+- Pi adapter keeps stderr buffered for diagnostics.
+- README wording fix for `.gitignore`.
+
+### Changed
+- Display / daemon wire version **0.8.3**.
+
 ## [0.8.2] - 2026-08-06
 
 ### Fixed
