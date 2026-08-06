@@ -268,12 +268,23 @@ function formatCleanText(text: string): string {
 	return t.trim()
 }
 
-/** 补默认 max，并夹住硬上限。 */
-function withToolDefaults(name: string, args: Record<string, unknown>): Record<string, unknown> {
+/** 补默认 max，并夹住硬上限。
+ * v0.8+ 是单个折叠工具 codegraph（action=…）：按 args.action 分发，
+ * 不能再按旧工具名 switch（callTool 固定走 "codegraph"）。
+ */
+function withToolDefaults(args: Record<string, unknown>): Record<string, unknown> {
 	const out: Record<string, unknown> = { ...args }
-	switch (name) {
+	const action = typeof out.action === "string" ? out.action : ""
+	switch (action) {
 		case "search":
-			out.max_results = clampInt(out.max_results, DEFAULT_SEARCH_MAX, HARD_SEARCH_MAX)
+			// max_results 与 max 二选一：谁传了夹谁；都没传补默认。
+			if (out.max_results !== undefined && out.max_results !== null) {
+				out.max_results = clampInt(out.max_results, DEFAULT_SEARCH_MAX, HARD_SEARCH_MAX)
+			} else if (out.max !== undefined && out.max !== null) {
+				out.max = clampInt(out.max, DEFAULT_SEARCH_MAX, HARD_SEARCH_MAX)
+			} else {
+				out.max_results = DEFAULT_SEARCH_MAX
+			}
 			break
 		case "files":
 			out.max = clampInt(out.max, DEFAULT_FILES_MAX, HARD_FILES_MAX)
@@ -281,7 +292,13 @@ function withToolDefaults(name: string, args: Record<string, unknown>): Record<s
 		case "callers":
 		case "callees":
 		case "impact":
-			out.max_results = clampInt(out.max_results, DEFAULT_SYMBOL_MAX, HARD_SYMBOL_MAX)
+			if (out.max_results !== undefined && out.max_results !== null) {
+				out.max_results = clampInt(out.max_results, DEFAULT_SYMBOL_MAX, HARD_SYMBOL_MAX)
+			} else if (out.max !== undefined && out.max !== null) {
+				out.max = clampInt(out.max, DEFAULT_SYMBOL_MAX, HARD_SYMBOL_MAX)
+			} else {
+				out.max_results = DEFAULT_SYMBOL_MAX
+			}
 			break
 		case "explore":
 			// 0/缺省 = 服务端按仓库体量分档；不要强塞默认把 0 盖掉
@@ -325,6 +342,7 @@ interface MCPResponse {
 			description: string
 			inputSchema: Record<string, unknown>
 		}>
+		instructions?: string
 	}
 	error?: {
 		code: number
@@ -339,6 +357,7 @@ interface MCPToolResult {
 		description: string
 		inputSchema: Record<string, unknown>
 	}>
+	instructions?: string
 }
 
 class CodeGraphClient {
@@ -354,6 +373,8 @@ class CodeGraphClient {
 	>()
 	private tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = []
 	private initialized = false
+	/** Server-provided instructions from the MCP initialize handshake (may be null). */
+	private serverInstructions: string | null = null
 	private starting: Promise<void> | null = null
 	private stopped = false
 	private restartAttempts = 0
@@ -429,7 +450,7 @@ class CodeGraphClient {
 			}
 		})
 
-		await this.sendRequest(
+		const initResult = await this.sendRequest(
 			"initialize",
 			{
 				protocolVersion: "2024-11-05",
@@ -438,6 +459,7 @@ class CodeGraphClient {
 			},
 			START_TIMEOUT_MS,
 		)
+		this.serverInstructions = initResult.instructions ?? null
 		this.sendNotification("notifications/initialized")
 
 		const listResult = await this.sendRequest("tools/list", {}, START_TIMEOUT_MS)
@@ -483,7 +505,7 @@ class CodeGraphClient {
 			await this.start()
 		}
 		if (!this.initialized) throw new Error("codegraph-go not initialized")
-		const bounded = withToolDefaults(name, args)
+		const bounded = withToolDefaults(args)
 		try {
 			const result = await this.sendRequest("tools/call", { name, arguments: bounded })
 			const text = result.content?.map((c) => c.text).join("\n") || "no result"
@@ -503,6 +525,11 @@ class CodeGraphClient {
 
 	getTools() {
 		return this.tools
+	}
+
+	/** Instructions announced by the server during initialize (absent → null). */
+	getServerInstructions(): string | null {
+		return this.serverInstructions
 	}
 
 	/** Exponential backoff restart after unexpected exit (max ~5 tries). */
@@ -621,17 +648,26 @@ export default function (pi: ExtensionAPI) {
 				? `家目录模式已开：索引里只有像项目的一级目录${projects.length ? `（${projects.join(", ")}）` : ""}。用户点名项目时代理自动补 path=，不依赖用户传。`
 				: `当前索引根就是单个项目目录，一般不必再加 path。`
 
-			return {
-				systemPrompt:
-					event.systemPrompt +
+			let prompt = event.systemPrompt
+			const serverInstructions = client.getServerInstructions()
+			if (serverInstructions) {
+				prompt +=
 					`
+
+## CodeGraph server instructions
+
+${serverInstructions}`
+			}
+			prompt +=
+				`
 
 ## CodeGraph Tools
 
 索引根: \`${client.workdir}\`（${client.workdirNote}）
 ${projectLine}
-单次结果预算约 ${OUTPUT_CHAR_CAP} 字 / ${OUTPUT_LINE_CAP} 行（过大才压缩；正常体量不砍）。`,
-			}
+单次结果预算约 ${OUTPUT_CHAR_CAP} 字 / ${OUTPUT_LINE_CAP} 行（过大才压缩；正常体量不砍）。`
+
+			return { systemPrompt: prompt }
 		}
 		if (lastRefuseReason) {
 			return {

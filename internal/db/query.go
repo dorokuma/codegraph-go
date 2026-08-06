@@ -88,9 +88,9 @@ type Fact struct {
 	ContentHash  string
 	Author       string
 	Status       string // active | superseded | retracted
-	SupersededBy int64 // 0 = none
-	CreatedAt    int64 // unix seconds
-	UpdatedAt    int64 // unix seconds
+	SupersededBy int64  // 0 = none
+	CreatedAt    int64  // unix seconds
+	UpdatedAt    int64  // unix seconds
 }
 
 // UnresolvedRef is a pending/failed reference awaiting resolution.

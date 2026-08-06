@@ -48,12 +48,12 @@ func weightFor(provenance string) float64 {
 
 // CommunityInfo holds one detected community for output formatting.
 type CommunityInfo struct {
-	ID            int               `json:"id"`
-	Size          int               `json:"size"`
-	InternalEdges int               `json:"internalEdges"`
-	TopSymbols    []topSymbol       `json:"topSymbols"`
-	TopFiles      []string          `json:"topFiles"`
-	KindDist      map[string]int    `json:"kindDist"`
+	ID            int            `json:"id"`
+	Size          int            `json:"size"`
+	InternalEdges int            `json:"internalEdges"`
+	TopSymbols    []topSymbol    `json:"topSymbols"`
+	TopFiles      []string       `json:"topFiles"`
+	KindDist      map[string]int `json:"kindDist"`
 }
 
 type topSymbol struct {
@@ -95,7 +95,7 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 
 	// Step 2: Build node ID mapping (DB node id → 0-based compact ID for gonum)
 	// and reverse mapping (compact ID → db.Node for output enrichment).
-	nodeIndex := make(map[int64]int64, len(snapshot.Nodes))   // DB node ID → compact ID
+	nodeIndex := make(map[int64]int64, len(snapshot.Nodes))      // DB node ID → compact ID
 	reverseIndex := make(map[int64]db.Node, len(snapshot.Nodes)) // compact ID → DB node
 	g := simple.NewWeightedUndirectedGraph(0, 0)
 	for i, n := range snapshot.Nodes {

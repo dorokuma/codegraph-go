@@ -3,6 +3,22 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-08-06
+
+### Fixed
+- Pi adapter action dispatch: `withToolDefaults` now switches on `args.action`
+  instead of the legacy tool name (the single `codegraph` tool never matched the
+  old cases), so `max`/`max_results` clamping and defaults, `explore.skipCode`,
+  `node.includeCode` and `affected.depth` defaults are effective again.
+- Pi adapter captures server `instructions` from the MCP initialize handshake
+  and injects them into the agent system prompt (`## CodeGraph server
+  instructions`), ahead of the adapter's own `## CodeGraph Tools` section.
+
+### Changed
+- Display / daemon wire version **0.8.1**.
+- gofmt comment alignment in `internal/db/query.go` and `internal/tools/community.go`
+  (formatting only, no logic change).
+
 ## [0.8.0] - 2026-08-05
 
 ### Changed
