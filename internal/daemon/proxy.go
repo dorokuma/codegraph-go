@@ -224,7 +224,7 @@ func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, o
 			return nil, nil, Hello{}, false, err
 		}
 	}
-	if err := SpawnDetached(projectRoot, opts); err != nil {
+	if err := spawnDetachedFn(projectRoot, opts); err != nil {
 		log.Printf("spawn daemon: %v", err)
 		return nil, nil, Hello{}, false, err
 	}
@@ -235,7 +235,73 @@ func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, o
 			return conn, br, hello, true, nil
 		}
 	}
+
+	// Invisible-holder self-heal: the spawn above came up on no candidate
+	// socket, and the lightweight flock probe (invisibleHolderHoldsLock)
+	// reports the DB lock still held — by a daemon whose pidfile and socket
+	// dentry were removed while it kept running (the deploy.sh race: rm -f
+	// daemon.pid daemon.sock before the old daemon actually exited). Such a
+	// holder is unreachable through every candidate socket AND every
+	// pidfile, so neither the version-mismatch branch nor
+	// halfDeadDaemonHoldsLock can see it: every fresh spawn acquires the
+	// pidfile + socket, then dies in onReady on the still-held flock — a
+	// permanent failure loop. Kill holders by direct /proc inspection and
+	// retry the spawn once before falling back. When the probe shows the
+	// flock is free (the normal case: the spawn just failed for another
+	// reason), walk the original path straight to the caller.
+	if invisibleHolderHoldsLock(projectRoot) {
+		n, err := killInvisibleHolders(projectRoot)
+		if err != nil {
+			// A holder survived SIGTERM+SIGKILL: it still owns the flock, so
+			// neither a fresh spawn nor direct-mode fallback is safe — surface
+			// the error (caller → actionable exit) instead of retrying blindly.
+			log.Printf("kill invisible holders: %v", err)
+			return nil, nil, Hello{}, false, err
+		}
+		if n > 0 {
+			log.Printf("terminated %d invisible flock holder(s) for %s; respawning daemon", n, projectRoot)
+		} else {
+			// No daemon-mode process matched (the flock is held by e.g. a
+			// daemon of another workdir or a direct-mode session), or the
+			// /proc scan could not be read. The holder may release the flock
+			// at any moment (session end, other daemon exit): wait briefly
+			// for that before paying for a respawn, so a transient holder
+			// does not trigger a meaningless spawn. Bounded by the caller's
+			// wait; if the flock frees, skip the respawn entirely.
+			if probeFlockFreed(projectRoot, min(wait, 1*time.Second)) {
+				log.Printf("flock released without a matching holder for %s; skipping respawn", projectRoot)
+				return nil, nil, Hello{}, false, nil
+			}
+			log.Printf("no invisible holder matched for %s; respawning daemon once more", projectRoot)
+		}
+		if err := spawnDetachedFn(projectRoot, opts); err != nil {
+			log.Printf("spawn daemon after invisible-holder cleanup: %v", err)
+			return nil, nil, Hello{}, false, err
+		}
+		deadline := time.Now().Add(wait)
+		for time.Now().Before(deadline) {
+			time.Sleep(poll)
+			if conn, br, hello, ok, _ := DialAnyCandidate(projectRoot); ok {
+				return conn, br, hello, true, nil
+			}
+		}
+	}
 	return nil, nil, Hello{}, false, nil
+}
+
+// probeFlockFreed polls the flock probe until it reports free or max
+// elapses. Returns true as soon as the flock is free (the holder resolved
+// itself — skip the respawn); false when it stayed held (the bounded
+// respawn in the caller is the last attempt before falling back).
+func probeFlockFreed(root string, max time.Duration) bool {
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		if !invisibleHolderHoldsLock(root) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 func contains(s, sub string) bool {

@@ -194,6 +194,16 @@ func lockHolderHint(dir string) string {
 	if err := json.Unmarshal(raw, &info); err != nil || info.PID <= 0 {
 		return ""
 	}
+	// Self-reference guard: a daemon writes its OWN pidfile before opening
+	// the DB. When the open then fails on a flock held by an INVISIBLE
+	// holder (pidfile/socket dentry removed by a deploy race while that
+	// daemon kept running), the recorded pid is this very process —
+	// reporting "held by pid <self>" would be a lie about who owns the
+	// lock and actively mislead debugging. Return no hint; the error
+	// already says "another process" and stays accurate.
+	if info.PID == os.Getpid() {
+		return ""
+	}
 	hint := fmt.Sprintf(" (held by pid %d", info.PID)
 	if info.Version != "" {
 		hint += ", version " + info.Version

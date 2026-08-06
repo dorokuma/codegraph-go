@@ -12,6 +12,33 @@ go build -o ./bin/codegraph-go ./cmd/codegraph-go 2>&1
 echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
 
 echo "=== 停止旧进程 ==="
+# Resolve the daemon workdir BEFORE any artifact handling. The pidfile
+# always sits at <workdir>/.codegraph/daemon.pid, so the workdir is exactly
+# two levels up from the pidfile — including $CODEGRAPH_HOME/daemon.pid,
+# which is the regular location for workdir=$HOME (the HOME-workdir
+# scenario). Candidates in priority order: repo-root pidfile, then legacy
+# CODEGRAPH_HOME pidfile; neither → the repo root (the deployment target).
+# Doing this early matters even when the stop section below gets no pidfile:
+# the /proc scan later must know WORKDIR to find daemons whose pidfile/
+# socket were already removed by an earlier race ("invisible flock holder"),
+# so scan_daemon_pids also covers a HOME-workdir daemon on the "only HOME
+# pidfile" path.
+WORKDIR=""
+for cand in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
+  if [ -f "$cand" ]; then
+    WORKDIR="$(cd "$(dirname "$(dirname "$cand")")" && pwd)"
+    break
+  fi
+done
+[ -n "$WORKDIR" ] || WORKDIR="$ROOT"
+
+# Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
+# pidfile, then a short window for it to exit. NO rm here — deleting the
+# pidfile/socket of a daemon that is still running is exactly what creates
+# the invisible flock holder (the daemon keeps the DB flock while becoming
+# unreachable through every pidfile and socket). Artifacts are only removed
+# below, after the flock is confirmed released and no daemon-mode process
+# for WORKDIR remains.
 PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
 if [ -n "$PID" ]; then
   if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
@@ -21,7 +48,6 @@ if [ -n "$PID" ]; then
   fi
   sleep 1
 fi
-rm -f "$CODEGRAPH_HOME/daemon.pid" "$CODEGRAPH_HOME/daemon.sock" 2>/dev/null
 
 echo "=== 替换二进制 ==="
 if [ -f "$BINARY" ]; then
@@ -37,60 +63,128 @@ rm -rf ./bin
 echo "cleaned build output ./bin"
 
 echo "=== 升级后强制重启 daemon ==="
-# The daemon writes its pidfile at <root>/.codegraph/daemon.pid (per project
-# root), not $CODEGRAPH_HOME. Probe the repo-root pidfile first, then the
-# legacy location; take the first that exists. No pidfile → nothing to do
-# (idempotent).
-DAEMON_PIDFILE=""
-for cand in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
-  if [ -f "$cand" ]; then DAEMON_PIDFILE="$cand"; break; fi
-done
-# Workdir for the restart: the pidfile always sits at
-# <workdir>/.codegraph/daemon.pid, so the workdir is exactly two levels up
-# from the pidfile — including $HOME/.codegraph/daemon.pid, which is the
-# regular location for workdir=$HOME (not a legacy layout, so no special
-# case). No pidfile → fall back to the repo root (the deployment target).
-WORKDIR=""
-if [ -n "$DAEMON_PIDFILE" ]; then
-  WORKDIR="$(cd "$(dirname "$(dirname "$DAEMON_PIDFILE")")" && pwd)"
-else
-  WORKDIR="$ROOT"
-fi
+# WORKDIR was resolved in the stop section above (first existing pidfile
+# among the two candidate locations, else the repo root). It drives the
+# kill scan, the flock wait, the artifact cleanup, and the pre-warm spawn.
 KILLED_PID=""
-if [ -n "$DAEMON_PIDFILE" ]; then
-  PID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$DAEMON_PIDFILE" | grep -oE '[0-9]+' | head -1)
-  if [ -n "$PID" ]; then
-    if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
-      echo "restarting daemon pid $PID (SIGTERM)"
-      kill "$PID" 2>/dev/null || true
-      # Graceful exit window (daemon Stop drains sessions, checkpoints WAL):
-      # wait up to 5s, then SIGKILL so a half-dead daemon (stuck Stop) cannot
-      # survive the upgrade and keep holding the DB.
-      waited=0
-      while kill -0 "$PID" 2>/dev/null && [ "$waited" -lt 25 ]; do
-        sleep 0.2
-        waited=$((waited + 1))
-      done
-      if kill -0 "$PID" 2>/dev/null; then
-        echo "daemon pid $PID still alive after 5s — SIGKILL"
-        kill -9 "$PID" 2>/dev/null || true
-      else
-        echo "daemon pid $PID exited"
-      fi
-      KILLED_PID="$PID"
-    else
-      echo "pid $PID does not belong to codegraph, skipping kill"
+# Collect every daemon-mode codegraph process targeting WORKDIR, not just
+# the pidfile-recorded one: a deploy race can leave a live daemon whose
+# pidfile and socket dentry were already removed ("invisible flock holder")
+# — the pidfile alone would miss it, and an unconditional rm would then
+# delete the artifacts of a process that still owns the DB flock.
+# (a) every pidfile's recorded pid (both candidate locations);
+# (b) /proc scan: codegraph binary + -workdir $WORKDIR +
+#     CODEGRAPH_DAEMON_INTERNAL=1 (daemon mode only — never a foreground
+#     client or direct-mode session). A running daemon keeps its ORIGINAL
+#     argv[0] even after deploy renames its binary on disk to .old: the
+#     basename is still "codegraph-go", so the scan matches it by name —
+#     not by any ".old" suffix in the path.
+PIDS=""
+for pf in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
+  [ -f "$pf" ] || continue
+  PID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$pf" | grep -oE '[0-9]+' | head -1)
+  if [ -n "$PID" ] && ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID"; fi
+done
+
+# scan_daemon_pids <workdir>: print pids of daemon-mode codegraph processes
+# whose -workdir value equals the argument (exact match).
+scan_daemon_pids() {
+  local wd="$1" p pid argv0 base prev arg wdval
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ -r "$p/cmdline" ] || continue
+    argv0=$(tr '\0' '\n' <"$p/cmdline" 2>/dev/null | head -1)
+    [ -n "$argv0" ] || continue
+    base=${argv0##*/}
+    case "$base" in
+      codegraph|codegraph-go) ;;
+      *) continue ;;
+    esac
+    wdval=""
+    prev=""
+    while IFS= read -r arg; do
+      if [ "$prev" = "-workdir" ]; then wdval="$arg"; break; fi
+      prev="$arg"
+    done < <(tr '\0' '\n' <"$p/cmdline" 2>/dev/null)
+    # Normalize the daemon's -workdir value (cd && pwd strips a trailing
+    # slash and resolves ".") so it compares equal to the caller's WORKDIR
+    # — the shell mirror of the Go-side filepath.Clean in isInvisibleHolder.
+    wdval="$(cd "$wdval" 2>/dev/null && pwd || printf '%s' "$wdval")"
+    [ "$wdval" = "$wd" ] || continue
+    # Daemon mode only: CODEGRAPH_DAEMON_INTERNAL=1 must be in environ.
+    if ! tr '\0' '\n' <"$p/environ" 2>/dev/null | grep -qx 'CODEGRAPH_DAEMON_INTERNAL=1'; then
+      continue
     fi
+    echo "$pid"
+  done
+  true
+}
+
+for PID in $(scan_daemon_pids "$WORKDIR"); do
+  if ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID"; fi
+done
+
+for PID in $PIDS; do
+  if [ ! -r "/proc/$PID/cmdline" ]; then
+    echo "pid $PID already gone, skipping"
+    continue
   fi
+  if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
+    echo "restarting daemon pid $PID (SIGTERM)"
+    kill "$PID" 2>/dev/null || true
+    # Graceful exit window (daemon Stop drains sessions, checkpoints WAL):
+    # wait up to 5s, then SIGKILL so a half-dead daemon (stuck Stop) cannot
+    # survive the upgrade and keep holding the DB.
+    waited=0
+    while kill -0 "$PID" 2>/dev/null && [ "$waited" -lt 25 ]; do
+      sleep 0.2
+      waited=$((waited + 1))
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+      echo "daemon pid $PID still alive after 5s — SIGKILL"
+      kill -9 "$PID" 2>/dev/null || true
+    else
+      echo "daemon pid $PID exited"
+    fi
+    KILLED_PID="$PID"
+  else
+    echo "pid $PID does not belong to codegraph, skipping kill"
+  fi
+done
+
+# Only now, after every target is dead, wait for the DB flock to be
+# released and confirm no daemon-mode process for WORKDIR remains BEFORE
+# removing artifacts. The unconditional rm here was the trigger of the
+# invisible-holder wedge: deleting the pidfile/socket of a daemon that is
+# still running (mid-spawn, or not yet dead) makes it unreachable forever
+# while it keeps holding the flock.
+mkdir -p "$WORKDIR/.codegraph"
+[ -f "$WORKDIR/.codegraph/codegraph.lock" ] || : >"$WORKDIR/.codegraph/codegraph.lock"
+flock_free=0
+for i in $(seq 1 50); do
+  if flock -n "$WORKDIR/.codegraph/codegraph.lock" true 2>/dev/null; then
+    flock_free=1
+    break
+  fi
+  sleep 0.2
+done
+REMAINING=$(scan_daemon_pids "$WORKDIR")
+if [ -z "$REMAINING" ]; then
+  if [ "$flock_free" = "1" ]; then
+    echo "daemon flock released"
+  else
+    echo "WARN: flock still held after 10s (by a non-daemon process); removing daemon artifacts anyway — no daemon processes remain"
+  fi
+  rm -f "$ROOT/.codegraph/daemon.pid" "$ROOT/.codegraph/daemon.sock" \
+        "$CODEGRAPH_HOME/daemon.pid" "$CODEGRAPH_HOME/daemon.sock" 2>/dev/null || true
+  # Note: this glob is not project-scoped — it also removes the tmp-fallback
+  # sockets of OTHER projects on this machine. Their daemons are unaffected
+  # (the pidfiles still hold the locks); the only cost is one extra spawn
+  # probe on their next dial. Accepted for a deploy script.
+  rm -f /tmp/codegraph-go-*.sock 2>/dev/null || true
+else
+  echo "WARN: daemon processes still present for $WORKDIR ($REMAINING) — keeping pidfile/socket so client-side stale-daemon cleanup handles them"
 fi
-# Clean residual artifacts so the fresh daemon binds cleanly.
-rm -f "$ROOT/.codegraph/daemon.pid" "$ROOT/.codegraph/daemon.sock" \
-      "$CODEGRAPH_HOME/daemon.pid" "$CODEGRAPH_HOME/daemon.sock" 2>/dev/null || true
-# Note: this glob is not project-scoped — it also removes the tmp-fallback
-# sockets of OTHER projects on this machine. Their daemons are unaffected
-# (the pidfiles still hold the locks); the only cost is one extra spawn
-# probe on their next dial. Accepted for a deploy script.
-rm -f /tmp/codegraph-go-*.sock 2>/dev/null || true
 # Drop daemons/ registry records for this project root or the killed daemon
 # (leave other projects' records intact).
 REG_DIR="${CODEGRAPH_HOME:-$HOME/.codegraph}/daemons"
@@ -115,13 +209,19 @@ fi
 mkdir -p "$WORKDIR/.codegraph"
 CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
 SPAWN_PID=$!
-# Verify the warm-up actually took the lock AND bound the socket: the pidfile
-# is written before the socket bind, so a pidfile alone does not mean the
-# daemon is listening yet. A half-dead old daemon still holding the DB would
-# make the new daemon exit immediately.
+# Verify the warm-up actually took the lock AND bound the socket AND is
+# alive: the pidfile is written before the socket bind, so a pidfile alone
+# does not mean the daemon is listening yet. Four conditions together mean
+# ready — pidfile + socket + DB flock held by the new daemon (flock -n
+# probe fails = held) + the spawned process alive. A half-dead old daemon
+# still holding the DB would make the new daemon exit immediately; the
+# missing flock would then be caught here instead of falsely reporting
+# ready. Not ready is idempotent: the next client spawns automatically.
 ready=0
 for i in $(seq 1 15); do
-  if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ]; then
+  if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ] \
+     && ! flock -n "$WORKDIR/.codegraph/codegraph.lock" true 2>/dev/null \
+     && kill -0 "$SPAWN_PID" 2>/dev/null; then
     ready=1
     break
   fi

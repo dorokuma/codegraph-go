@@ -206,12 +206,14 @@ func waitForExit(pid int, timeout time.Duration) bool {
 	return false
 }
 
-// procStartTimeFn/procCmdlineFn are the /proc readers used by
-// verifyDaemonIdentity. They are variables so tests can simulate an
-// unreadable /proc; production behavior always uses the real implementations.
+// procStartTimeFn/procCmdlineFn/procEnvironFn are the /proc readers used by
+// verifyDaemonIdentity and scanProcs. They are variables so tests can
+// simulate an unreadable /proc; production behavior always uses the real
+// implementations.
 var (
 	procStartTimeFn = procStartTime
 	procCmdlineFn   = procCmdline
+	procEnvironFn   = procEnviron
 )
 
 // verifyDaemonIdentity guards the SIGTERM in KillStaleDaemon against PID

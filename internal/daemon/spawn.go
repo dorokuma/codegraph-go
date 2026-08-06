@@ -15,6 +15,11 @@ type SpawnOpts struct {
 	NoSync     bool   // -no-sync
 }
 
+// spawnDetachedFn is the spawner used by EnsureAndDial. A variable so tests
+// can substitute a fake daemon starter (a real spawn would re-execute the
+// test binary); production always uses SpawnDetached.
+var spawnDetachedFn = SpawnDetached
+
 // SpawnDetached launches this binary as the shared daemon for root.
 // Stdio goes to .codegraph/daemon.log; the child is in its own session.
 // opts may be nil.
