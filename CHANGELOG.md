@@ -3,6 +3,38 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-08-06
+
+### Fixed
+- Single-writer database lock: the daemon takes an exclusive process lock on the
+  index before opening it, cleans up a stale daemon (PID identity-validated)
+  before re-acquiring, and reports who holds the lock when it cannot — two
+  writers can no longer fight over the same index.
+- Rebuild safety: `NeedsRebuild` no longer triggers a full index wipe on
+  arbitrary read errors; a failed extraction keeps the file's previously indexed
+  symbols, single-file reindexing is atomic, and index errors are surfaced
+  instead of silently swallowed.
+- Call-graph edges: multiple call sites between the same symbol pair now produce
+  distinct edges (unique key includes line/column) via a crash-recovery
+  migration, and synthesized edges are replaced atomically in a single
+  transaction. Schema revision 17 → 18.
+- Incremental sync hardening: re-extract is gated on a content hash with
+  millisecond-precision mtime comparison; git-assist clears the index for
+  deleted/renamed files; watcher overflow triggers a full rescan and
+  re-registers directory watches; unresolved-reference scans are pushed down
+  into SQL and tolerate empty tails.
+- Daemon lifecycle: graceful exit when the parent proxy exits (PPID watch),
+  PID-reuse guard so only the true stale daemon is killed, idempotent `Close`,
+  and the safelog no longer panics when written after close.
+- Safety nets: the path jail resolves symlinks, `projectPath` workdirs are
+  allowlisted, `affected` depth is clamped, and `callees` falls back to the
+  definition location when there are no callers.
+
+### Changed
+- Display / daemon wire version **0.8.2**; index schema revision **18**.
+- Go directive bumped to 1.25.12 with toolchain go1.26.5 (stdlib CVE fixes);
+  removed a 43 MB binary that was accidentally committed.
+
 ## [0.8.1] - 2026-08-06
 
 ### Fixed

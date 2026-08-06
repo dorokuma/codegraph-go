@@ -4,13 +4,13 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.8.0**. Index logic version **17**.
+Current version: **0.8.2**. Index logic version **18**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
 
 ## Features
 
-Alignment: steps **1–9** done incl. 7.5 (logic **17**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
+Alignment: steps **1–9** done incl. 7.5 (logic **18**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
 
 - **1 MCP tool `codegraph` (action router):** `action=explore` (PRIMARY), `node`, `search`, `callers`/`callees`/`impact`, `files`, `status`, `affected`/`communities`, `store_fact`/`search_facts`. Same capabilities as 0.7 multi-tool surface; one schema for lower prompt cost.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
@@ -46,8 +46,8 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.8.0 |
-| Index logic | 17 |
+| Display version | 0.8.2 |
+| Index logic | 18 |
 | Feature parity | **not claimed** (step 10 open) |
 
 Single source of truth: `/root/codegraph-go-comparison.md`.
