@@ -47,8 +47,8 @@ func TestIndexFileParseFailureKeepsOldIndex(t *testing.T) {
 	defer func() { orch.extractFn = nil }()
 
 	n, err := orch.indexFile(src, "go", nil)
-	if err != nil {
-		t.Fatalf("indexFile should swallow extract failure: %v", err)
+	if !errors.Is(err, ErrKeepOldIndex) {
+		t.Fatalf("indexFile should return ErrKeepOldIndex on extract failure, got: %v", err)
 	}
 	if n != 0 {
 		t.Fatalf("expected 0 nodes on parse failure, got %d", n)
@@ -57,11 +57,34 @@ func TestIndexFileParseFailureKeepsOldIndex(t *testing.T) {
 	if len(hs) != 1 {
 		t.Fatalf("old symbol was wiped on parse failure: %d", len(hs))
 	}
-	// Meta touched so full scans don't retry the broken file every pass.
+	// M2: the content hash must NOT be refreshed on failure — a fresh hash
+	// would make the hash/meta gates treat the broken file as current and
+	// skip it forever. The stored hash still reflects the last successful
+	// index.
 	key := db.StoragePath(root, src)
 	same, herr := database.FileHasContentHash(key, hashContent(broken))
-	if herr != nil || !same {
-		t.Fatalf("expected touched content_hash after parse failure: same=%v err=%v", same, herr)
+	if herr != nil || same {
+		t.Fatalf("content_hash must NOT be touched on extract failure: same=%v err=%v", same, herr)
+	}
+	// M2: because the meta stayed stale, the next IndexAll retries the file
+	// (self-healing). The direct indexFile call above did not count (seam set
+	// after), so reads is 0 before the pass and must be ≥1 after it.
+	reads := 0
+	orch.readFileFn = func(path string) ([]byte, error) {
+		if path == src {
+			reads++
+		}
+		return os.ReadFile(path)
+	}
+	defer func() { orch.readFileFn = nil }()
+	if _, _, err := orch.IndexAll(); err != nil {
+		t.Fatalf("IndexAll with failed extract must still return nil (non-fatal): %v", err)
+	}
+	if reads < 1 {
+		t.Fatalf("next IndexAll must retry the failed file, got %d reads", reads)
+	}
+	if p := orch.PartialFailures(); p != 1 {
+		t.Fatalf("expected 1 partial failure after the pass, got %d", p)
 	}
 }
 
@@ -120,9 +143,10 @@ func TestIndexFileEmptyResultClearsOldIndex(t *testing.T) {
 // TestIndexFileTSErrorRegexEmptyKeepsOldIndex: tree-sitter reports a real
 // parse error AND the regex fallback finds nothing, while the file already
 // has an index with symbols — the old symbols must be kept (S1). The failure
-// must not ClearFile, must not write a node_count=0 record, must touch the
-// file meta (so full scans don't retry every pass), and must return nil so
-// IndexAll continues with other files.
+// must not ClearFile, must not write a node_count=0 record, must NOT touch
+// the file meta (M2: stale meta makes the next pass retry the file), and
+// must return ErrKeepOldIndex (non-fatal, M7) so IndexAll continues with
+// other files.
 func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
 	root := t.TempDir()
 	database, err := db.Open(root)
@@ -158,8 +182,8 @@ func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
 	defer func() { orch.extractFn = nil }()
 
 	n, err := orch.indexFile(src, "go", nil)
-	if err != nil {
-		t.Fatalf("indexFile should treat ts-error+empty as recoverable: %v", err)
+	if !errors.Is(err, ErrKeepOldIndex) {
+		t.Fatalf("indexFile should return ErrKeepOldIndex on ts-error+empty, got: %v", err)
 	}
 	if n != 0 {
 		t.Fatalf("expected 0 nodes on failed extraction, got %d", n)
@@ -175,10 +199,29 @@ func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
 	if err != nil || nodeCount == 0 {
 		t.Fatalf("node_count must stay >0 on failed extraction, got %d err=%v", nodeCount, err)
 	}
-	// Meta touched so full scans don't retry the broken file every pass.
+	// M2: content hash must NOT be touched — a fresh hash would skip the
+	// broken file forever instead of retrying it.
 	same, herr := database.FileHasContentHash(key, hashContent(broken))
-	if herr != nil || !same {
-		t.Fatalf("expected touched content_hash after failed extraction: same=%v err=%v", same, herr)
+	if herr != nil || same {
+		t.Fatalf("content_hash must NOT be touched on failed extraction: same=%v err=%v", same, herr)
+	}
+	// M2: stale meta ⇒ next IndexAll retries the file (self-healing).
+	reads := 0
+	orch.readFileFn = func(path string) ([]byte, error) {
+		if path == src {
+			reads++
+		}
+		return os.ReadFile(path)
+	}
+	defer func() { orch.readFileFn = nil }()
+	if _, _, err := orch.IndexAll(); err != nil {
+		t.Fatalf("IndexAll with failed extract must still return nil (non-fatal): %v", err)
+	}
+	if reads < 1 {
+		t.Fatalf("next IndexAll must retry the failed file, got %d reads", reads)
+	}
+	if p := orch.PartialFailures(); p != 1 {
+		t.Fatalf("expected 1 partial failure after the pass, got %d", p)
 	}
 }
 
@@ -229,8 +272,8 @@ func TestIndexFileTSErrorRegexEmptyCountQueryFailsKeepsOldIndex(t *testing.T) {
 	}()
 
 	n, err := orch.indexFile(src, "go", nil)
-	if err != nil {
-		t.Fatalf("indexFile should treat count-query failure as recoverable: %v", err)
+	if !errors.Is(err, ErrKeepOldIndex) {
+		t.Fatalf("indexFile should return ErrKeepOldIndex when count query failed, got: %v", err)
 	}
 	if n != 0 {
 		t.Fatalf("expected 0 nodes on failed extraction, got %d", n)
@@ -246,10 +289,29 @@ func TestIndexFileTSErrorRegexEmptyCountQueryFailsKeepsOldIndex(t *testing.T) {
 	if err != nil || nodeCount == 0 {
 		t.Fatalf("node_count must stay >0 when count query failed, got %d err=%v", nodeCount, err)
 	}
-	// Meta touched so full scans don't retry the broken file every pass.
+	// M2: content hash must NOT be touched — a fresh hash would skip the
+	// broken file forever instead of retrying it.
 	same, herr := database.FileHasContentHash(key, hashContent(broken))
-	if herr != nil || !same {
-		t.Fatalf("expected touched content_hash after failed extraction: same=%v err=%v", same, herr)
+	if herr != nil || same {
+		t.Fatalf("content_hash must NOT be touched on failed extraction: same=%v err=%v", same, herr)
+	}
+	// M2: stale meta ⇒ next IndexAll retries the file (self-healing).
+	reads := 0
+	orch.readFileFn = func(path string) ([]byte, error) {
+		if path == src {
+			reads++
+		}
+		return os.ReadFile(path)
+	}
+	defer func() { orch.readFileFn = nil }()
+	if _, _, err := orch.IndexAll(); err != nil {
+		t.Fatalf("IndexAll with failed extract must still return nil (non-fatal): %v", err)
+	}
+	if reads < 1 {
+		t.Fatalf("next IndexAll must retry the failed file, got %d reads", reads)
+	}
+	if p := orch.PartialFailures(); p != 1 {
+		t.Fatalf("expected 1 partial failure after the pass, got %d", p)
 	}
 }
 
@@ -394,6 +456,60 @@ func TestSameSizeSameMtimeContentChangedReindexes(t *testing.T) {
 }
 
 // ---- A6: IndexChanges drops the index for deleted/renamed-away files ----
+
+// TestIndexChangesKeepOldIndexNotHardError (M7): IndexChanges must treat
+// ErrKeepOldIndex exactly like runIndexJobs does — count it as a partial
+// failure, do NOT return it as an error — so the watcher and git-assist sync
+// paths don't log "sync error" for extraction failures that intentionally
+// kept the old index.
+func TestIndexChangesKeepOldIndexNotHardError(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src := filepath.Join(root, "a.go")
+	if err := os.WriteFile(src, []byte("package p\nfunc Hello() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := NewOrchestrator(database, root)
+	if _, err := orch.IndexFile(src); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change content (passes the content-hash gate), then make extraction
+	// fail: the old index is kept and ErrKeepOldIndex is returned by
+	// indexIfNeeded.
+	if err := os.WriteFile(src, []byte("package p\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{}, false, errors.New("injected parse failure")
+	}
+	defer func() { orch.extractFn = nil }()
+
+	// IndexChanges must NOT surface ErrKeepOldIndex as an error (M7): the
+	// watcher's "sync error" log must stay quiet for kept-old-index failures.
+	files, nodes, err := orch.IndexChanges([]string{src})
+	if err != nil {
+		t.Fatalf("IndexChanges must not return ErrKeepOldIndex as hard error, got: %v", err)
+	}
+	if files != 0 || nodes != 0 {
+		t.Fatalf("failed extraction must index nothing: files=%d nodes=%d", files, nodes)
+	}
+	// The old index is still there (retention semantics unchanged)…
+	hs, _ := database.GetNodeByName("Hello")
+	if len(hs) != 1 {
+		t.Fatalf("old index must be kept, got %d rows", len(hs))
+	}
+	// …and the failure is counted as a partial failure, not lost.
+	if p := orch.PartialFailures(); p != 1 {
+		t.Fatalf("expected 1 partial failure counted by IndexChanges, got %d", p)
+	}
+}
 
 func TestIndexChangesDeletesRemovedFile(t *testing.T) {
 	root := t.TempDir()

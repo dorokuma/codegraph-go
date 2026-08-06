@@ -94,6 +94,10 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	affected := make(map[string]bool)
 	queue := make([]string, len(absFiles))
 	copy(queue, absFiles)
+	// M5: import-query failures used to be swallowed silently. Count them so
+	// the result can carry a caveat — a DB failure for one file should not
+	// block the traversal, but the user must know the set may be incomplete.
+	importQueryFails := 0
 
 	for depth := 0; depth < args.Depth && len(queue) > 0; depth++ {
 		// Let cancellation/timeout interrupt the BFS early.
@@ -128,7 +132,8 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			// Find files that import this file's package
 			importers, err := findImportersCtx(ctx, database, file)
 			if err != nil {
-				continue // DB failure for one file shouldn't block the whole traversal
+				importQueryFails++ // DB failure for one file shouldn't block the whole traversal
+				continue
 			}
 			for _, importer := range importers {
 				// Normalize importer paths (relative storage keys → absolute).
@@ -161,14 +166,22 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	sort.Strings(testFiles)
 
 	if len(testFiles) == 0 {
+		text := "No affected test files found."
+		if importQueryFails > 0 {
+			text += fmt.Sprintf("\nnote: %d import-query failure(s); affected set may be incomplete", importQueryFails)
+		}
 		return &AffectedResult{
-			Content: []ContentItem{{Type: "text", Text: "No affected test files found."}},
+			Content: []ContentItem{{Type: "text", Text: text}},
 		}, nil
 	}
 
 	var b strings.Builder
 	for _, f := range testFiles {
 		fmt.Fprintf(&b, "%s\n", f)
+	}
+	if importQueryFails > 0 {
+		// M5: surface partial traversal failures instead of a silent gap.
+		fmt.Fprintf(&b, "note: %d import-query failure(s); affected set may be incomplete\n", importQueryFails)
 	}
 
 	return &AffectedResult{

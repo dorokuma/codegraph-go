@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -170,6 +171,49 @@ func TestDaemonIdleExit(t *testing.T) {
 			t.Fatalf("socket still present")
 		}
 	}
+}
+
+// TestRunAsDaemonOnReadyFailureStopsAndReleasesLock (L4): a failing onReady
+// (the daemon-mode equivalent of "DB cannot be opened") must END the daemon
+// lifecycle instead of keeping a DB-less zombie alive. Afterwards the pidfile
+// (daemon lock) and the socket must be gone, the lock must be re-acquirable
+// (clients can fall back to direct / spawn a fresh daemon), and the error
+// must reach the RunAsDaemon caller so the process exits non-zero.
+func TestRunAsDaemonOnReadyFailureStopsAndReleasesLock(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	onReadyErr := errors.New("open database: injected failure")
+
+	handler := func(ctx context.Context, rwc io.ReadWriteCloser) error { return nil }
+	err := RunAsDaemon(root, handler, func() error { return onReadyErr })
+	if err == nil {
+		t.Fatal("RunAsDaemon must return the onReady error")
+	}
+	if !errors.Is(err, onReadyErr) {
+		t.Fatalf("returned error %v does not wrap onReady error", err)
+	}
+	// Lock released: pidfile removed by Stop's cleanupArtifacts.
+	if _, serr := os.Stat(PidPath(root)); !os.IsNotExist(serr) {
+		t.Fatalf("pidfile still present after onReady failure: %v", serr)
+	}
+	// Socket removed: no client can attach to a DB-less daemon. Check every
+	// candidate path — Start binds the first bindable candidate (preferred
+	// in-project path, or the tmpdir fallback when that path is too long /
+	// unusable, see SocketCandidates), so the preferred path alone could miss
+	// the socket actually bound.
+	for _, sock := range SocketCandidates(root) {
+		if _, serr := os.Stat(sock); !os.IsNotExist(serr) {
+			t.Fatalf("socket still present after onReady failure: %s: %v", sock, serr)
+		}
+	}
+	// The lock is re-acquirable — direct-mode fallback / fresh spawn works.
+	res, aerr := TryAcquireLock(root)
+	if aerr != nil || res.Kind != "acquired" {
+		t.Fatalf("lock not re-acquirable after onReady failure: %+v err=%v", res, aerr)
+	}
+	_ = os.Remove(res.PidPath)
 }
 
 func TestHelloVersionMismatch(t *testing.T) {

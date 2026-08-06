@@ -51,12 +51,20 @@ func ConnectHello(socketPath string) (net.Conn, *bufio.Reader, Hello, ProxyResul
 
 // RunProxy pipes host stdio through a same-version daemon socket until either end closes.
 // Call after ConnectHello succeeded; br must be the reader positioned after daemon hello.
-func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) ProxyResult {
+// WriteClientHello failure returns an error (L2): the connection is useless
+// once the daemon never saw our hello. The caller cannot fall back to direct
+// mode here (the daemon still owns the DB lock), so it logs and exits the
+// proxy path.
+func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) (ProxyResult, error) {
 	if truthy(os.Getenv(EnvLogAttach)) {
 		log.Printf("attached to shared daemon on %s (pid %d, v%s)", hello.SocketPath, hello.PID, hello.Codegraph)
 	}
 	if err := WriteClientHello(conn); err != nil {
+		// L2: don't pipe stdio into a socket the daemon will never serve —
+		// close it and surface the failure to the caller.
 		log.Printf("write client hello: %v", err)
+		_ = conn.Close()
+		return ProxyResult{}, fmt.Errorf("write client hello: %w", err)
 	}
 
 	// PPID watchdog: closing the socket ends both io.Copy legs (daemon
@@ -86,7 +94,7 @@ func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) ProxyResult {
 		log.Printf("proxy copy: %v", err)
 	}
 	_ = conn.Close()
-	return ProxyResult{Outcome: "proxied"}
+	return ProxyResult{Outcome: "proxied"}, nil
 }
 
 // DialAnyCandidate walks SocketCandidates and returns the first same-version connection.

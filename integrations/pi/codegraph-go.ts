@@ -20,6 +20,8 @@ import path from "node:path"
 
 const START_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_START_TIMEOUT_MS || 30000)
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_REQUEST_TIMEOUT_MS || 120000)
+// 非 DEBUG 时保留最近多少行 stderr，进程退出/重启时打出来排查（仍照常 drain 防管道阻塞）。
+const STDERR_KEEP_LINES = 20
 
 // ---- Output budget ---------------------------------------------------------
 // 目标：日常一次调用够用；真遇到超大结果才裁。
@@ -379,6 +381,10 @@ class CodeGraphClient {
 	private stopped = false
 	private restartAttempts = 0
 	private restartTimer: ReturnType<typeof setTimeout> | null = null
+	/** 最近 N 行 stderr（固定容量缓冲），进程退出重启时用于排查。 */
+	private stderrBuffer: string[] = []
+	/** 未以换行结尾的半行，等下一 chunk 拼上（chunk 边界可能切断一行）。 */
+	private stderrCarry = ""
 	readonly workdir: string
 	readonly workdirNote: string
 
@@ -425,11 +431,23 @@ class CodeGraphClient {
 		})
 
 		// Drain stderr so the child never blocks on a full pipe.
+		// DEBUG 模式直接透传；否则保留最近 N 行，进程退出重启时打印排查。
 		if (this.proc.stderr) {
 			this.proc.stderr.on("data", (chunk: Buffer | string) => {
+				const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
 				if (process.env.CODEGRAPH_GO_DEBUG) {
-					const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
 					console.error(`[codegraph-go] ${text.trimEnd()}`)
+					return
+				}
+				const lines = (this.stderrCarry + text).split("\n")
+				this.stderrCarry = lines.pop() || ""
+				for (const line of lines) {
+					const trimmed = line.trimEnd()
+					if (!trimmed) continue
+					this.stderrBuffer.push(trimmed)
+					if (this.stderrBuffer.length > STDERR_KEEP_LINES) {
+						this.stderrBuffer.shift()
+					}
 				}
 			})
 		}
@@ -532,9 +550,30 @@ class CodeGraphClient {
 		return this.serverInstructions
 	}
 
+	/** 打印最近 stderr（若有）并清空缓冲；每次异常退出只打一次（error+exit 双触发不重复）。 */
+	private dumpStderrBuffer(): void {
+		const tail = this.stderrCarry.trimEnd()
+		if (tail) {
+			this.stderrBuffer.push(tail)
+			if (this.stderrBuffer.length > STDERR_KEEP_LINES) {
+				this.stderrBuffer = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
+			}
+		}
+		this.stderrCarry = ""
+		if (this.stderrBuffer.length === 0) return
+		const lines = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
+		console.warn(`[codegraph-go] last stderr before restart (${lines.length} lines):`)
+		for (const line of lines) {
+			console.warn(`[codegraph-go]   ${line}`)
+		}
+		this.stderrBuffer = []
+	}
+
 	/** Exponential backoff restart after unexpected exit (max ~5 tries). */
 	private scheduleRestart() {
 		if (this.stopped) return
+		// 每次异常退出都先打印最近 stderr，再决定是否/如何重启。
+		this.dumpStderrBuffer()
 		if (this.restartAttempts >= 5) {
 			console.error("[codegraph-go] gave up auto-restart after 5 attempts")
 			return

@@ -193,7 +193,14 @@ func main() {
 	conn, br, hello, ok, err := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
 	if ok {
 		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)
-		_ = daemon.RunProxy(conn, br, hello)
+		if _, err := daemon.RunProxy(conn, br, hello); err != nil {
+			// L2: the hello write failed — the socket is unusable. Log it and
+			// exit non-zero (like the ErrStaleDaemonRefused path): direct
+			// fallback would double-write (the daemon is alive and still owns
+			// the DB lock) and the host must know the proxy was never built.
+			slog.Error("proxy failed", "error", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if err != nil && errors.Is(err, daemon.ErrStaleDaemonRefused) {

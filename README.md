@@ -36,7 +36,7 @@ Alignment: steps **1–9** done incl. 7.5 (logic **18**). Not full feature-parit
 - **Portable index paths:** files/nodes stored relative to workdir (schema 17+); safe to move/copy the tree after reindex
 - **Auto-sync:** file watcher with 2-second debounce on every configured workdir; new directories are watched recursively
 - **Staleness warning:** warns when referenced files are pending sync
-- **Respects .gitignore:** uses ripgrep for file operations
+- **Index skip rules:** indexing applies built-in skip rules (internal skip.go) and does not parse `.gitignore`; search tools run ripgrep, which respects ignore files by default and uses `--no-ignore` when an explicit path is given
 - **Agent fact storage:** `store_fact` / `search_facts` tools let agents attach cross-session findings, decisions, and notes to code symbols; facts survive index rebuilds
 
 

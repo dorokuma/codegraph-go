@@ -501,6 +501,10 @@ func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error
 // ListUnresolvedRefsByFiles returns unresolved_refs rows for multiple file
 // paths, optionally filtered by status (empty string = no filter).
 // This avoids loading all unresolved refs into memory and filtering in Go.
+// The IN list is chunked so it stays under SQLite's variable-number ceiling
+// (999), mirroring ListUnresolvedRefsByNames; each chunk carries the status
+// filter. A row can only match one chunk (each path appears once), so no
+// dedup is needed.
 func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]UnresolvedRef, error) {
 	if len(files) == 0 {
 		return nil, nil
@@ -508,35 +512,49 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	q := `SELECT id, from_node, reference_name, reference_kind, line, col,
+	const maxFilesPerChunk = 400 // 1 IN list x 400 + 1 status arg stays under SQLite's 999-var cap
+	selectCols := `SELECT id, from_node, reference_name, reference_kind, line, col,
 		file_path, language, status, name_tail, COALESCE(candidates,'')
 		FROM unresolved_refs WHERE file_path IN (`
-	ph := make([]string, len(files))
-	args := make([]interface{}, 0, len(files)+1)
-	for i, f := range files {
-		ph[i] = "?"
-		args = append(args, f)
-	}
-	q += strings.Join(ph, ",") + `)`
-	if status != "" {
-		q += ` AND status = ?`
-		args = append(args, status)
-	}
-	rows, err := d.conn.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+
 	var out []UnresolvedRef
-	for rows.Next() {
-		var r UnresolvedRef
-		if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
-			&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+	for start := 0; start < len(files); start += maxFilesPerChunk {
+		end := start + maxFilesPerChunk
+		if end > len(files) {
+			end = len(files)
+		}
+		chunk := files[start:end]
+		ph := make([]string, len(chunk))
+		args := make([]interface{}, 0, len(chunk)+1)
+		for i, f := range chunk {
+			ph[i] = "?"
+			args = append(args, f)
+		}
+		q := selectCols + strings.Join(ph, ",") + `)`
+		if status != "" {
+			q += ` AND status = ?`
+			args = append(args, status)
+		}
+		rows, err := d.conn.Query(q, args...)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		for rows.Next() {
+			var r UnresolvedRef
+			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListUnresolvedRefsByNames returns unresolved_refs rows whose reference_name
@@ -1451,7 +1469,9 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 	dir = filepath.ToSlash(filepath.Clean(strings.TrimSpace(dir)))
 	if dir == "" || dir == "." {
 		// Direct children of workdir root: no slash in relative path.
-		rows, err := d.conn.QueryContext(ctx, `SELECT path FROM files ORDER BY path`)
+		// Capped like ListFilesContext to avoid unbounded memory use on very
+		// large databases (M4).
+		rows, err := d.conn.QueryContext(ctx, `SELECT path FROM files ORDER BY path LIMIT 100000`)
 		if err != nil {
 			return nil, err
 		}

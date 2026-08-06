@@ -54,6 +54,14 @@ type Orchestrator struct {
 	// times a file is read on one pass and assert the hash-gate bytes are the
 	// same bytes indexFile indexes (no second read).
 	readFileFn func(path string) ([]byte, error)
+
+	// partialFails counts files whose extraction failed with the old index
+	// kept (ErrKeepOldIndex) during index passes (M7). Guarded by partialMu;
+	// read via PartialFailures(). Reset at the start of each pass so the
+	// count reflects only the most recent pass (stale counts would otherwise
+	// keep warning forever after one permanent failure).
+	partialMu    sync.Mutex
+	partialFails int
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -171,6 +179,14 @@ const maxIndexFileSize = 1 * 1024 * 1024
 // errors.Is(err, ErrIndexInterrupted) identifies it through any wrapping.
 var ErrIndexInterrupted = errors.New("index interrupted by shutdown")
 
+// ErrKeepOldIndex marks a file whose extraction failed but whose previous
+// index was kept (A4/S1). It is non-fatal: the pass continues with other
+// files and the old symbols stay queryable. runIndexJobs counts it as a
+// partial failure (M7) instead of a hard error, and because the file meta is
+// deliberately NOT refreshed on this path (M2) the next index pass retries
+// the file — a broken file self-heals once the parser can read it again.
+var ErrKeepOldIndex = errors.New("extraction failed, keeping old index")
+
 // visitIndexable walks the workspace once, applying the shared skip rules, and
 // invokes fn for each language-supported source file under the size limit.
 // Walk errors on individual paths are skipped so one bad path cannot abort the scan.
@@ -186,6 +202,13 @@ func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lan
 			if ShouldSkipDirIn(o.workdir, path, info.Name()) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// filepath.Walk uses Lstat, so a symlink to a file shows up here with
+		// ModeSymlink set. Skip it: the target may live outside the workspace
+		// and reading it would leak external content (aligned with
+		// internal/tools/node.go safeReadPath's protection).
+		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
 		if info.Size() > maxIndexFileSize {
@@ -217,6 +240,13 @@ func (o *Orchestrator) storePath(path string) string {
 // F4: the bytes read for the content-hash gate are handed to indexFile so the
 // file is never read twice on the same pass.
 func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string) (files int, nodes int, err error) {
+	// Second defense against symlinks (watcher entries bypass the Walk skip):
+	// never index a symlink itself — its target may live outside the
+	// workspace. Lstat is used because the info passed in may already have
+	// followed the link (H2).
+	if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, nil
+	}
 	key := o.storePath(path)
 	var data []byte
 	if !o.isForce() {
@@ -283,7 +313,15 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 			totalFiles += f
 			totalNodes += n
 			if err != nil {
-				errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+				// ErrKeepOldIndex is a partial failure (old index kept, will be
+				// retried) — count it, don't fail the pass (M7).
+				if errors.Is(err, ErrKeepOldIndex) {
+					o.partialMu.Lock()
+					o.partialFails++
+					o.partialMu.Unlock()
+				} else {
+					errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+				}
 			}
 			if onEach != nil {
 				onEach(i+1, len(jobs))
@@ -309,7 +347,22 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 				func(j indexJob) {
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("index worker panic: %v", r)
+							// Keep the immediate per-file diagnostic (path + panic
+							// value) so worker-side failures are visible in logs
+							// even when the aggregated error is only surfaced
+							// much later (H5).
+							log.Printf("index worker panic: %s: %v", j.path, r)
+							// Count the panic as an index error for this file (H5):
+							// IndexAll must return a non-nil error so callers never
+							// mark the schema revision on a pass that lost a file.
+							mu.Lock()
+							errs = append(errs, fmt.Errorf("index %s: panic: %v", j.path, r))
+							done++
+							cur, tot := done, len(jobs)
+							mu.Unlock()
+							if onEach != nil {
+								onEach(cur, tot)
+							}
 						}
 					}()
 					if o.interrupted() {
@@ -320,7 +373,15 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 					totalFiles += f
 					totalNodes += n
 					if err != nil {
-						errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+						// ErrKeepOldIndex is a partial failure (old index kept, will
+						// be retried) — count it, don't fail the pass (M7).
+						if errors.Is(err, ErrKeepOldIndex) {
+							o.partialMu.Lock()
+							o.partialFails++
+							o.partialMu.Unlock()
+						} else {
+							errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+						}
 					}
 					done++
 					cur, tot := done, len(jobs)
@@ -372,6 +433,11 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	if o.interrupted() {
 		return 0, 0, ErrIndexInterrupted
 	}
+	// M7: the partial-failure count is per-pass; reset so a stale count from
+	// an earlier pass cannot trigger a warning on a clean pass.
+	o.partialMu.Lock()
+	o.partialFails = 0
+	o.partialMu.Unlock()
 	totalFiles, totalNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if done%500 == 0 {
 			log.Printf("indexed progress %d/%d candidates", done, total)
@@ -392,6 +458,17 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
 	o.runSynthesis(nil)
+	if n := o.PartialFailures(); n > 0 {
+		// Neutral per-pass report, same position as IndexAllWithProgress:
+		// whether the schema revision gets marked is the server's (caller's)
+		// decision, so only state what happened here — n file(s) failed
+		// extraction and will be retried next pass. Do not claim "marked
+		// current" (a shutdown between this log and the caller's
+		// SetSchemaRevision would mislead operators) nor "revision not
+		// marked" (the server's "index warning" log covers the hard-error
+		// case, so repeating it here would be redundant).
+		log.Printf("index pass: %d file(s) failed extraction; will retry on next pass", n)
+	}
 	return totalFiles, totalNodes, jerr
 }
 
@@ -490,6 +567,16 @@ func (o *Orchestrator) readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+// PartialFailures returns how many files failed extraction (old index kept,
+// ErrKeepOldIndex) during the most recent index pass. Reset at the start of
+// every IndexAll/IndexAllWithProgress/IndexChanges pass, so the value is only
+// meaningful right after a pass returned (M7).
+func (o *Orchestrator) PartialFailures() int {
+	o.partialMu.Lock()
+	defer o.partialMu.Unlock()
+	return o.partialFails
+}
+
 // indexFile extracts and writes the index for one file. data, when non-nil,
 // is the file content already read by the caller (indexIfNeeded's content-hash
 // gate, F4) and is reused instead of reading the file a second time; nil means
@@ -520,34 +607,34 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 	}
 
 	// Extract: tree-sitter first, regex fallback. On total failure the previous
-	// index is KEPT (no ClearFile, no empty file record) — only the file meta
-	// is touched so full scans don't retry the broken file every pass, and
-	// IndexAll continues with other files (A4/Critical#3).
+	// index is KEPT (no ClearFile, no empty file record) and IndexAll
+	// continues with other files (A4/Critical#3). The file meta is deliberately
+	// NOT touched on this path (M2): a fresh content_hash would make the
+	// gates treat the file as current, so an unchanged broken file would be
+	// skipped forever. Leaving the stale meta makes the next IndexAll retry
+	// the file (self-healing). ErrKeepOldIndex is non-fatal (M7).
 	result, tsErrored, extractErr := o.extractFile(lang, string(data), store)
 	if extractErr != nil {
 		log.Printf("warning: extraction failed for %s: %v (keeping existing index)", path, extractErr)
-		if info, serr := os.Stat(path); serr == nil {
-			_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
-		}
-		return 0, nil
+		return 0, ErrKeepOldIndex
 	}
 	// S1: tree-sitter reported a real parse error AND the regex fallback
 	// found nothing (nodes+edges+refs all zero) while the file still has an
 	// old index with symbols — the file is unparseable, not empty. Clearing
 	// it would destroy the previous symbols, so treat it as an extraction
-	// failure: keep the old index, log a warning, touch meta (so full scans
-	// don't retry the broken file every pass) and return nil so IndexAll
-	// continues. The same applies when the stored node-count query itself
-	// fails (cerr != nil): the old index could not be inspected, so never
-	// gamble on clearing it. A successful tree-sitter parse with an empty
-	// result (file genuinely cleared) still clears the old index as before.
+	// failure: keep the old index, log a warning, do NOT touch the file meta
+	// (M2: the stale meta makes the next IndexAll retry the file) and return
+	// ErrKeepOldIndex so IndexAll continues but the failure stays visible
+	// (M7). The same applies when the stored node-count query itself fails
+	// (cerr != nil): the old index could not be inspected, so never gamble
+	// on clearing it. A successful tree-sitter parse with an empty result
+	// (file genuinely cleared) still clears the old index as before.
 	if tsErrored && len(result.Nodes) == 0 && len(result.Edges) == 0 && len(result.Refs) == 0 {
 		if old, cerr := o.fileNodeCount(store); cerr != nil || old > 0 {
 			log.Printf("warning: extraction failed for %s (tree-sitter error, regex found nothing), keeping existing index", path)
-			if info, serr := os.Stat(path); serr == nil {
-				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
-			}
-			return 0, nil
+			// No meta touch here either (M2): the stale meta makes the next
+			// IndexAll retry this file; ErrKeepOldIndex keeps the pass going.
+			return 0, ErrKeepOldIndex
 		}
 	}
 	nodes := result.Nodes
@@ -881,6 +968,13 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	storeKeys := make([]string, 0, len(files))
 	var errs []error
 
+	// M7: per-pass semantics, same as IndexAll — reset the partial-failure
+	// count before the pass so PartialFailures() reflects only this batch
+	// (a stale count from an earlier pass would keep warning forever).
+	o.partialMu.Lock()
+	o.partialFails = 0
+	o.partialMu.Unlock()
+
 	for _, path := range files {
 		if o.interrupted() {
 			break // shutdown: stop mid-batch, keep what was written
@@ -908,7 +1002,18 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		totalFiles += filesN
 		totalNodes += nodes
 		if ierr != nil {
-			errs = append(errs, ierr)
+			// ErrKeepOldIndex is a partial failure (old index kept, will be
+			// retried) — count it, don't fail the pass (M7). Aligned with
+			// runIndexJobs: without this, the watcher and git-assist paths
+			// would log "sync error" for every extraction failure that
+			// intentionally kept the old index.
+			if errors.Is(ierr, ErrKeepOldIndex) {
+				o.partialMu.Lock()
+				o.partialFails++
+				o.partialMu.Unlock()
+			} else {
+				errs = append(errs, ierr)
+			}
 		}
 		storeKeys = append(storeKeys, o.storePath(path))
 	}
@@ -941,6 +1046,10 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 		return 0, 0, ErrIndexInterrupted
 	}
 	totalCandidates := len(jobs)
+	// M7: per-pass partial-failure count (see IndexAll).
+	o.partialMu.Lock()
+	o.partialFails = 0
+	o.partialMu.Unlock()
 	indexedFiles, indexedNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if onProgress != nil && (done%10 == 0 || done == total) {
 			onProgress("indexing", done, totalCandidates)
@@ -959,6 +1068,13 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	o.runSynthesis(nil)
+	if n := o.PartialFailures(); n > 0 {
+		// Neutral per-pass report, same wording as IndexAll: the schema-revision
+		// decision belongs to the server (caller); say only what happened here
+		// — n file(s) failed extraction and will be retried next pass. No
+		// "marked current" / "revision not marked" claims (see IndexAll).
+		log.Printf("index pass: %d file(s) failed extraction; will retry on next pass", n)
+	}
 	elapsed := time.Since(start)
 	pending, _ := o.db.CountUnresolvedRefs("pending")
 	log.Printf("indexing complete: %d files, %d nodes, %d pending refs in %v (workers=%d)",

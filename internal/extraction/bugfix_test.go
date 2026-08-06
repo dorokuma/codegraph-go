@@ -1,8 +1,14 @@
 package extraction
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 // TestRunIndexJobsRecoverPerIteration verifies BUG-5 fix: a panic inside one
@@ -91,6 +97,64 @@ func TestRunIndexJobsPanicDoesNotHang(t *testing.T) {
 
 	// If this blocks, the test times out → deadlock.
 	wg.Wait()
+}
+
+// TestRunIndexJobsRealPanicCounted verifies H5/M1: a panic raised inside the
+// REAL runIndexJobs/IndexAll pipeline (injected via the readFileFn seam) is
+// recovered per-iteration, recorded in the aggregated error, and does not
+// abort the pass for the other files. Unlike the hand-written pool
+// simulations above, this exercises the actual Orchestrator code path, so a
+// regression that drops the recover (or forgets to append to errs) fails
+// here instead of being masked by the simulation.
+func TestRunIndexJobsRealPanicCounted(t *testing.T) {
+	// Force the multi-worker pool (the path with the per-iteration recover).
+	t.Setenv("CODEGRAPH_INDEX_WORKERS", "4")
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	const n = 6
+	var panicFile string
+	for i := 0; i < n; i++ {
+		p := filepath.Join(root, fmt.Sprintf("f%d.go", i))
+		if err := os.WriteFile(p, []byte(fmt.Sprintf("package p\nfunc F%d() {}\n", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if i == 3 {
+			panicFile = p
+		}
+	}
+
+	orch := NewOrchestrator(database, root)
+	orch.readFileFn = func(path string) ([]byte, error) {
+		if path == panicFile {
+			panic("injected panic")
+		}
+		return os.ReadFile(path)
+	}
+	defer func() { orch.readFileFn = nil }()
+
+	_, _, err = orch.IndexAll()
+	if err == nil {
+		t.Fatal("IndexAll must return a non-nil error when a worker panics (H5)")
+	}
+	if !strings.Contains(err.Error(), panicFile) {
+		t.Fatalf("aggregated error must name the panicked file, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "injected panic") {
+		t.Fatalf("aggregated error must carry the panic value, got: %v", err)
+	}
+	// The panic must not abort the pass: other files are still indexed, the
+	// panicked one is not.
+	if hs, _ := database.GetNodeByName("F0"); len(hs) != 1 {
+		t.Fatalf("non-panicked file should still be indexed, got %d rows", len(hs))
+	}
+	if hs, _ := database.GetNodeByName("F3"); len(hs) != 0 {
+		t.Fatalf("panicked file must not be indexed, got %d rows", len(hs))
+	}
 }
 
 // TestSFCSvelteAstroLineNumbers verifies BUG-6 fix: svelte/astro template tag

@@ -645,7 +645,13 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found (index empty for this symbol; rg fallback also empty)"}}}, nil, nil
+		// rg exits 1 on no matches; any other error means rg itself failed and
+		// must surface instead of masquerading as "no references" (aligned
+		// with toolSearch).
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found (index empty for this symbol; rg fallback also empty)"}}}, nil, nil
+		}
+		return nil, nil, fmt.Errorf("rg callers fallback: %w", err)
 	}
 	// Compile (or reuse) a regex that matches definitions of the target symbol.
 	// The fixed prefix is the same for every name; only the quoted name varies.
@@ -723,7 +729,13 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		"-c", "-w", args.Name, root)
 	out, err := rg.Output()
 	if err != nil && len(out) == 0 {
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
+		// rg exits 1 on no matches; any other error means rg itself failed and
+		// must surface instead of masquerading as "no references" (aligned
+		// with toolSearch).
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
+		}
+		return nil, nil, fmt.Errorf("rg impact fallback: %w", err)
 	}
 	rgText := relativizeRgOutput(string(out), projRoot)
 	result := "# Impact of " + args.Name + " (rg fallback)\n" + limitLines(rgText, args.MaxResults)

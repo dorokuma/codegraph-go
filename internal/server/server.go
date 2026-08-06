@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	stdsync "sync"
 	"sync/atomic"
 	"time"
@@ -42,8 +41,10 @@ type Server struct {
 	ProjectMaxLRU       int                 // max cached project DBs (0 = unlimited)
 	ProjectPendingClose map[string]*dbEntry // evicted but still in use; guarded by ProjectMu
 
-	// DefReCache avoids recompiling the caller-filter regex per toolCallers invocation.
-	DefReCache stdsync.Map // string → *regexp.Regexp
+	// DefReCache avoids recompiling the caller-filter regex per toolCallers
+	// invocation. Bounded FIFO (M6): an unbounded cache would leak one entry
+	// per distinct symbol name over a long-lived daemon's lifetime.
+	DefReCache defReCache
 
 	// pathMu guards realRoots (B6: EvalSymlinks cache for resolvePathIn).
 	pathMu    stdsync.Mutex
@@ -77,7 +78,12 @@ func (o *onceRWC) Close() error {
 // RunDirect starts a single-process MCP server (stdio) from config.
 // It opens the server state and runs until the transport closes.
 func RunDirect(cfg config.Config) error {
-	s, cleanup := OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
+	s, cleanup, err := OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
+	if err != nil {
+		// L4: OpenServerState no longer os.Exit's on DB failure — surface the
+		// error so the caller controls the failure path (main logs and exits).
+		return fmt.Errorf("open server state: %w", err)
+	}
 	defer cleanup()
 
 	srv := NewMCPServer(s)
@@ -109,15 +115,22 @@ func RunDaemonProcess(cfg config.Config) error {
 		s         *Server
 		cleanup   func()
 		mcpSrv    *mcp.Server
+		stateErr  error
 	)
-	ensure := func() {
+	ensure := func() error {
 		stateOnce.Do(func() {
-			s, cleanup = OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
+			s, cleanup, stateErr = OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
+			if stateErr != nil {
+				return
+			}
 			mcpSrv = NewMCPServer(s)
 		})
+		return stateErr
 	}
 	handler := func(ctx context.Context, rwc io.ReadWriteCloser) error {
-		ensure()
+		if err := ensure(); err != nil {
+			return err
+		}
 		// Each connection is one MCP session sharing tools/DB/watcher.
 		// IOTransport closes Reader and Writer separately — once-wrap so the
 		// underlying conn is closed exactly once.
@@ -132,8 +145,7 @@ func RunDaemonProcess(cfg config.Config) error {
 		return ss.Wait()
 	}
 	onReady := func() error {
-		ensure()
-		return nil
+		return ensure()
 	}
 	if err := daemon.RunAsDaemon(cfg.Workdir, handler, onReady); err != nil {
 		if cleanup != nil {
@@ -150,14 +162,16 @@ func RunDaemonProcess(cfg config.Config) error {
 // OpenServerState opens DB + orchestrator and kicks background index/watcher.
 // workdir is the primary workspace root (first in the workdirs list) for
 // backward compatibility; workdirs is the full list of workspace roots.
-func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, func()) {
+// Returns an error when the database cannot be opened (L4) instead of
+// os.Exit'ing, so callers control the failure path.
+func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, func(), error) {
 	if workdirs == nil {
 		workdirs = []string{workdir}
 	}
 	database, err := db.Open(workdir)
 	if err != nil {
 		slog.Error("open database", "error", err)
-		os.Exit(1)
+		return nil, nil, err
 	}
 
 	// Start WAL checkpoint background loop (every 5 minutes).
@@ -204,7 +218,7 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 		s.closeProjectCache()
 		_ = database.Close()
 	}
-	return s, cleanup
+	return s, cleanup, nil
 }
 
 func backgroundIndexAndWatch(s *Server, noSync bool) {
@@ -232,6 +246,12 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		// still re-syncs on later changes.
 		slog.Error("schema revision check failed; skipping index round", "error", rebuildErr)
 	} else {
+		// serr records a failed SetSchemaRevision; nil means the revision was
+		// stored (or RebuildAll handled the marking internally). It gates the
+		// success Info below: a failed SetSchemaRevision must not be logged
+		// as "indexed … schema=<target>" (SchemaRevision() is the target
+		// constant, not what the DB actually holds).
+		var serr error
 		if rebuild {
 			slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
 
@@ -262,7 +282,21 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 				// BgDone is closed, so every later step in this goroutine
 				// bails on it.
 			} else if err == nil {
-				_ = database.SetSchemaRevision()
+				// Set the schema revision FIRST, then report partial failures:
+				// "marked current" must only be logged after the revision is
+				// actually stored — a shutdown between the log line and
+				// SetSchemaRevision would claim current for an unmarked index.
+				serr = database.SetSchemaRevision()
+				if serr != nil {
+					slog.Warn("set schema revision", "error", serr)
+				} else if n := orch.PartialFailures(); n > 0 {
+					// M7: extraction failures keep the old index and are retried on
+					// the next pass (M2), so marking the revision is safe — but
+					// surface the partial-failure count so operators see the index
+					// is marked current with gaps. (Panics/H5 and hard errors set
+					// err != nil and never reach here.)
+					slog.Warn("index marked current with extraction failures; will retry", "failed_files", n)
+				}
 			}
 		}
 		if err != nil {
@@ -271,7 +305,7 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			} else {
 				slog.Warn("index warning", "error", err)
 			}
-		} else {
+		} else if serr == nil {
 			slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 		}
 
@@ -320,6 +354,10 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			continue
 		}
 		var f2, n2 int
+		// Same gate as the primary workdir: serr != nil means the revision
+		// was NOT stored, so skip the success Info (the Warn above already
+		// reported it; NeedsRebuild re-indexes on next startup).
+		var serr error
 		if rebuildNeeded {
 			slog.Info("full rebuild", "workdir", wd, "from", oldVer, "to", db.SchemaRevision())
 			f2, n2, err = otherOrch.RebuildAll()
@@ -330,7 +368,15 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 				// Same rule as the primary workdir: never mark the revision
 				// on an interrupted pass — the next startup rebuilds it.
 			} else if err == nil {
-				_ = otherDB.SetSchemaRevision()
+				// Same ordering as the primary workdir: mark the revision
+				// first, log "marked current" only after it is stored (a
+				// shutdown in between must not claim an unmarked index).
+				serr = otherDB.SetSchemaRevision()
+				if serr != nil {
+					slog.Warn("set schema revision", "workdir", wd, "error", serr)
+				} else if n := otherOrch.PartialFailures(); n > 0 {
+					slog.Warn("index marked current with extraction failures; will retry", "workdir", wd, "failed_files", n)
+				}
 			}
 		}
 		if err != nil {
@@ -342,7 +388,9 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			_ = otherDB.Close()
 			continue
 		}
-		slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+		if serr == nil {
+			slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+		}
 
 		// Keep secondary DB open and watch for changes (parity with primary).
 		if !noSync {

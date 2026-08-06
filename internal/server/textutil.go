@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
 )
@@ -51,16 +52,48 @@ func isWordSep(b byte) bool {
 	return false
 }
 
-// getCachedDefRe returns a compiled regex that matches definitions of the given name.
-// The result is cached per name to avoid repeated MustCompile across invocations.
-func (s *Server) getCachedDefRe(name string) *regexp.Regexp {
-	if cached, ok := s.DefReCache.Load(name); ok {
-		return cached.(*regexp.Regexp)
+// defReCacheCap bounds the compiled-definition-regex cache (M6). One entry
+// per distinct queried symbol name: unbounded, a long-lived daemon would leak
+// a compiled regex per symbol it ever saw.
+const defReCacheCap = 256
+
+// defReCache is a bounded FIFO cache for compiled definition regexes (M6).
+// The zero value is usable; get compiles on miss and evicts the oldest entry
+// when the cap is exceeded. Concurrent-safe: MCP tool handlers may call it in
+// parallel.
+type defReCache struct {
+	mu    sync.Mutex
+	m     map[string]*regexp.Regexp
+	order []string // insertion order, oldest first
+	cap   int
+}
+
+// get returns the cached regex for name, compiling and caching it on miss.
+func (c *defReCache) get(name string) *regexp.Regexp {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]*regexp.Regexp)
+		c.cap = defReCacheCap
+	}
+	if re, ok := c.m[name]; ok {
+		return re
 	}
 	quoted := regexp.QuoteMeta(name)
 	re := regexp.MustCompile(`(func\s+(\([^)]*\)\s*)?|def\s+|function\s+|class\s+|fn\s+)` + quoted + `\b`)
-	s.DefReCache.Store(name, re)
+	c.m[name] = re
+	c.order = append(c.order, name)
+	if len(c.order) > c.cap {
+		delete(c.m, c.order[0])
+		c.order = c.order[1:]
+	}
 	return re
+}
+
+// getCachedDefRe returns a compiled regex that matches definitions of the given name.
+// The result is cached per name (bounded FIFO, M6) to avoid repeated MustCompile.
+func (s *Server) getCachedDefRe(name string) *regexp.Regexp {
+	return s.DefReCache.get(name)
 }
 
 // relativizeRgOutput converts absolute file paths in rg output to paths relative

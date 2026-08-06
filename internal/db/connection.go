@@ -180,9 +180,6 @@ func (d *DB) Close() error {
 }
 
 // lockHolderHint enriches the in-use error with daemon pid/version when a
-// .codegraph/daemon.pid file is present (best-effort;
-
-// lockHolderHint enriches the in-use error with daemon pid/version when a
 // .codegraph/daemon.pid file is present (best-effort; returns "" otherwise).
 // Parsed inline (not via the daemon package) to avoid an import cycle.
 func lockHolderHint(dir string) string {

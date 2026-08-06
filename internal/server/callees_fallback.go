@@ -35,6 +35,14 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		"-e", defPattern, root)
 	defOut, err := rgDef.Output()
 	if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
+		// err != nil with a non-exit-1 code means rg itself is broken (not
+		// merely "no match") — surface the error instead of masking it with a
+		// misleading "no definitions" answer or a pointless fallback run.
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+				return nil, nil, fmt.Errorf("rg definitions: %w", err)
+			}
+		}
 		// Fallback uses an independent context — primary may have exhausted its timeout.
 		fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer fallbackCancel()
@@ -44,7 +52,12 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 			"--max-count=20",
 			"-e", fallbackPattern, root)
 		defOut, err = rgDefFallback.Output()
-		if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+				return nil, nil, fmt.Errorf("rg definitions fallback: %w", err)
+			}
+		}
+		if len(bytes.TrimSpace(defOut)) == 0 {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "no definitions found for " + args.Name}},
 			}, nil, nil
@@ -103,7 +116,15 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		if len(allCalls) >= args.MaxResults {
 			break
 		}
-		lines, err := readLines(d.file)
+		// d.file comes from rg output: it may be (or pass through) a symlink
+		// pointing outside the workspace. resolvePathIn enforces the realpath
+		// + escape jail before the file is read, so a symlink cannot smuggle
+		// reads outside the workspace root (H3).
+		p, err := s.resolvePathIn(root, d.file)
+		if err != nil {
+			continue
+		}
+		lines, err := readLines(p)
 		if err != nil {
 			continue
 		}

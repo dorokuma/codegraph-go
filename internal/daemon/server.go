@@ -312,7 +312,19 @@ func RunAsDaemon(root string, handler SessionHandler, onReady func() error) erro
 			}
 			if onReady != nil {
 				if err := onReady(); err != nil {
-					log.Printf("daemon onReady: %v", err)
+					// L4: onReady failure (typically the DB cannot be opened)
+					// must END the daemon, not just log and keep waiting: a
+					// DB-less daemon holding the pidfile lock + socket would
+					// be a zombie that clients attach to yet can never serve,
+					// and it blocks both fresh spawns and direct-mode
+					// fallback. Stop releases the socket and removes our
+					// pidfile (cleanupArtifacts), then the error propagates to
+					// the caller so the process exits non-zero — "DB cannot be
+					// opened = startup failure" stays true, just via error
+					// return instead of os.Exit.
+					log.Printf("daemon onReady: %v; shutting down", err)
+					d.Stop("onReady failed")
+					return err
 				}
 			}
 			// Signal handlers
