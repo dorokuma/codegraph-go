@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -357,6 +358,54 @@ func TestKillStaleDaemonRefusesUnreadableStartTime(t *testing.T) {
 	}
 	_ = cmd.Process.Kill()
 	<-done
+}
+
+// TestKillStaleDaemonSIGKILLFallback (M3 regression): a live daemon whose
+// identity is confirmed but which does not exit on SIGTERM must be escalated
+// to SIGKILL after the grace window, the lock cleared, and a nil returned —
+// never a fake success while the process is still alive. A SIGSTOPped helper
+// models the stuck daemon: SIGTERM stays pending (never handled) while
+// SIGKILL terminates it immediately.
+func TestKillStaleDaemonSIGKILLFallback(t *testing.T) {
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	// Stop the helper so it cannot handle SIGTERM (stays pending, process
+	// stays alive) — the same shape as a daemon stuck in Stop that ignores
+	// the graceful signal.
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP helper: %v", err)
+	}
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon with SIGKILL fallback: %v", err)
+	}
+	// The helper must have been terminated (SIGKILL) and the lock cleared.
+	select {
+	case werr := <-waited:
+		if werr == nil {
+			t.Fatal("helper process still running after SIGKILL fallback")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("helper process not terminated after SIGKILL fallback")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pidfile not cleared after SIGKILL fallback")
+	}
 }
 
 func TestRegistryRoundtrip(t *testing.T) {

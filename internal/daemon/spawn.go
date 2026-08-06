@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,9 +82,16 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Detach: don't keep a zombie; child is session leader.
-	if err := cmd.Process.Release(); err != nil {
-		log.Printf("release daemon process pid=%d: %v", cmd.Process.Pid, err)
-	}
+	// Reap the child in a goroutine instead of Process.Release: a candidate
+	// daemon that loses the lock race exits within ~50ms, and without a Wait
+	// the parent would carry a zombie until the CLI itself exits. cmd.Wait()
+	// reaps it immediately; a daemon that survives long-term just blocks the
+	// goroutine on Wait — acceptable for the CLI's short lifetime. The child
+	// is a Setsid session leader and is adopted by init if this process dies,
+	// so reaping does not affect daemon independence (cmd.Wait() and Setsid
+	// do not conflict — Wait is a plain waitpid on the child).
+	go func() {
+		_ = cmd.Wait()
+	}()
 	return nil
 }

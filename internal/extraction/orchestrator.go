@@ -24,6 +24,14 @@ type Orchestrator struct {
 	db      *db.DB
 	workdir string
 
+	// done, when set via SetDone, is polled by the index loops so a shutdown
+	// (daemon Stop closes BgDone) can interrupt a long index pass promptly
+	// instead of finishing the whole workspace first — the 8/6 half-dead
+	// daemon stuck Stop's BgWg.Wait() behind a full IndexAll pass while the
+	// process held the DB with no socket serving. nil disables the checks
+	// (tests, direct mode without a shutdown channel).
+	done <-chan struct{}
+
 	// force is accessed from IndexAll worker goroutines and background
 	// RebuildAll concurrently — guarded by forceMu (A9).
 	forceMu sync.Mutex
@@ -51,6 +59,27 @@ type Orchestrator struct {
 // NewOrchestrator creates a new extraction orchestrator.
 func NewOrchestrator(database *db.DB, workdir string) *Orchestrator {
 	return &Orchestrator{db: database, workdir: workdir}
+}
+
+// SetDone wires a shutdown signal channel into the index loops. After the
+// channel is closed, in-flight index passes wind down within one unit of work
+// (one file, one walk callback).
+func (o *Orchestrator) SetDone(done <-chan struct{}) {
+	o.done = done
+}
+
+// interrupted reports whether the shutdown channel has been closed. nil
+// channel → never interrupted.
+func (o *Orchestrator) interrupted() bool {
+	if o.done == nil {
+		return false
+	}
+	select {
+	case <-o.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetForceReindex makes the next IndexAll/IndexChanges ignore mtime short-circuit.
@@ -134,6 +163,14 @@ func simplifyHandlerName(h string) string {
 // maxIndexFileSize skips oversized blobs (minified bundles, generated dumps).
 const maxIndexFileSize = 1 * 1024 * 1024
 
+// ErrIndexInterrupted aborts an in-flight index pass when the shutdown
+// channel (SetDone) is closed. Callers must treat it as "shutdown happened;
+// partial results are on disk" — never as a retryable failure and never as
+// success: the schema revision must not be marked, or the next startup would
+// trust a half index (NeedsRebuild would stay false).
+// errors.Is(err, ErrIndexInterrupted) identifies it through any wrapping.
+var ErrIndexInterrupted = errors.New("index interrupted by shutdown")
+
 // visitIndexable walks the workspace once, applying the shared skip rules, and
 // invokes fn for each language-supported source file under the size limit.
 // Walk errors on individual paths are skipped so one bad path cannot abort the scan.
@@ -141,6 +178,9 @@ func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lan
 	return filepath.Walk(o.workdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
+		}
+		if o.interrupted() {
+			return ErrIndexInterrupted
 		}
 		if info.IsDir() {
 			if ShouldSkipDirIn(o.workdir, path, info.Name()) {
@@ -236,6 +276,9 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 		totalFiles, totalNodes := 0, 0
 		var errs []error
 		for i, j := range jobs {
+			if o.interrupted() {
+				return totalFiles, totalNodes, errors.Join(errs...)
+			}
 			f, n, err := o.indexIfNeeded(j.path, j.info, j.lang)
 			totalFiles += f
 			totalNodes += n
@@ -269,6 +312,9 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 							log.Printf("index worker panic: %v", r)
 						}
 					}()
+					if o.interrupted() {
+						return // shutdown: drain the queue without indexing
+					}
 					f, n, err := o.indexIfNeeded(j.path, j.info, j.lang)
 					mu.Lock()
 					totalFiles += f
@@ -287,6 +333,9 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 		}()
 	}
 	for _, j := range jobs {
+		if o.interrupted() {
+			break // stop feeding; workers drain the rest without indexing
+		}
 		ch <- j
 	}
 	close(ch)
@@ -295,6 +344,9 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 }
 
 // collectIndexJobs walks the workspace once into a job list.
+// An interrupted walk returns the partial job list wrapped in
+// ErrIndexInterrupted; the caller surfaces the sentinel instead of treating
+// the partial list as a complete pass.
 func (o *Orchestrator) collectIndexJobs() ([]indexJob, error) {
 	var jobs []indexJob
 	err := o.visitIndexable(func(path string, info os.FileInfo, lang string) error {
@@ -307,22 +359,36 @@ func (o *Orchestrator) collectIndexJobs() ([]indexJob, error) {
 // IndexAll indexes all files in the workspace (skips unchanged unless force).
 // A8: per-file failures are aggregated — indexing continues, partial results
 // are kept, and a non-nil error is returned when any file failed.
+// Shutdown (done closed) winds the pass down within one unit of work and
+// skips the resolution/synthesis tail. Every interrupted exit returns
+// ErrIndexInterrupted (possibly joined with per-file errors) so callers can
+// tell "shutdown aborted the pass" from a clean partial success — and must
+// NOT mark the schema revision on it.
 func (o *Orchestrator) IndexAll() (int, int, error) {
 	jobs, err := o.collectIndexJobs()
 	if err != nil {
 		return 0, 0, err
+	}
+	if o.interrupted() {
+		return 0, 0, ErrIndexInterrupted
 	}
 	totalFiles, totalNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if done%500 == 0 {
 			log.Printf("indexed progress %d/%d candidates", done, total)
 		}
 	})
+	if o.interrupted() {
+		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
+	}
 
 	// Step 3: turn pending unresolved_refs into cross-file edges.
 	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 	} else if st.Resolved > 0 || st.Failed > 0 {
 		log.Printf("resolved %d edges (%d failed, %d retried)", st.Resolved, st.Failed, st.Retried)
+	}
+	if o.interrupted() {
+		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
 	o.runSynthesis(nil)
@@ -374,6 +440,11 @@ func (o *Orchestrator) RebuildAll() (int, int, error) {
 	}()
 	files, nodes, err := o.IndexAll()
 	if err != nil {
+		// Interrupted (ErrIndexInterrupted) or a real indexing failure: the
+		// wipe already happened but the reindex is incomplete — never mark
+		// the schema revision here. The revision stays at the old value, so
+		// the next startup's NeedsRebuild()==true triggers a full rebuild
+		// instead of trusting an empty/half index.
 		return files, nodes, err
 	}
 	if err := o.db.SetSchemaRevision(); err != nil {
@@ -811,6 +882,9 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	var errs []error
 
 	for _, path := range files {
+		if o.interrupted() {
+			break // shutdown: stop mid-batch, keep what was written
+		}
 		info, err := os.Stat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -839,6 +913,9 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		storeKeys = append(storeKeys, o.storePath(path))
 	}
 
+	if o.interrupted() {
+		return totalFiles, totalNodes, errors.Join(append(errs, ErrIndexInterrupted)...)
+	}
 	if _, err := resolution.ResolveForFiles(o.db, o.workdir, storeKeys); err != nil {
 		log.Printf("resolve changes: %v", err)
 	}
@@ -860,6 +937,9 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	if err != nil {
 		return 0, 0, err
 	}
+	if o.interrupted() {
+		return 0, 0, ErrIndexInterrupted
+	}
 	totalCandidates := len(jobs)
 	indexedFiles, indexedNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if onProgress != nil && (done%10 == 0 || done == total) {
@@ -867,10 +947,16 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 		}
 	})
 
+	if o.interrupted() {
+		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
+	}
 	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 	} else if st.Resolved > 0 {
 		log.Printf("resolved %d edges after index", st.Resolved)
+	}
+	if o.interrupted() {
+		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	o.runSynthesis(nil)
 	elapsed := time.Since(start)

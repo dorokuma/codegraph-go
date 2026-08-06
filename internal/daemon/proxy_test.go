@@ -98,3 +98,71 @@ func TestEnsureAndDialRefusesStaleKill(t *testing.T) {
 	_ = cmd.Process.Kill()
 	<-done
 }
+
+// TestHalfDeadDaemonHoldsLockStartupGrace (M2 regression): half-dead
+// classification must respect a startup window — a pidfile written less than
+// halfDeadStartupGrace ago names a healthy daemon that is still binding its
+// socket (TryAcquireLock writes the pidfile before Daemon.Start binds), so it
+// must NOT be treated as half-dead. An old StartedAt with a live process IS
+// half-dead; a legacy pidfile without startedAt is conservatively not.
+func TestHalfDeadDaemonHoldsLockStartupGrace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := PidPath(root)
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	base := LockInfo{
+		PID:        cmd.Process.Pid,
+		Version:    PackageVersion,
+		SocketPath: PreferredSocket(root),
+		StartedAt:  time.Now().Add(-time.Hour).UnixMilli(),
+		ProcStart:  procStartTime(cmd.Process.Pid),
+	}
+
+	// Old StartedAt + live process → half-dead (killable).
+	if err := os.WriteFile(pidPath, EncodeLock(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !halfDeadDaemonHoldsLock(root) {
+		t.Fatal("old StartedAt with a live process must be half-dead")
+	}
+
+	// Fresh StartedAt (startup window) + live process → NOT half-dead.
+	base.StartedAt = time.Now().UnixMilli()
+	if err := os.WriteFile(pidPath, EncodeLock(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if halfDeadDaemonHoldsLock(root) {
+		t.Fatal("pidfile written within the startup grace must not be half-dead (healthy daemon still binding its socket)")
+	}
+
+	// Legacy pidfile without startedAt → conservative: NOT half-dead.
+	base.StartedAt = 0
+	if err := os.WriteFile(pidPath, EncodeLock(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if halfDeadDaemonHoldsLock(root) {
+		t.Fatal("legacy pidfile without startedAt must not be half-dead (avoid killing a healthy daemon)")
+	}
+
+	// Dead process → not half-dead regardless of age.
+	dead := LockInfo{PID: 1 << 30, Version: PackageVersion, StartedAt: time.Now().Add(-time.Hour).UnixMilli()}
+	if err := os.WriteFile(pidPath, EncodeLock(dead), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if halfDeadDaemonHoldsLock(root) {
+		t.Fatal("dead process must not be half-dead")
+	}
+
+	_ = cmd.Process.Kill()
+	<-waited
+}

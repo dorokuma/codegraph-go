@@ -106,6 +106,79 @@ func DialAnyCandidate(projectRoot string) (net.Conn, *bufio.Reader, Hello, bool,
 	return nil, nil, Hello{}, false, ""
 }
 
+// halfDeadStartupGrace is how long after a daemon wrote its pidfile we treat
+// dial failures as a startup window instead of a half-dead process. The
+// daemon writes the pidfile (TryAcquireLock) BEFORE it binds the socket
+// (Daemon.Start), so a healthy daemon mid-startup looks exactly like a
+// half-dead one for a few milliseconds. Killing inside this window would
+// SIGTERM a healthy daemon that is merely still starting.
+const halfDeadStartupGrace = 3 * time.Second
+
+// halfDeadDaemonHoldsLock reports whether the pidfile names a LIVE process
+// while DialAnyCandidate has just failed on every candidate socket. That is
+// the half-dead state: the daemon's Stop path got stuck (listener closed —
+// which unlinks the socket file — but Stop wedged in d.wg.Wait() behind a
+// session/accept goroutine that never returns, so cleanupArtifacts never ran
+// and the pidfile is still there) before the process exited. The lock is
+// held by a process that will never accept this client; it keeps blocking
+// spawns and direct-mode fallback (which refuses to run on top of a live
+// writer), so treat it like a version mismatch — kill and replace — instead
+// of burning the spawn + 6s poll cycle.
+//
+// Two guards prevent killing a healthy daemon:
+//   - Startup grace: a pidfile written less than halfDeadStartupGrace ago is
+//     a daemon still binding its socket — dial failures there are transient
+//     and the spawn loop below retries, so it is never half-dead.
+//   - Legacy pidfiles without startedAt cannot be age-gated; refusing to
+//     classify them as half-dead is the safe choice (a false kill would
+//     SIGTERM a healthy daemon, while a missed kill only costs one extra
+//     spawn attempt, which the normal lock-taken path resolves).
+func halfDeadDaemonHoldsLock(projectRoot string) bool {
+	raw, err := os.ReadFile(PidPath(projectRoot))
+	if err != nil {
+		return false // no pidfile → nothing holds the lock
+	}
+	info := DecodeLock(raw)
+	if info == nil || info.PID <= 0 || !IsProcessAlive(info.PID) {
+		return false
+	}
+	// Startup window: pidfile written, socket not yet bound (or not yet
+	// answering). Never kill inside the grace window.
+	if info.StartedAt > 0 && time.Since(time.UnixMilli(info.StartedAt)) < halfDeadStartupGrace {
+		return false
+	}
+	// Old pidfile without startedAt: cannot verify age — conservative
+	// no-kill (see comment above).
+	if info.StartedAt <= 0 {
+		return false
+	}
+	return true
+}
+
+// killStaleDaemonForSpawn terminates the recorded daemon so the caller can
+// spawn a replacement, mapping failures to the caller's contract:
+// ErrStaleDaemonRefused is wrapped (fatal — an unidentified live process holds
+// the lock; do NOT spawn), any other kill failure (e.g. signal sent but exit
+// wait timed out) is logged and the caller proceeds with a fresh spawn
+// (historical behavior).
+func killStaleDaemonForSpawn(projectRoot string) error {
+	if err := KillStaleDaemon(projectRoot); err != nil {
+		if errors.Is(err, ErrStaleDaemonRefused) {
+			// G1: the PID-reuse guard refused to signal the recorded
+			// process because its identity could not be confirmed. The
+			// lock is still held by a live, unidentified process: spawning
+			// on top of it or falling back to direct mode would risk
+			// double-writing the index, so stop and hand the refusal to
+			// the caller (main prints an actionable message and exits).
+			return fmt.Errorf("stale daemon at %s failed identity check: %w", PidPath(projectRoot), err)
+		}
+		// Ordinary failure (e.g. signal sent but exit wait timed out):
+		// keep historical behavior — log and retry via a fresh spawn.
+		log.Printf("kill stale daemon: %v", err)
+	}
+	return nil
+}
+
 // EnsureAndDial probes for a live daemon, spawning one if needed, then dials.
 // Returns ok=false when the daemon path is unavailable (caller → direct mode).
 // The returned error is non-nil when the daemon path is unusable for a reason
@@ -125,19 +198,22 @@ func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, o
 		// pidfile so the fresh spawn below can acquire the lock; the old
 		// daemon must not keep writing an index this build is about to
 		// migrate/replace.
-		if err := KillStaleDaemon(projectRoot); err != nil {
-			if errors.Is(err, ErrStaleDaemonRefused) {
-				// G1: the PID-reuse guard refused to signal the recorded
-				// process because its identity could not be confirmed. The
-				// lock is still held by a live, unidentified process: spawning
-				// on top of it or falling back to direct mode would risk
-				// double-writing the index, so stop and hand the refusal to
-				// the caller (main prints an actionable message and exits).
-				return nil, nil, Hello{}, false, fmt.Errorf("stale daemon at %s failed identity check: %w", PidPath(projectRoot), err)
-			}
-			// Ordinary failure (e.g. signal sent but exit wait timed out):
-			// keep historical behavior — log and retry via a fresh spawn.
-			log.Printf("kill stale daemon: %v", err)
+		if err := killStaleDaemonForSpawn(projectRoot); err != nil {
+			return nil, nil, Hello{}, false, err
+		}
+	} else if halfDeadDaemonHoldsLock(projectRoot) {
+		// No candidate socket answered, yet the pidfile names a live
+		// process: a half-dead daemon holds the lock but is not serving
+		// (its Stop got stuck after the listener closed and the socket file
+		// was unlinked, before cleanupArtifacts removed the pidfile). It
+		// will never accept this client, so replace it the same way as a
+		// version mismatch — the fresh spawn below needs the lock and the
+		// DB. Identity verification is unchanged: KillStaleDaemon still
+		// runs verifyDaemonIdentity before signaling (PID-reuse guard), and
+		// halfDeadDaemonHoldsLock's startup grace keeps a healthy daemon
+		// mid-bind from being misclassified.
+		if err := killStaleDaemonForSpawn(projectRoot); err != nil {
+			return nil, nil, Hello{}, false, err
 		}
 	}
 	if err := SpawnDetached(projectRoot, opts); err != nil {

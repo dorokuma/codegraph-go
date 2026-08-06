@@ -172,6 +172,10 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 		Orchestrator: orch,
 		BgDone:       make(chan struct{}),
 	}
+	// Shutdown interrupt for the index loops: when Stop closes BgDone the
+	// in-flight IndexAll/RebuildAll/IndexChanges pass winds down within one
+	// unit of work instead of blocking BgWg.Wait() for the whole workspace.
+	orch.SetDone(s.BgDone)
 	s.BgWg.Add(1)
 	go backgroundIndexAndWatch(s, noSync)
 	cleanup := func() {
@@ -237,6 +241,11 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			default:
 			}
 			files, nodes, err = orch.RebuildAll()
+			// RebuildAll marks the schema revision only on a complete pass.
+			// An interrupted rebuild returns ErrIndexInterrupted and leaves
+			// the revision at its old value: the next startup sees
+			// NeedsRebuild()==true and re-runs the full rebuild, so a wiped
+			// half index is never presented as current.
 		} else {
 			slog.Info("indexing project in background...")
 
@@ -246,14 +255,25 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			default:
 			}
 			files, nodes, err = orch.IndexAll()
-			if err == nil {
+			if errors.Is(err, extraction.ErrIndexInterrupted) {
+				// Shutdown interrupted the pass: do NOT mark the schema
+				// revision — the half index must not masquerade as current.
+				// Logged as an interruption below, not as success. No retry:
+				// BgDone is closed, so every later step in this goroutine
+				// bails on it.
+			} else if err == nil {
 				_ = database.SetSchemaRevision()
 			}
 		}
 		if err != nil {
-			slog.Warn("index warning", "error", err)
+			if errors.Is(err, extraction.ErrIndexInterrupted) {
+				slog.Warn("index pass interrupted by shutdown, revision not marked")
+			} else {
+				slog.Warn("index warning", "error", err)
+			}
+		} else {
+			slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 		}
-		slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 
 		// Optional git-status assist: catch edits missed while nothing was watching.
 		if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
@@ -264,7 +284,11 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			}
 			c, n, gerr := orch.IndexChanges(dirty)
 			if gerr != nil {
-				slog.Warn("git-assist sync", "error", gerr)
+				if errors.Is(gerr, extraction.ErrIndexInterrupted) {
+					slog.Warn("index pass interrupted by shutdown, revision not marked")
+				} else {
+					slog.Warn("git-assist sync", "error", gerr)
+				}
 			} else if c > 0 {
 				slog.Info("git-assist sync", "files", c, "nodes", n)
 			}
@@ -288,6 +312,7 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			continue
 		}
 		otherOrch := extraction.NewOrchestrator(otherDB, wd)
+		otherOrch.SetDone(s.BgDone)
 		rebuildNeeded, oldVer, rerr := otherDB.NeedsRebuild()
 		if rerr != nil {
 			slog.Warn("schema check", "workdir", wd, "error", rerr)
@@ -301,12 +326,19 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		} else {
 			slog.Info("indexing", "workdir", wd)
 			f2, n2, err = otherOrch.IndexAll()
-			if err == nil {
+			if errors.Is(err, extraction.ErrIndexInterrupted) {
+				// Same rule as the primary workdir: never mark the revision
+				// on an interrupted pass — the next startup rebuilds it.
+			} else if err == nil {
 				_ = otherDB.SetSchemaRevision()
 			}
 		}
 		if err != nil {
-			slog.Warn("index warning", "workdir", wd, "error", err)
+			if errors.Is(err, extraction.ErrIndexInterrupted) {
+				slog.Warn("index pass interrupted by shutdown, revision not marked", "workdir", wd)
+			} else {
+				slog.Warn("index warning", "workdir", wd, "error", err)
+			}
 			_ = otherDB.Close()
 			continue
 		}

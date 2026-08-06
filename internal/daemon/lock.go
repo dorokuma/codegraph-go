@@ -121,9 +121,12 @@ var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed 
 // KillStaleDaemon terminates a live daemon whose version no longer matches
 // (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
 // pidfile, verifies the target is really the daemon we recorded (S3: PID-reuse
-// guard), SIGTERMs it when alive, polls up to 5s for exit, then clears the
-// stale pidfile. ClearStaleLock's expectedDeadPID guard ensures we never
-// remove a pidfile that was rewritten to name a different process.
+// guard), SIGTERMs it when alive, polls up to 5s for exit, then escalates to
+// SIGKILL when the grace expires (a daemon stuck in Stop must not keep the
+// lock, and returning a fake nil here would make the caller spawn a
+// replacement doomed to fail on the still-held lock). If the process survives
+// even SIGKILL, an explicit error is returned and the stale pidfile is left
+// in place (ClearStaleLock never removes a live pidfile).
 func KillStaleDaemon(projectRoot string) error {
 	pidPath := PidPath(projectRoot)
 	raw, err := os.ReadFile(pidPath)
@@ -161,16 +164,46 @@ func KillStaleDaemon(projectRoot string) error {
 			return serr
 		}
 		// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			time.Sleep(50 * time.Millisecond)
-			if !IsProcessAlive(info.PID) {
-				break
+		if !waitForExit(info.PID, 5*time.Second) {
+			// SIGTERM grace expired: the daemon is stuck (e.g. Stop wedged in
+			// d.wg.Wait() behind a session that never returns). Identity was
+			// verified above, so escalating to SIGKILL cannot hit a recycled
+			// pid. Escalate — a half-dead daemon must not keep holding the
+			// lock.
+			log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
+			if serr := proc.Signal(syscall.SIGKILL); serr != nil {
+				// Died between the probe and the signal.
+				if !IsProcessAlive(info.PID) {
+					ClearStaleLock(pidPath, info.PID)
+					return nil
+				}
+				return serr
+			}
+			if !waitForExit(info.PID, 2*time.Second) {
+				// Still alive after SIGKILL: never report success. The lock
+				// stays (ClearStaleLock below refuses to remove a pidfile
+				// naming a live process); the caller gets an explicit error
+				// instead of a fake nil that would lead to a spawn attempt
+				// doomed to fail on the still-held lock.
+				return fmt.Errorf("stale daemon pid=%d still alive after SIGTERM+SIGKILL; lock not cleared", info.PID)
 			}
 		}
 	}
 	ClearStaleLock(pidPath, info.PID)
 	return nil
+}
+
+// waitForExit polls IsProcessAlive(pid) until it reports dead or the timeout
+// elapses. Returns true when the process exited within the window.
+func waitForExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		if !IsProcessAlive(pid) {
+			return true
+		}
+	}
+	return false
 }
 
 // procStartTimeFn/procCmdlineFn are the /proc readers used by
