@@ -104,17 +104,24 @@ if [ -d "$REG_DIR" ]; then
     fi
   done
 fi
-# Pre-warm: spawn the new daemon detached (SpawnDetached equivalent:
-# -workdir + CODEGRAPH_DAEMON_INTERNAL=1, output to .codegraph/daemon.log) so
-# the next client connects immediately instead of paying spawn + index time.
+# Pre-warm: spawn the new daemon detached — the shell equivalent of Go-side
+# SpawnDetached (internal/daemon/spawn.go): setsid puts the daemon in its own
+# session (SysProcAttr{Setsid:true}), stdin is /dev/null, stdout/stderr go to
+# .codegraph/daemon.log, and CODEGRAPH_DAEMON_INTERNAL=1 is the daemon-mode
+# entry SpawnDetached uses. nohup is deliberately NOT used: it only ignores
+# SIGHUP without leaving the session (no setsid), which is a remedial
+# workaround, not proper daemonization. This way the next client connects
+# immediately instead of paying spawn + index time.
 mkdir -p "$WORKDIR/.codegraph"
-CODEGRAPH_DAEMON_INTERNAL=1 nohup "$BINARY" -workdir "$WORKDIR" >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
+CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
 SPAWN_PID=$!
-# Verify the warm-up actually took the lock; a half-dead old daemon still
-# holding the DB would make the new daemon exit immediately.
+# Verify the warm-up actually took the lock AND bound the socket: the pidfile
+# is written before the socket bind, so a pidfile alone does not mean the
+# daemon is listening yet. A half-dead old daemon still holding the DB would
+# make the new daemon exit immediately.
 ready=0
 for i in $(seq 1 15); do
-  if [ -f "$WORKDIR/.codegraph/daemon.pid" ]; then
+  if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ]; then
     ready=1
     break
   fi
