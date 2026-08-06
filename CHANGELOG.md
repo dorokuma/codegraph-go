@@ -3,6 +3,31 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.4] - 2026-08-06
+
+### Fixed
+- Invisible flock holder self-heal: when every candidate socket is
+  unreachable yet the DB lock is still held by a daemon whose pidfile/socket
+  were removed (deploy race), `EnsureAndDial` locates the holder via `/proc`
+  (codegraph argv + `-workdir` match + `CODEGRAPH_DAEMON_INTERNAL=1`) and
+  replaces it instead of looping forever. The holder's identity is
+  re-verified against live `/proc` immediately before every signal (SIGTERM
+  and the SIGKILL escalation) to guard against PID reuse between scan and
+  signal; a `/proc` scan failure is treated as "no holder found" instead of
+  a fatal error; and the held-lock probe is a lightweight `flock(2)` check
+  rather than a full database open.
+- `deploy.sh` no longer removes `daemon.pid`/`daemon.sock` while a daemon
+  might still hold the DB lock: it kills every daemon-mode process for the
+  workdir, waits for the flock to be released, and only then removes
+  artifacts; pre-warm readiness now requires pidfile + socket + held lock +
+  live process.
+- The "database in use" error no longer reports "held by pid <self>" when
+  the pidfile names the reporting process itself (the daemon's own
+  freshly-written pidfile during an invisible-holder wedge).
+
+### Changed
+- Display / daemon wire version **0.8.4**.
+
 ## [0.8.3] - 2026-08-06
 
 ### Fixed
