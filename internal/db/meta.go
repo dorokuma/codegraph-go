@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -15,7 +16,9 @@ func stringsContainsNoSuchTable(err error) bool {
 // call-edge line numbers switched to call-site, anonymous-closure calls now
 // captured). On mismatch the server wipes symbol data and does a full reindex.
 // Bumped 16→17: index stores workdir-relative paths (portable; fixes affected).
-const IndexSchemaRevision = "17"
+// Bumped 17→18: edges uniqueness now includes line+col (multi call-site edges);
+// old single-edge-per-pair indexes are stale and need wipe+rebuild.
+const IndexSchemaRevision = "18"
 
 const metaSchemaKey = "index_schema_revision"
 
@@ -34,8 +37,14 @@ func (d *DB) NeedsRebuildContext(ctx context.Context) (bool, string, error) {
 	var cur string
 	err := d.conn.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaSchemaKey).Scan(&cur)
 	if err != nil {
-		// missing row or missing table on very old DBs → rebuild
-		return true, "(none)", nil
+		// Missing row or missing table on very old DBs → rebuild.
+		if err == sql.ErrNoRows || stringsContainsNoSuchTable(err) {
+			return true, "(none)", nil
+		}
+		// Any other error (closed connection, lock contention, …) must NOT
+		// trigger a wipe: returning (true, …) would wipe the index on a
+		// transient failure. Surface the error instead.
+		return false, "", err
 	}
 	if cur != IndexSchemaRevision {
 		return true, cur, nil

@@ -372,6 +372,8 @@ func nullInt64(v int64) interface{} {
 // it returns 0 on conflict. Callers that need the real ID should query it
 // separately (like UpsertNode does). Current non-test callers discard the
 // return value so this is harmless in practice.
+// A3: uniqueness is per call-site (source,target,kind,line,col), so one
+// source calling the same target from many lines keeps one row per site.
 func (d *DB) UpsertEdge(e *Edge) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -379,13 +381,12 @@ func (d *DB) UpsertEdge(e *Edge) (int64, error) {
 	result, err := d.conn.Exec(`
 		INSERT INTO edges (source_id, target_id, kind, file, line, col, provenance, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
-			file = excluded.file,
-			line = excluded.line,
+		ON CONFLICT(source_id, target_id, kind, line, col) DO UPDATE SET
 			col = excluded.col,
+			file = excluded.file,
 			provenance = excluded.provenance,
 			metadata = excluded.metadata
-	`, e.SourceID, e.TargetID, e.Kind, e.File, e.Line, nullInt(e.Col), e.Provenance, e.Metadata)
+	`, e.SourceID, e.TargetID, e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata)
 	if err != nil {
 		return 0, fmt.Errorf("upsert edge: %w", err)
 	}
@@ -730,12 +731,14 @@ const structuralEdgeSQL = `('calls','references','bridge')`
 
 // GetCallers returns nodes that call/reference the given node ID.
 // Includes: call sites, route→handler references (reversed), bridge sources.
+// A3: multiple call-site edges to the same node exist now; callers are the
+// DISTINCT source nodes (use GetIncomingEdges for per-call-site rows).
 func (d *DB) GetCallers(nodeID int64) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	rows, err := d.conn.Query(`
-		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
+		SELECT DISTINCT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type
 		FROM edges e
@@ -751,12 +754,13 @@ func (d *DB) GetCallers(nodeID int64) ([]Node, error) {
 
 // GetCallees returns nodes that the given node ID calls/references.
 // For a route node this surfaces the handler via references edges.
+// A3: distinct callee nodes (per-call-site rows via GetOutgoingEdges).
 func (d *DB) GetCallees(nodeID int64) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	rows, err := d.conn.Query(`
-		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
+		SELECT DISTINCT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type
 		FROM edges e
@@ -839,6 +843,8 @@ func scanNodeRefs(rows *sql.Rows) ([]NodeRef, error) {
 }
 
 // GetImpact returns files that reference the given node, with match counts.
+// A3: COUNT(*) counts call sites (one source may hit the node many times);
+// for distinct referencing files use GetFileDependents.
 func (d *DB) GetImpact(nodeID int64) (map[string]int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -869,6 +875,8 @@ func (d *DB) GetImpact(nodeID int64) (map[string]int, error) {
 }
 
 // FileNeedsReindex checks if a file needs reindexing based on size and mtime.
+// mtime is milliseconds since epoch (UnixMilli) stored as REAL; callers must
+// pass the same precision they stored (see TouchFileMeta).
 func (d *DB) FileNeedsReindex(path string, size int64, mtime float64) (bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -907,6 +915,7 @@ func (d *DB) FileHasContentHash(path, hash string) (bool, error) {
 
 // TouchFileMeta refreshes size/mtime/content_hash without changing node_count.
 // Used when content is unchanged but the filesystem timestamp moved.
+// mtime is milliseconds since epoch (UnixMilli) stored as REAL.
 func (d *DB) TouchFileMeta(path string, size int64, mtime float64, contentHash string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -916,6 +925,22 @@ func (d *DB) TouchFileMeta(path string, size int64, mtime float64, contentHash s
 		WHERE path = ?
 	`, size, mtime, contentHash, float64(time.Now().Unix()), path)
 	return err
+}
+
+// GetFileNodeCount returns the stored node_count for path (0 when missing).
+func (d *DB) GetFileNodeCount(path string) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var n sql.NullInt64
+	err := d.conn.QueryRow(`SELECT node_count FROM files WHERE path = ?`, path).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return int(n.Int64), nil
 }
 
 // GetFileContentHash returns the stored content hash for path, or "" if missing.
@@ -968,6 +993,137 @@ func (d *DB) ClearFile(path string) error {
 	}
 
 	return tx.Commit()
+}
+
+// ReplaceFileIndex atomically replaces all index rows for one file inside a
+// single SQLite transaction: clears the file's old rows (unresolved_refs by
+// file_path, nodes with cascaded edges/refs), inserts the new nodes/edges/
+// refs, and upserts the file record. Returns the inserted node ids aligned
+// with the nodes slice (A4: parse failures must never leave a half-written
+// file — the caller only invokes this after extraction succeeded).
+//
+// Edges and refs may reference nodes of this same batch before they exist by
+// using negative placeholder ids: -(i+1) refers to nodes[i]. Positive ids are
+// used verbatim (e.g. module nodes created before the transaction).
+func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []UnresolvedRef, fileRecord *FileRecord) ([]int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Drop refs anchored on this file path (file_path column has no FK).
+	if _, err := tx.Exec(`DELETE FROM unresolved_refs WHERE file_path = ?`, store); err != nil {
+		return nil, fmt.Errorf("replace file unresolved_refs: %w", err)
+	}
+	// Delete nodes for this file. CASCADE deletes edges (source_id/target_id
+	// FK) and unresolved_refs (from_node FK).
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE file = ?`, store); err != nil {
+		return nil, fmt.Errorf("replace file nodes: %w", err)
+	}
+
+	ids := make([]int64, len(nodes))
+	for i, n := range nodes {
+		body := TruncateBody(n.Body)
+		exported := 0
+		if n.IsExported {
+			exported = 1
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO nodes (
+				kind, name, file, line, end_line, body, language,
+				qualified_name, signature, docstring,
+				start_column, end_column, visibility, is_exported, return_type
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(file, line, kind, name) DO UPDATE SET
+				end_line = excluded.end_line,
+				body = excluded.body,
+				language = excluded.language,
+				qualified_name = excluded.qualified_name,
+				signature = excluded.signature,
+				docstring = excluded.docstring,
+				start_column = excluded.start_column,
+				end_column = excluded.end_column,
+				visibility = excluded.visibility,
+				is_exported = excluded.is_exported,
+				return_type = excluded.return_type
+		`, n.Kind, n.Name, n.File, n.Line, n.EndLine, body, n.Language,
+			n.QualifiedName, n.Signature, n.Docstring,
+			nullInt(n.StartColumn), nullInt(n.EndColumn), n.Visibility, exported, n.ReturnType); err != nil {
+			return nil, fmt.Errorf("replace file insert node %s: %w", n.Name, err)
+		}
+		var id int64
+		if err := tx.QueryRow(`
+			SELECT id FROM nodes WHERE file = ? AND line = ? AND kind = ? AND name = ?
+		`, n.File, n.Line, n.Kind, n.Name).Scan(&id); err != nil {
+			return nil, fmt.Errorf("replace file node id lookup %s: %w", n.Name, err)
+		}
+		ids[i] = id
+	}
+	// Map batch placeholder ids (negative) to the real inserted ids.
+	realID := func(v int64) int64 {
+		if v < 0 {
+			return ids[-(v + 1)]
+		}
+		return v
+	}
+	for _, e := range edges {
+		if _, err := tx.Exec(`
+			INSERT INTO edges (source_id, target_id, kind, file, line, col, provenance, metadata)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(source_id, target_id, kind, line, col) DO UPDATE SET
+				col = excluded.col,
+				file = excluded.file,
+				provenance = excluded.provenance,
+				metadata = excluded.metadata
+		`, realID(e.SourceID), realID(e.TargetID), e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata); err != nil {
+			return nil, fmt.Errorf("replace file insert edge: %w", err)
+		}
+	}
+	for _, r := range refs {
+		status := r.Status
+		if status == "" {
+			status = "pending"
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO unresolved_refs (
+				from_node, reference_name, reference_kind, line, col,
+				file_path, language, status, name_tail, candidates
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(from_node, reference_name, reference_kind, line, col) DO UPDATE SET
+				file_path = excluded.file_path,
+				language = excluded.language,
+				status = excluded.status,
+				name_tail = excluded.name_tail,
+				candidates = excluded.candidates
+		`, realID(r.FromNode), r.ReferenceName, r.ReferenceKind, r.Line, r.Col,
+			r.FilePath, r.Language, status, r.NameTail, r.Candidates); err != nil {
+			return nil, fmt.Errorf("replace file insert unresolved_ref: %w", err)
+		}
+	}
+	if fileRecord != nil {
+		if _, err := tx.Exec(`
+			INSERT INTO files (path, size, mtime, indexed_at, content_hash, language, node_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(path) DO UPDATE SET
+				size = excluded.size,
+				mtime = excluded.mtime,
+				indexed_at = excluded.indexed_at,
+				content_hash = excluded.content_hash,
+				language = excluded.language,
+				node_count = excluded.node_count
+		`, fileRecord.Path, fileRecord.Size, fileRecord.Mtime, float64(time.Now().Unix()),
+			fileRecord.ContentHash, fileRecord.Language, fileRecord.NodeCount); err != nil {
+			return nil, fmt.Errorf("replace file record: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // Stats returns index statistics.
@@ -1370,28 +1526,28 @@ func scanOneNode(row *sql.Row) (*Node, error) {
 type GraphSnapshot struct {
 	Nodes []Node
 	Edges []Edge
+	// Truncated is set when either collection hit the safety cap and was cut
+	// off; consumers must treat the snapshot as approximate (A7).
+	Truncated bool
 }
 
+// graphSnapshotCap bounds the rows loaded per collection to prevent OOM on
+// very large indexes. Exceeding it truncates the snapshot instead of failing.
+// A var (not const) so tests can lower it to exercise the truncation path.
+var graphSnapshotCap = 500_000
+
 // GetGraphSnapshot returns all nodes and edges in one call, protected by RLock.
-// Returns an error if edge count exceeds 500k (safety cap to prevent OOM).
+// When the index exceeds graphSnapshotCap rows in either collection the result
+// is truncated and GraphSnapshot.Truncated is set (callers report it, they
+// never crash on the partial view).
 func (d *DB) GetGraphSnapshot() (*GraphSnapshot, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	var edgeCount int
-	if err := d.conn.QueryRow("SELECT COUNT(*) FROM edges").Scan(&edgeCount); err != nil {
-		return nil, fmt.Errorf("count edges: %w", err)
-	}
-	if edgeCount > 500_000 {
-		return nil, fmt.Errorf(
-			"graph too large for community detection: %d edges (max 500k); "+
-				"this limit exists to prevent OOM and can be adjusted in code",
-			edgeCount,
-		)
-	}
+	snap := &GraphSnapshot{}
 
 	nodes, err := func() ([]Node, error) {
-		rows, err := d.conn.Query(`SELECT ` + nodeSelectCols + ` FROM nodes`)
+		rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes LIMIT ?`, graphSnapshotCap+1)
 		if err != nil {
 			return nil, fmt.Errorf("query nodes: %w", err)
 		}
@@ -1401,9 +1557,14 @@ func (d *DB) GetGraphSnapshot() (*GraphSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(nodes) > graphSnapshotCap {
+		snap.Truncated = true
+		nodes = nodes[:graphSnapshotCap]
+	}
+	snap.Nodes = nodes
 
 	edges, err := func() ([]Edge, error) {
-		rows, err := d.conn.Query(`SELECT id, source_id, target_id, kind, file, line, col, provenance, metadata FROM edges`)
+		rows, err := d.conn.Query(`SELECT id, source_id, target_id, kind, file, line, col, provenance, metadata FROM edges LIMIT ?`, graphSnapshotCap+1)
 		if err != nil {
 			return nil, fmt.Errorf("query edges: %w", err)
 		}
@@ -1428,6 +1589,11 @@ func (d *DB) GetGraphSnapshot() (*GraphSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(edges) > graphSnapshotCap {
+		snap.Truncated = true
+		edges = edges[:graphSnapshotCap]
+	}
+	snap.Edges = edges
 
-	return &GraphSnapshot{Nodes: nodes, Edges: edges}, nil
+	return snap, nil
 }

@@ -20,7 +20,10 @@ export function loadUser(id: number): string {
 function hidden() {}
 </script>
 `
-	res := NewExtractor("vue").Extract(src, "/src/App.vue")
+	res, err := NewExtractor("vue").Extract(src, "/src/App.vue")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	comp := findNode(res.Nodes, "App")
 	if comp == nil || comp.Kind != "component" || !comp.IsExported {
@@ -79,7 +82,10 @@ export function greet(name) { return name }
 <button on:click={greet('x')}>hi</button>
 <Modal />
 `
-	sres := NewExtractor("svelte").Extract(svelte, "/Widget.svelte")
+	sres, err := NewExtractor("svelte").Extract(svelte, "/Widget.svelte")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if findNode(sres.Nodes, "Widget") == nil {
 		t.Fatal("svelte component node missing")
 	}
@@ -104,7 +110,10 @@ export function setup(): void {}
 function clientOnly() {}
 </script>
 `
-	ares := NewExtractor("astro").Extract(astro, "/page.astro")
+	ares, err := NewExtractor("astro").Extract(astro, "/page.astro")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if findNode(ares.Nodes, "page") == nil {
 		t.Fatal("astro component missing")
 	}
@@ -145,7 +154,10 @@ func TestNoisyRefName(t *testing.T) {
 // Same-file calls named add/new/close must survive promote so orchestrator can link.
 func TestNoisyDoesNotDropSameFileCalls(t *testing.T) {
 	js := "export function add(a,b){return a+b}\nexport function main(){return add(1,2)}\n"
-	jres := NewTreeSitterExtractor("javascript").Extract(js, "a.js")
+	jres, err := NewTreeSitterExtractor("javascript").Extract(js, "a.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasAdd := false
 	for _, r := range jres.Refs {
 		if r.FromName == "main" && r.ReferenceName == "add" {
@@ -157,7 +169,10 @@ func TestNoisyDoesNotDropSameFileCalls(t *testing.T) {
 	}
 
 	rust := "pub struct W{}\nimpl W { pub fn new() -> W { W{} } }\npub fn boot() { let _ = W::new(); }\n"
-	rres := NewExtractor("rust").Extract(rust, "lib.rs")
+	rres, err := NewExtractor("rust").Extract(rust, "lib.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasNew := false
 	for _, r := range rres.Refs {
 		if r.ReferenceName == "new" {

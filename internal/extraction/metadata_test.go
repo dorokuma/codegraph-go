@@ -41,7 +41,10 @@ func (s MyStruct) other() {}
 	if ext == nil {
 		t.Fatal("tree-sitter go extractor unavailable")
 	}
-	res := ext.Extract(src, "foo.go")
+	res, err := ext.Extract(src, "foo.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	hello := findNode(res.Nodes, "Hello")
 	if hello == nil {
@@ -143,7 +146,10 @@ class Internal {}
 	if ext == nil {
 		t.Fatal("tree-sitter ts extractor unavailable")
 	}
-	res := ext.Extract(src, "app.ts")
+	res, err := ext.Extract(src, "app.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	foo := findNode(res.Nodes, "foo")
 	if foo == nil {
@@ -243,7 +249,10 @@ pub fn boot() {
 fn internal() {}
 `
 	ext := NewExtractor("rust")
-	res := ext.Extract(src, "lib.rs")
+	res, err := ext.Extract(src, "lib.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := findNode(res.Nodes, "Widget")
 	if w == nil || w.Kind != "struct" || !w.IsExported {
@@ -326,7 +335,10 @@ class MyClass:
 	if ext == nil {
 		t.Fatal("tree-sitter python extractor unavailable")
 	}
-	res := ext.Extract(src, "main.py")
+	res, err := ext.Extract(src, "main.py")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	hello := findNode(res.Nodes, "hello")
 	if hello == nil {

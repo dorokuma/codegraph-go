@@ -101,7 +101,10 @@ func (s MyStruct) Method() {
 }
 `
 	ext := NewExtractor("go")
-	res := ext.Extract(source, "/test.go")
+	res, err := ext.Extract(source, "/test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Check nodes
 	nodeNames := make(map[string]bool)
@@ -156,7 +159,10 @@ class MyComponent extends React.Component {
 }
 `
 	ext := NewExtractor("javascript")
-	res := ext.Extract(source, "/app.js")
+	res, err := ext.Extract(source, "/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	nodeNames := make(map[string]bool)
 	for _, n := range res.Nodes {
@@ -196,7 +202,10 @@ class MyClass:
         hello()
 `
 	ext := NewExtractor("python")
-	res := ext.Extract(source, "/main.py")
+	res, err := ext.Extract(source, "/main.py")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	nodeNames := make(map[string]bool)
 	for _, n := range res.Nodes {
@@ -231,7 +240,10 @@ struct MyStruct {
 }
 `
 	ext := NewExtractor("rust")
-	res := ext.Extract(source, "/main.rs")
+	res, err := ext.Extract(source, "/main.rs")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	nodeNames := make(map[string]bool)
 	for _, n := range res.Nodes {
@@ -346,7 +358,10 @@ func TestIsPythonKeyword(t *testing.T) {
 
 func TestExtractEmptySource(t *testing.T) {
 	ext := NewExtractor("go")
-	res := ext.Extract("", "/empty.go")
+	res, err := ext.Extract("", "/empty.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(res.Nodes) != 0 {
 		t.Errorf("expected 0 nodes, got %d", len(res.Nodes))
 	}
@@ -363,7 +378,10 @@ func TestExtractObjC(t *testing.T) {
 - (void)doWork;
 `
 	ext := NewExtractor("objective-c")
-	res := ext.Extract(src, "/App.m")
+	res, err := ext.Extract(src, "/App.m")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(res.Nodes) < 2 {
 		t.Fatalf("expected objc nodes, got %d", len(res.Nodes))
 	}
@@ -378,7 +396,10 @@ function hello() { return 1 }
 </script>
 <template><div></div></template>`
 	ext := NewExtractor("vue")
-	res := ext.Extract(src, "/App.vue")
+	res, err := ext.Extract(src, "/App.vue")
+	if err != nil {
+		t.Fatal(err)
+	}
 	found := false
 	for _, n := range res.Nodes {
 		if n.Name == "hello" {
@@ -404,13 +425,25 @@ function Bar: Integer;
 procedure Baz;
 `
 	liq := `{% section 'header' %} {% snippet 'card' %}`
-	if r := NewExtractor("luau").Extract(lua, "/a.luau"); len(r.Nodes) < 2 || len(r.Edges) < 1 {
+	r, err := NewExtractor("luau").Extract(lua, "/a.luau")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Nodes) < 2 || len(r.Edges) < 1 {
 		t.Fatalf("luau nodes=%d edges=%d", len(r.Nodes), len(r.Edges))
 	}
-	if r := NewExtractor("pascal").Extract(pas, "/a.pas"); len(r.Nodes) < 3 {
+	r, err = NewExtractor("pascal").Extract(pas, "/a.pas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Nodes) < 3 {
 		t.Fatalf("pascal nodes=%d", len(r.Nodes))
 	}
-	if r := NewExtractor("liquid").Extract(liq, "/a.liquid"); len(r.Nodes) < 2 {
+	r, err = NewExtractor("liquid").Extract(liq, "/a.liquid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Nodes) < 2 {
 		t.Fatalf("liquid nodes=%d", len(r.Nodes))
 	}
 }

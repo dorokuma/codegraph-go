@@ -84,7 +84,10 @@ func TestE2EGoCloseSameFileLinks(t *testing.T) {
 func close() {}
 func main() { close() }
 `
-	res := NewTreeSitterExtractor("go").Extract(src, "a.go")
+	res, err := NewTreeSitterExtractor("go").Extract(src, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	has := false
 	for _, r := range res.Refs {
 		if r.FromName == "main" && r.ReferenceName == "close" {
@@ -170,7 +173,10 @@ func TestE2ESFCTemplatePrecision(t *testing.T) {
 export function saveForm() {}
 </script>
 `
-	res := NewExtractor("vue").Extract(src, "/src/Page.vue")
+	res, err := NewExtractor("vue").Extract(src, "/src/Page.vue")
+	if err != nil {
+		t.Fatal(err)
+	}
 	names := map[string]string{}
 	for _, r := range res.Refs {
 		names[r.ReferenceName] = r.ReferenceKind

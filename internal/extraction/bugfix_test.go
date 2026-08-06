@@ -116,7 +116,10 @@ function hidden() {
 <Modal />
 <AnotherTag />
 `
-	svelteRes := NewExtractor("svelte").Extract(svelte, "/Widget.svelte")
+	svelteRes, err := NewExtractor("svelte").Extract(svelte, "/Widget.svelte")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range svelteRes.Refs {
 		switch r.ReferenceName {
 		case "Modal":
@@ -151,7 +154,10 @@ function clientOnly() {
 </script>
 <BodyPanel />
 `
-	astroRes := NewExtractor("astro").Extract(astro, "/page.astro")
+	astroRes, err := NewExtractor("astro").Extract(astro, "/page.astro")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range astroRes.Refs {
 		if r.ReferenceName == "BodyPanel" {
 			// BodyPanel appears on line 9 of the source.
@@ -174,7 +180,10 @@ const x = 1
 </script>
 <BottomBar />
 `
-	beforeRes := NewExtractor("svelte").Extract(before, "/Before.svelte")
+	beforeRes, err := NewExtractor("svelte").Extract(before, "/Before.svelte")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasTop, hasBottom := false, false
 	for _, r := range beforeRes.Refs {
 		switch r.ReferenceName {
@@ -275,7 +284,10 @@ func caller() {
 func hello() {}
 `
 	ext := NewTreeSitterExtractor("go")
-	res := ext.Extract(source, "/test.go")
+	res, err := ext.Extract(source, "/test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Collect call refs from caller to hello.
 	var callLines []int
@@ -327,7 +339,10 @@ def hello():
     pass
 `
 	ext := NewTreeSitterExtractor("python")
-	res := ext.Extract(source, "/test.py")
+	res, err := ext.Extract(source, "/test.py")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var callLines []int
 	for _, r := range res.Refs {
@@ -373,7 +388,10 @@ func outer() {
 func inner() {}
 `
 	ext := NewTreeSitterExtractor("go")
-	res := ext.Extract(source, "/test.go")
+	res, err := ext.Extract(source, "/test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	hasCall := false
 	for _, r := range res.Refs {
@@ -400,7 +418,10 @@ func outer() {
 
 func inner() {}
 `
-	res2 := NewTreeSitterExtractor("go").Extract(source2, "/test2.go")
+	res2, err := NewTreeSitterExtractor("go").Extract(source2, "/test2.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasCall2 := false
 	for _, r := range res2.Refs {
 		if r.ReferenceKind == "calls" && r.FromName == "outer" && r.ReferenceName == "inner" {
@@ -425,7 +446,10 @@ func outer() {
 
 func inner() {}
 `
-	res3 := NewTreeSitterExtractor("go").Extract(source3, "/test3.go")
+	res3, err := NewTreeSitterExtractor("go").Extract(source3, "/test3.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasCall3 := false
 	for _, r := range res3.Refs {
 		if r.ReferenceKind == "calls" && r.FromName == "outer" && r.ReferenceName == "inner" {
@@ -451,7 +475,10 @@ func TestJSAnonymousClosureCalls(t *testing.T) {
 function inner() {}
 `
 	ext := NewTreeSitterExtractor("javascript")
-	res := ext.Extract(source, "/test.js")
+	res, err := ext.Extract(source, "/test.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	hasCall := false
 	for _, r := range res.Refs {
@@ -474,7 +501,10 @@ function inner() {}
 
 function foo(x) { return x }
 `
-	res2 := NewTreeSitterExtractor("javascript").Extract(source2, "/test2.js")
+	res2, err := NewTreeSitterExtractor("javascript").Extract(source2, "/test2.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasCall2 := false
 	for _, r := range res2.Refs {
 		if r.ReferenceKind == "calls" && r.FromName == "outer" && r.ReferenceName == "foo" {
@@ -495,7 +525,10 @@ function foo(x) { return x }
 
 function inner() { return 1 }
 `
-	res3 := NewTreeSitterExtractor("javascript").Extract(source3, "/test3.js")
+	res3, err := NewTreeSitterExtractor("javascript").Extract(source3, "/test3.js")
+	if err != nil {
+		t.Fatal(err)
+	}
 	hasCall3 := false
 	for _, r := range res3.Refs {
 		if r.ReferenceKind == "calls" && r.FromName == "outer" && r.ReferenceName == "inner" {

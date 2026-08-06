@@ -62,3 +62,47 @@ func TestGitDirtyNonRepo(t *testing.T) {
 		t.Fatalf("non-repo: %v", got)
 	}
 }
+
+// TestGitDirtySourceFilesRename verifies that a git rename surfaces BOTH the
+// old path (to drop from the index) and the new path (to index).
+func TestGitDirtySourceFilesRename(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s (%v)", args, out, err)
+		}
+	}
+	run("git", "init")
+	run("git", "config", "user.email", "t@t.com")
+	run("git", "config", "user.name", "t")
+
+	src := filepath.Join(root, "main.go")
+	if err := os.WriteFile(src, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("git", "add", "main.go")
+	run("git", "commit", "-m", "init")
+
+	dst := filepath.Join(root, "renamed.go")
+	run("git", "mv", "main.go", "renamed.go")
+
+	got := GitDirtySourceFiles(root)
+	hasOld, hasNew := false, false
+	for _, f := range got {
+		if filepath.Clean(f) == filepath.Clean(src) {
+			hasOld = true
+		}
+		if filepath.Clean(f) == filepath.Clean(dst) {
+			hasNew = true
+		}
+	}
+	if !hasOld {
+		t.Errorf("rename old path missing from dirty set: %v", got)
+	}
+	if !hasNew {
+		t.Errorf("rename new path missing from dirty set: %v", got)
+	}
+}

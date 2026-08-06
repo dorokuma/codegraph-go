@@ -3,11 +3,13 @@ package db
 import (
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,15 +22,39 @@ type DB struct {
 	mu   sync.RWMutex
 	conn *sql.DB
 	path string
+	// lockFile is the process-level exclusive lock on .codegraph/codegraph.lock
+	// (A1 single-writer). Held for the lifetime of the DB; released on Close.
+	lockFile *os.File
 }
 
 // Open opens (or creates) the SQLite database at .codegraph/codegraph.db under workdir.
-func Open(workdir string) (*DB, error) {
+func Open(workdir string) (db *DB, err error) {
 	dir := filepath.Join(workdir, ".codegraph")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create .codegraph dir: %w", err)
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")
+
+	// A1: single-writer lock. SQLite WAL allows one writer; a second process
+	// opening the same index would fight over the write lock (busy errors,
+	// lost updates). Take a process-level exclusive flock on codegraph.lock
+	// before touching the db; fail fast with a clear error when held.
+	lockPath := filepath.Join(dir, "codegraph.lock")
+	lockFile, lerr := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if lerr != nil {
+		return nil, fmt.Errorf("open lock file: %w", lerr)
+	}
+	if ferr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); ferr != nil {
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("codegraph.db in use by another process%s: %w", lockHolderHint(dir), ferr)
+	}
+	// Every error path below must release the lock before returning.
+	defer func() {
+		if err != nil {
+			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			_ = lockFile.Close()
+		}
+	}()
 
 	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
 	// not just the first one in the pool (database/sql may open new connections
@@ -39,6 +65,11 @@ func Open(workdir string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+
+	// W12: a single pooled connection. WAL writes serialize through one handle
+	// and the DB RWMutex never races against a second connection; combined with
+	// the process lock above this makes writes strictly single-writer.
+	conn.SetMaxOpenConns(1)
 
 	// Enable WAL mode for concurrent reads
 	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -72,7 +103,7 @@ func Open(workdir string) (*DB, error) {
 		return nil, fmt.Errorf("ensure meta: %w", err)
 	}
 
-	db := &DB{conn: conn, path: dbPath}
+	db = &DB{conn: conn, path: dbPath, lockFile: lockFile}
 	// Bring pre-v7 tables up to current columns/indexes without wiping data here.
 	// Logic-version mismatch still triggers Wipe+Rebuild separately.
 	if err := db.ensureSchema(); err != nil {
@@ -119,14 +150,46 @@ func (d *DB) ensureFTSBackfill() error {
 	return nil
 }
 
-// Close closes the database connection.
+// Close closes the database connection and releases the single-writer lock.
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	var err error
 	if d.conn != nil {
-		return d.conn.Close()
+		err = d.conn.Close()
 	}
-	return nil
+	if d.lockFile != nil {
+		// LOCK_UN + close releases the A1 process lock so the next Open wins.
+		_ = syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_UN)
+		_ = d.lockFile.Close()
+		d.lockFile = nil
+	}
+	return err
+}
+
+// lockHolderHint enriches the in-use error with daemon pid/version when a
+// .codegraph/daemon.pid file is present (best-effort;
+
+// lockHolderHint enriches the in-use error with daemon pid/version when a
+// .codegraph/daemon.pid file is present (best-effort; returns "" otherwise).
+// Parsed inline (not via the daemon package) to avoid an import cycle.
+func lockHolderHint(dir string) string {
+	raw, err := os.ReadFile(filepath.Join(dir, "daemon.pid"))
+	if err != nil {
+		return ""
+	}
+	var info struct {
+		PID     int    `json:"pid"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &info); err != nil || info.PID <= 0 {
+		return ""
+	}
+	hint := fmt.Sprintf(" (held by pid %d", info.PID)
+	if info.Version != "" {
+		hint += ", version " + info.Version
+	}
+	return hint + ")"
 }
 
 // Path returns the database file path.

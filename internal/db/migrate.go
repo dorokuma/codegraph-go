@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -28,6 +29,11 @@ func (d *DB) ensureSchema() error {
 		{"provenance", "TEXT"},
 		{"metadata", "TEXT"},
 	}); err != nil {
+		return err
+	}
+	// A3: pre-A3 databases have UNIQUE(source_id,target_id,kind) which collapses
+	// multi call-site edges; rebuild the table with the (kind,line,col) key.
+	if err := d.rebuildEdgesUniqueKey(); err != nil {
 		return err
 	}
 	if err := d.addMissingColumns("files", []colDef{
@@ -106,4 +112,77 @@ func (d *DB) tableColumns(table string) (map[string]bool, error) {
 		out[name] = true
 	}
 	return out, rows.Err()
+}
+
+// tableSQL returns the stored CREATE TABLE DDL for a table ("" when missing).
+func (d *DB) tableSQL(table string) (string, error) {
+	var ddl string
+	err := d.conn.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&ddl)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return ddl, nil
+}
+
+// rebuildEdgesUniqueKey migrates the edges unique key from
+// UNIQUE(source_id,target_id,kind) to UNIQUE(source_id,target_id,kind,line,col)
+// so one source can hold many call-site edges to the same target. line/col are
+// made NOT NULL DEFAULT 0 so NULLs cannot bypass the constraint.
+//
+// SQLite cannot ALTER constraints, so the table is rebuilt: edges_new ← copy
+// (COALESCE old NULLs to 0) → DROP → RENAME, then the edges indexes are
+// recreated. PRAGMA foreign_keys cannot be toggled inside a transaction, so
+// this runs on the raw connection outside any tx (Open calls it before any
+// transaction starts).
+func (d *DB) rebuildEdgesUniqueKey() error {
+	ddl, err := d.tableSQL("edges")
+	if err != nil {
+		return fmt.Errorf("edges rebuild: read ddl: %w", err)
+	}
+	hasOld := strings.Contains(ddl, "UNIQUE(source_id, target_id, kind)")
+	hasNew := strings.Contains(ddl, "UNIQUE(source_id, target_id, kind, line, col)")
+	if !hasOld || hasNew {
+		return nil
+	}
+
+	if _, err := d.conn.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("edges rebuild: disable foreign_keys: %w", err)
+	}
+	defer func() {
+		// Re-enable FK enforcement on this connection; the DSN also sets it for
+		// every new connection, so a failure here cannot leave FKs off.
+		_, _ = d.conn.Exec(`PRAGMA foreign_keys=ON`)
+	}()
+
+	for _, q := range []string{
+		`CREATE TABLE edges_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+			target_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL,
+			file TEXT,
+			line INTEGER NOT NULL DEFAULT 0,
+			col INTEGER NOT NULL DEFAULT 0,
+			provenance TEXT,
+			metadata TEXT,
+			UNIQUE(source_id, target_id, kind, line, col)
+		)`,
+		`INSERT INTO edges_new (id, source_id, target_id, kind, file, line, col, provenance, metadata)
+		 SELECT id, source_id, target_id, kind, file, COALESCE(line, 0), COALESCE(col, 0), provenance, metadata
+		 FROM edges`,
+		`DROP TABLE edges`,
+		`ALTER TABLE edges_new RENAME TO edges`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`,
+	} {
+		if _, err := d.conn.Exec(q); err != nil {
+			return fmt.Errorf("edges rebuild: %w", err)
+		}
+	}
+	return nil
 }

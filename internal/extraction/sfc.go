@@ -1,6 +1,7 @@
 package extraction
 
 import (
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -68,7 +69,9 @@ type sfcScriptBlock struct {
 }
 
 // extractSFC builds a full ExtractResult for vue/svelte/astro files.
-func (e *Extractor) extractSFC(source, filePath string) ExtractResult {
+// Returns an error when a script block fails to parse in every extractor;
+// the orchestrator then keeps the previous index for the file.
+func (e *Extractor) extractSFC(source, filePath string) (ExtractResult, error) {
 	compName := sfcComponentName(filePath)
 	endLine := strings.Count(source, "\n") + 1
 	if endLine < 1 {
@@ -98,7 +101,10 @@ func (e *Extractor) extractSFC(source, filePath string) ExtractResult {
 	}
 
 	for _, b := range blocks {
-		part := extractScriptContent(b.lang, b.content, filePath)
+		part, perr := extractScriptContent(b.lang, b.content, filePath)
+		if perr != nil {
+			return out, fmt.Errorf("sfc script %s: %w", b.lang, perr)
+		}
 		for _, n := range part.Nodes {
 			n.Language = e.language
 			n.Line = shiftLine(n.Line, b.lineOffset)
@@ -128,7 +134,7 @@ func (e *Extractor) extractSFC(source, filePath string) ExtractResult {
 		}
 		out.Refs = append(out.Refs, ref)
 	}
-	return out
+	return out, nil
 }
 
 func sfcComponentName(filePath string) string {
@@ -204,9 +210,16 @@ func scriptLangFromAttrs(attrs string) string {
 }
 
 // extractScriptContent runs tree-sitter (preferred) or regex JS/TS extract.
-func extractScriptContent(lang, content, filePath string) ExtractResult {
+// Falls back to the regex extractor when tree-sitter fails; an error is
+// returned only when every extractor failed.
+func extractScriptContent(lang, content, filePath string) (ExtractResult, error) {
 	if ts := NewTreeSitterExtractor(lang); ts != nil {
-		return ts.Extract(content, filePath)
+		res, err := ts.Extract(content, filePath)
+		if err == nil {
+			return res, nil
+		}
+		// fall back to the regex extractor on ts failure
+		return NewExtractor(lang).Extract(content, filePath)
 	}
 	return NewExtractor(lang).Extract(content, filePath)
 }

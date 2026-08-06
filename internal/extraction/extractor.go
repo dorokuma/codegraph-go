@@ -68,7 +68,9 @@ func NewExtractor(language string) *Extractor {
 }
 
 // Extract parses the source code and returns nodes, structural edges, and pending refs.
-func (e *Extractor) Extract(source string, filePath string) ExtractResult {
+// The regex extractor is best-effort and never fails; the error return keeps
+// the signature uniform with TreeSitterExtractor so callers can fall back.
+func (e *Extractor) Extract(source string, filePath string) (ExtractResult, error) {
 	var nodes []ExtractedNode
 	var edges []ExtractedEdge
 	switch e.language {
@@ -94,7 +96,7 @@ func (e *Extractor) Extract(source string, filePath string) ExtractResult {
 	default:
 		nodes, edges = e.extractGeneric(source, filePath)
 	}
-	return promoteCallsToRefs(nodes, edges, filePath, e.language)
+	return promoteCallsToRefs(nodes, edges, filePath, e.language), nil
 }
 
 // promoteCallsToRefs moves call edges into UnresolvedReference so the

@@ -34,11 +34,14 @@ CREATE TABLE IF NOT EXISTS edges (
     target_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,        -- calls, imports, extends, implements, references, bridge
     file TEXT,
-    line INTEGER,
-    col INTEGER,
+    line INTEGER NOT NULL DEFAULT 0,   -- call-site line (0 = unknown); part of uniqueness
+    col INTEGER NOT NULL DEFAULT 0,    -- call-site column; part of uniqueness
     provenance TEXT,           -- exact / import / proximity / heuristic
     metadata TEXT,             -- JSON object
-    UNIQUE(source_id, target_id, kind)
+    -- A3: per call-site uniqueness. One source can call the same target from
+    -- many lines; the old UNIQUE(source_id,target_id,kind) collapsed them.
+    -- NOT NULL DEFAULT 0 keeps NULLs from bypassing the constraint.
+    UNIQUE(source_id, target_id, kind, line, col)
 );
 
 CREATE TABLE IF NOT EXISTS files (

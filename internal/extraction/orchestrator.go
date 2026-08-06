@@ -3,6 +3,7 @@ package extraction
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,7 +23,15 @@ import (
 type Orchestrator struct {
 	db      *db.DB
 	workdir string
+
+	// force is accessed from IndexAll worker goroutines and background
+	// RebuildAll concurrently — guarded by forceMu (A9).
+	forceMu sync.Mutex
 	force   bool // when true, indexIfNeeded always reindexes
+
+	// extractFn, when non-nil, replaces the built-in ts→regex extraction
+	// pipeline. Test seam for parse-failure paths (A4).
+	extractFn func(lang, source, store string) (ExtractResult, error)
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -31,7 +40,17 @@ func NewOrchestrator(database *db.DB, workdir string) *Orchestrator {
 }
 
 // SetForceReindex makes the next IndexAll/IndexChanges ignore mtime short-circuit.
-func (o *Orchestrator) SetForceReindex(v bool) { o.force = v }
+func (o *Orchestrator) SetForceReindex(v bool) {
+	o.forceMu.Lock()
+	defer o.forceMu.Unlock()
+	o.force = v
+}
+
+func (o *Orchestrator) isForce() bool {
+	o.forceMu.Lock()
+	defer o.forceMu.Unlock()
+	return o.force
+}
 
 // splitNameLineKey parses keys produced as fmt.Sprintf("%s:%d", name, line).
 func splitNameLineKey(key string) (name string, line int, ok bool) {
@@ -85,52 +104,9 @@ func simplifyHandlerName(h string) string {
 	return strings.Trim(h, " ")
 }
 
-// parkUnresolved writes a pending unresolved_refs row (cross-file / unknown target).
-func (o *Orchestrator) parkUnresolved(fromID int64, refName, kind, file, lang string, line, col int) {
-	if fromID == 0 || refName == "" {
-		return
-	}
-	// Pure framework noise with no project symbol is skipped; real symbols
-	// (even if named like emit/on) still park so resolve can link them.
-	if !ShouldParkRef(o.db, refName) {
-		return
-	}
-	if _, err := o.db.InsertUnresolvedRef(&db.UnresolvedRef{
-		FromNode:      fromID,
-		ReferenceName: refName,
-		ReferenceKind: kind,
-		Line:          line,
-		Col:           col,
-		FilePath:      file,
-		Language:      lang,
-		Status:        "pending",
-		NameTail:      NameTail(refName),
-	}); err != nil {
-		log.Printf("insert unresolved %s %s: %v", kind, refName, err)
-	}
-}
-
-// linkSameFileOrPark writes an edge when target is in sameFileIDs; otherwise parks pending.
-func (o *Orchestrator) linkSameFileOrPark(sourceID int64, targetName string, sameFileIDs map[string]int64, file, lang string, line, col int, kind string) {
-	if sourceID == 0 || targetName == "" {
-		return
-	}
-	if tid, ok := sameFileIDs[targetName]; ok && tid > 0 {
-		if _, err := o.db.UpsertEdge(&db.Edge{
-			SourceID:   sourceID,
-			TargetID:   tid,
-			Kind:       kind,
-			File:       file,
-			Line:       line,
-			Col:        col,
-			Provenance: "exact",
-		}); err != nil {
-			log.Printf("upsert same-file %s edge ->%s: %v", kind, targetName, err)
-		}
-		return
-	}
-	o.parkUnresolved(sourceID, targetName, kind, file, lang, line, col)
-}
+// linkSameFileOrPark was replaced by the batched indexFile (A4): same-file
+// links and cross-file parks are now collected and written atomically in
+// ReplaceFileIndex. Keep parkUnresolved's logic inline there (see link()).
 
 // maxIndexFileSize skips oversized blobs (minified bundles, generated dumps).
 const maxIndexFileSize = 1 * 1024 * 1024
@@ -166,22 +142,40 @@ func (o *Orchestrator) storePath(path string) string {
 }
 
 // indexIfNeeded reindexes path when the DB says it is stale.
-// On success returns (1, nodeCount) even if nodeCount is 0; skip/error returns (0, 0).
+// Returns (1, nodeCount) on success; (0,0,nil) when skipped; a non-nil error
+// when the file failed to index (callers aggregate errors, keep going — A8).
 // path is a filesystem path (usually absolute from Walk/watcher); the DB key is relative.
-func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string) (files int, nodes int) {
+//
+// A5 incremental gate: when size+mtime are unchanged the cheap metadata check
+// cannot see same-size same-mtime edits, so the file content is hashed and
+// compared with the stored hash — identical content skips, anything else
+// reindexes. Metadata changes reindex directly without an extra read.
+func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string) (files int, nodes int, err error) {
 	key := o.storePath(path)
-	if !o.force {
-		needsReindex, err := o.db.FileNeedsReindex(key, info.Size(), float64(info.ModTime().Unix()))
-		if err != nil || !needsReindex {
-			return 0, 0
+	if !o.isForce() {
+		needsReindex, err := o.db.FileNeedsReindex(key, info.Size(), float64(info.ModTime().UnixMilli()))
+		if err != nil {
+			return 0, 0, err
+		}
+		if !needsReindex {
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return 0, 0, rerr
+			}
+			same, herr := o.db.FileHasContentHash(key, hashContent(data))
+			if herr != nil {
+				return 0, 0, herr
+			}
+			if same {
+				return 0, 0, nil
+			}
 		}
 	}
 	nodeCount, err := o.indexFile(path, lang)
 	if err != nil {
-		log.Printf("index %s: %v", path, err)
-		return 0, 0
+		return 0, 0, err
 	}
-	return 1, nodeCount
+	return 1, nodeCount, nil
 }
 
 // indexWorkerCount picks how many files to extract/index in parallel.
@@ -197,9 +191,11 @@ type indexJob struct {
 }
 
 // runIndexJobs fans out indexIfNeeded across a small worker pool.
-func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int)) (int, int) {
+// Errors are aggregated (A8): indexing continues file-by-file, partial results
+// stay written, and the joined error is returned at the end.
+func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int)) (int, int, error) {
 	if len(jobs) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 	workers := indexWorkerCount()
 	if workers > len(jobs) {
@@ -207,15 +203,19 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 	}
 	if workers <= 1 {
 		totalFiles, totalNodes := 0, 0
+		var errs []error
 		for i, j := range jobs {
-			f, n := o.indexIfNeeded(j.path, j.info, j.lang)
+			f, n, err := o.indexIfNeeded(j.path, j.info, j.lang)
 			totalFiles += f
 			totalNodes += n
+			if err != nil {
+				errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+			}
 			if onEach != nil {
 				onEach(i+1, len(jobs))
 			}
 		}
-		return totalFiles, totalNodes
+		return totalFiles, totalNodes, errors.Join(errs...)
 	}
 
 	var (
@@ -224,6 +224,7 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 		totalNodes int
 		done       int
 		wg         sync.WaitGroup
+		errs       []error
 		ch         = make(chan indexJob, workers*2)
 	)
 	for i := 0; i < workers; i++ {
@@ -237,10 +238,13 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 							log.Printf("index worker panic: %v", r)
 						}
 					}()
-					f, n := o.indexIfNeeded(j.path, j.info, j.lang)
+					f, n, err := o.indexIfNeeded(j.path, j.info, j.lang)
 					mu.Lock()
 					totalFiles += f
 					totalNodes += n
+					if err != nil {
+						errs = append(errs, fmt.Errorf("index %s: %w", j.path, err))
+					}
 					done++
 					cur, tot := done, len(jobs)
 					mu.Unlock()
@@ -256,7 +260,7 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 	}
 	close(ch)
 	wg.Wait()
-	return totalFiles, totalNodes
+	return totalFiles, totalNodes, errors.Join(errs...)
 }
 
 // collectIndexJobs walks the workspace once into a job list.
@@ -270,12 +274,14 @@ func (o *Orchestrator) collectIndexJobs() ([]indexJob, error) {
 }
 
 // IndexAll indexes all files in the workspace (skips unchanged unless force).
+// A8: per-file failures are aggregated — indexing continues, partial results
+// are kept, and a non-nil error is returned when any file failed.
 func (o *Orchestrator) IndexAll() (int, int, error) {
 	jobs, err := o.collectIndexJobs()
 	if err != nil {
 		return 0, 0, err
 	}
-	totalFiles, totalNodes := o.runIndexJobs(jobs, func(done, total int) {
+	totalFiles, totalNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if done%500 == 0 {
 			log.Printf("indexed progress %d/%d candidates", done, total)
 		}
@@ -289,7 +295,7 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
 	o.runSynthesis(nil)
-	return totalFiles, totalNodes, nil
+	return totalFiles, totalNodes, jerr
 }
 
 // runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
@@ -327,8 +333,14 @@ func (o *Orchestrator) RebuildAll() (int, int, error) {
 	if err := o.db.WipeIndex(); err != nil {
 		return 0, 0, err
 	}
+	o.forceMu.Lock()
 	o.force = true
-	defer func() { o.force = false }()
+	o.forceMu.Unlock()
+	defer func() {
+		o.forceMu.Lock()
+		o.force = false
+		o.forceMu.Unlock()
+	}()
 	files, nodes, err := o.IndexAll()
 	if err != nil {
 		return files, nodes, err
@@ -380,29 +392,27 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 
 	// Content-hash short-circuit: mtime can change without edits (touch, checkout).
 	// Skip clear+re-extract when the bytes are identical (unless force rebuild).
-	if !o.force {
+	if !o.isForce() {
 		if same, herr := o.db.FileHasContentHash(store, contentHash); herr == nil && same {
 			if info, serr := os.Stat(path); serr == nil {
 				// Refresh size/mtime so the cheap FileNeedsReindex stays quiet.
-				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().Unix()), contentHash)
+				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
 			}
 			return 0, nil
 		}
 	}
 
-	// Clear old data for this file
-	if err := o.db.ClearFile(store); err != nil {
-		return 0, err
-	}
-
-	// Try tree-sitter extractor first, fall back to regex.
-	// Pass store path so extractors embed portable File fields.
-	var result ExtractResult
-	tsExt := NewTreeSitterExtractor(lang)
-	if tsExt != nil {
-		result = tsExt.Extract(string(data), store)
-	} else {
-		result = NewExtractor(lang).Extract(string(data), store)
+	// Extract: tree-sitter first, regex fallback. On total failure the previous
+	// index is KEPT (no ClearFile, no empty file record) — only the file meta
+	// is touched so full scans don't retry the broken file every pass, and
+	// IndexAll continues with other files (A4/Critical#3).
+	result, extractErr := o.extractFile(lang, string(data), store)
+	if extractErr != nil {
+		log.Printf("warning: extraction failed for %s: %v (keeping existing index)", path, extractErr)
+		if info, serr := os.Stat(path); serr == nil {
+			_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
+		}
+		return 0, nil
 	}
 	nodes := result.Nodes
 	edges := result.Edges
@@ -425,28 +435,13 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		})
 	}
 
-	// Create a file-level node to anchor import/bridge edges.
-	fileNodeID, err := o.db.UpsertNode(&db.Node{
-		Kind:     db.KindFile,
-		Name:     store,
-		File:     store,
-		Line:     0,
-		Language: lang,
+	// ---- Build the atomic batch. File node first (index 0), then symbols. ----
+	dbNodes := make([]db.Node, 0, len(nodes)+1)
+	dbNodes = append(dbNodes, db.Node{
+		Kind: db.KindFile, Name: store, File: store, Line: 0, Language: lang,
 	})
-	if err != nil {
-		log.Printf("upsert file node %s: %v", store, err)
-	}
-
-	// Insert nodes
-	nodeIDMap := make(map[string]int64) // "name:line" and bare name → id
-	type bareHit struct {
-		id   int64
-		kind string
-		line int
-	}
-	bareBest := map[string]bareHit{}
 	for _, n := range nodes {
-		id, err := o.db.UpsertNode(&db.Node{
+		dbNodes = append(dbNodes, db.Node{
 			Kind:          n.Kind,
 			Name:          n.Name,
 			File:          store,
@@ -463,22 +458,79 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 			StartColumn:   n.StartColumn,
 			EndColumn:     n.EndColumn,
 		})
-		if err != nil {
-			log.Printf("upsert node %s: %v", n.Name, err)
-			continue
+	}
+	// Dedup on the nodes conflict key (file,line,kind,name): UpsertNode would
+	// merge duplicates into one row; keep the first occurrence so batch ids
+	// stay 1:1 with dbNodes.
+	{
+		seen := make(map[string]struct{}, len(dbNodes))
+		kept := dbNodes[:0]
+		for _, n := range dbNodes {
+			k := fmt.Sprintf("%s\x00%d\x00%s\x00%s", n.File, n.Line, n.Kind, n.Name)
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			kept = append(kept, n)
 		}
-		key := fmt.Sprintf("%s:%d", n.Name, n.Line)
-		nodeIDMap[key] = id
+		dbNodes = kept
+	}
+
+	// name:line → dbNodes index; bare-name best-hit map (same ranking as before).
+	nodeIdx := make(map[string]int, len(dbNodes))
+	type bareHit struct{ idx, rank, line int }
+	bareBest := map[string]bareHit{}
+	for i := 1; i < len(dbNodes); i++ { // skip the file node
+		n := dbNodes[i]
+		nodeIdx[fmt.Sprintf("%s:%d", n.Name, n.Line)] = i
 		prev, ok := bareBest[n.Name]
 		rank := bareRank(n.Kind)
-		if !ok || rank > bareRank(prev.kind) || (rank == bareRank(prev.kind) && n.Line < prev.line) {
-			bareBest[n.Name] = bareHit{id: id, kind: n.Kind, line: n.Line}
+		if !ok || rank > prev.rank || (rank == prev.rank && n.Line < prev.line) {
+			bareBest[n.Name] = bareHit{idx: i, rank: rank, line: n.Line}
 		}
 	}
-	sameFileBare := make(map[string]int64, len(bareBest))
+	sameFileBare := make(map[string]int, len(bareBest))
 	for name, hit := range bareBest {
-		nodeIDMap[name] = hit.id
-		sameFileBare[name] = hit.id
+		nodeIdx[name] = hit.idx
+		sameFileBare[name] = hit.idx
+	}
+
+	// ph(i) is the batch placeholder id for dbNodes[i] (negative; resolved to
+	// the real row id inside ReplaceFileIndex's transaction).
+	ph := func(i int) int64 { return -int64(i + 1) }
+
+	dbEdges := make([]db.Edge, 0, len(edges)+len(routes))
+	var parks []db.UnresolvedRef
+	link := func(from int, targetName string, line, col int, kind string) {
+		if from < 0 || targetName == "" {
+			return
+		}
+		if tid, ok := sameFileBare[targetName]; ok && tid > 0 {
+			dbEdges = append(dbEdges, db.Edge{
+				SourceID:   ph(from),
+				TargetID:   ph(tid),
+				Kind:       kind,
+				File:       store,
+				Line:       line,
+				Col:        col,
+				Provenance: "exact",
+			})
+			return
+		}
+		if !ShouldParkRef(o.db, targetName) {
+			return
+		}
+		parks = append(parks, db.UnresolvedRef{
+			FromNode:      ph(from),
+			ReferenceName: targetName,
+			ReferenceKind: kind,
+			Line:          line,
+			Col:           col,
+			FilePath:      store,
+			Language:      lang,
+			Status:        "pending",
+			NameTail:      NameTail(targetName),
+		})
 	}
 
 	// Route → handler: same-file edge now; cross-file → unresolved_refs.
@@ -488,82 +540,91 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 			continue
 		}
 		routeKey := fmt.Sprintf("%s:%d", route.Method+" "+route.Path, route.Line)
-		routeID, ok := nodeIDMap[routeKey]
+		routeIdx, ok := nodeIdx[routeKey]
 		if !ok {
 			continue
 		}
-		o.linkSameFileOrPark(routeID, handler, sameFileBare, store, lang, route.Line, 0, db.EdgeReferences)
+		link(routeIdx, handler, route.Line, 0, db.EdgeReferences)
+	}
+
+	// Pre-resolve import targets: module nodes live outside this file, so they
+	// are looked up / created before the batch transaction; the batch then
+	// references them by real id.
+	importTarget := make(map[int]int64, len(edges))
+	for i, e := range edges {
+		if e.Kind != "imports" {
+			continue
+		}
+		targetNodes, gerr := o.db.GetNodeByName(e.TargetName)
+		if gerr != nil {
+			log.Printf("lookup import target %s: %v", e.TargetName, gerr)
+		}
+		var targetID int64
+		if len(targetNodes) > 0 {
+			// Prefer a module node so import edges don't attach to a
+			// same-named function/class by accident.
+			targetID = targetNodes[0].ID
+			for _, tn := range targetNodes {
+				if tn.Kind == "module" {
+					targetID = tn.ID
+					break
+				}
+			}
+		} else {
+			targetID, gerr = o.db.UpsertNode(&db.Node{
+				Kind:     "module",
+				Name:     e.TargetName,
+				File:     e.TargetName,
+				Line:     0,
+				Language: lang,
+			})
+			if gerr != nil {
+				log.Printf("upsert import module %s: %v", e.TargetName, gerr)
+			}
+		}
+		if targetID > 0 {
+			importTarget[i] = targetID
+		}
 	}
 
 	// Structural edges (imports, etc.)
-	for _, e := range edges {
+	for i, e := range edges {
 		if e.Kind == "imports" {
-			targetNodes, err := o.db.GetNodeByName(e.TargetName)
-			if err != nil {
-				log.Printf("lookup import target %s: %v", e.TargetName, err)
-			}
-			var targetID int64
-			if len(targetNodes) > 0 {
-				// Prefer a module node so import edges don't attach to a
-				// same-named function/class by accident.
-				targetID = targetNodes[0].ID
-				for _, tn := range targetNodes {
-					if tn.Kind == "module" {
-						targetID = tn.ID
-						break
-					}
-				}
-			} else {
-				targetID, err = o.db.UpsertNode(&db.Node{
-					Kind:     "module",
-					Name:     e.TargetName,
-					File:     e.TargetName,
-					Line:     0,
-					Language: lang,
-				})
-				if err != nil {
-					log.Printf("upsert import module %s: %v", e.TargetName, err)
-				}
-			}
-			if targetID > 0 && fileNodeID > 0 {
-				if _, err := o.db.UpsertEdge(&db.Edge{
-					SourceID:   fileNodeID,
-					TargetID:   targetID,
+			if tid := importTarget[i]; tid > 0 {
+				dbEdges = append(dbEdges, db.Edge{
+					SourceID:   ph(0),
+					TargetID:   tid,
 					Kind:       "imports",
 					File:       store,
 					Line:       e.Line,
 					Provenance: "exact",
-				}); err != nil {
-					log.Printf("upsert import edge %s: %v", e.TargetName, err)
-				}
+				})
 			}
 			continue
 		}
-
-		// Any leftover non-import edges (extends/implements/calls not promoted).
-		sourceID := o.resolveSourceID(e.SourceName, e.Line, nodeIDMap, fileNodeID)
-		if sourceID == 0 {
+		srcIdx := o.resolveSourceIdx(e.SourceName, e.Line, nodeIdx)
+		if srcIdx < 0 {
 			continue
 		}
 		if e.Kind == "calls" {
-			o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, store, lang, e.Line, e.Col, db.EdgeCalls)
+			link(srcIdx, e.TargetName, e.Line, e.Col, db.EdgeCalls)
 			continue
 		}
 		// extends/implements: same-file only for now; else park.
-		o.linkSameFileOrPark(sourceID, e.TargetName, sameFileBare, store, lang, e.Line, e.Col, e.Kind)
+		link(srcIdx, e.TargetName, e.Line, e.Col, e.Kind)
 	}
 
 	// Pending call/type refs from extractors.
 	for _, ref := range refs {
-		sourceID := o.resolveSourceID(ref.FromName, ref.FromLine, nodeIDMap, fileNodeID)
-		if sourceID == 0 {
-			sourceID = fileNodeID
+		srcIdx := o.resolveSourceIdx(ref.FromName, ref.FromLine, nodeIdx)
+		if srcIdx < 0 {
+			srcIdx = 0 // file node
 		}
 		kind := ref.ReferenceKind
 		if kind == "" {
 			kind = db.EdgeCalls
 		}
-		o.linkSameFileOrPark(sourceID, ref.ReferenceName, sameFileBare, store, lang, ref.Line, ref.Col, kind)
+		link(srcIdx, ref.ReferenceName, ref.Line, ref.Col, kind)
 	}
 
 	// Cross-language bridges: same-file source; target may be foreign placeholder
@@ -575,7 +636,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 		if targetName == "" {
 			continue
 		}
-		sourceID := int64(0)
+		srcIdx := -1
 		bestLine := -1
 		for _, n := range nodes {
 			if n.Kind != "function" && n.Kind != "method" {
@@ -586,80 +647,96 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 				end = n.Line
 			}
 			if n.Line <= bridge.Line && bridge.Line <= end && n.Line >= bestLine {
-				if id, ok := nodeIDMap[fmt.Sprintf("%s:%d", n.Name, n.Line)]; ok {
-					sourceID = id
+				if idx, ok := nodeIdx[fmt.Sprintf("%s:%d", n.Name, n.Line)]; ok {
+					srcIdx = idx
 					bestLine = n.Line
 				}
 			}
 		}
-		if sourceID == 0 {
-			sourceID = fileNodeID
+		if srcIdx < 0 {
+			srcIdx = 0 // file node
 		}
-		// Prefer same-file target; else park as unresolved (no more heuristic cross-file).
-		if tid, ok := sameFileBare[targetName]; ok && tid > 0 {
-			if _, err := o.db.UpsertEdge(&db.Edge{
-				SourceID:   sourceID,
-				TargetID:   tid,
-				Kind:       "bridge",
-				File:       store,
-				Line:       bridge.Line,
-				Provenance: "exact",
-			}); err != nil {
-				log.Printf("upsert bridge edge %s: %v", targetName, err)
-			}
-		} else {
-			o.parkUnresolved(sourceID, targetName, "bridge", store, lang, bridge.Line, 0)
-		}
+		link(srcIdx, targetName, bridge.Line, 0, "bridge")
 	}
 
-	// Record file (+ language / node count / content_hash for schema v7 fields).
-	info, err := os.Stat(path)
-	if err != nil {
-		log.Printf("stat after index %s: %v", path, err)
+	// Single-transaction replace: clear old rows + insert batch + file record.
+	fr := db.FileRecord{
+		Path:        store,
+		ContentHash: contentHash,
+		Language:    lang,
+		NodeCount:   len(nodes),
+	}
+	if info, serr := os.Stat(path); serr == nil {
+		fr.Size = info.Size()
+		fr.Mtime = float64(info.ModTime().UnixMilli())
 	} else {
-		if err := o.db.UpsertFileRecord(&db.FileRecord{
-			Path:        store,
-			Size:        info.Size(),
-			Mtime:       float64(info.ModTime().Unix()),
-			ContentHash: contentHash,
-			Language:    lang,
-			NodeCount:   len(nodes),
-		}); err != nil {
-			log.Printf("upsert file record %s: %v", store, err)
-		}
+		log.Printf("stat after index %s: %v", path, serr)
+	}
+	if _, werr := o.db.ReplaceFileIndex(store, dbNodes, dbEdges, parks, &fr); werr != nil {
+		return 0, werr
 	}
 
 	return len(nodes), nil
 }
 
-// resolveSourceID finds the enclosing symbol id for a ref/edge source name.
-func (o *Orchestrator) resolveSourceID(name string, line int, nodeIDMap map[string]int64, fileNodeID int64) int64 {
+// extractFile runs the extraction pipeline: tree-sitter preferred, regex
+// fallback when tree-sitter fails. Returns an error only when every extractor
+// failed (A4) — callers then keep the previous index for the file.
+func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, error) {
+	if o.extractFn != nil {
+		return o.extractFn(lang, source, store)
+	}
+	if ts := NewTreeSitterExtractor(lang); ts != nil {
+		res, err := ts.Extract(source, store)
+		if err == nil {
+			return res, nil
+		}
+		log.Printf("tree-sitter extraction failed for %s (%s), falling back to regex: %v", store, lang, err)
+	}
+	return NewExtractor(lang).Extract(source, store)
+}
+
+// resolveSourceIdx finds the dbNodes index for a ref/edge source name.
+// Returns 0 for the file node when name is empty, -1 when no node matches
+// (callers decide whether to skip or fall back to the file node).
+func (o *Orchestrator) resolveSourceIdx(name string, line int, nodeIdx map[string]int) int {
 	if name == "" {
-		return fileNodeID
+		return 0 // file node
 	}
 	if line > 0 {
-		if id, ok := nodeIDMap[fmt.Sprintf("%s:%d", name, line)]; ok {
-			return id
+		if idx, ok := nodeIdx[fmt.Sprintf("%s:%d", name, line)]; ok {
+			return idx
 		}
 	}
-	if id, ok := nodeIDMap[name]; ok {
-		return id
+	if idx, ok := nodeIdx[name]; ok {
+		return idx
 	}
-	// Bare name not found — no need to scan nodeIDMap linearly;
-	// splitNameLineKey would not find a better match here.
-	return 0
+	// Bare name not found — no better match exists.
+	return -1
 }
 
 // IndexChanges indexes only files that have changed since last index.
 // files are filesystem paths (absolute from watcher/git); resolution uses storage keys.
+// A6: paths that no longer exist (deleted / renamed away) drop their old index
+// rows instead of being silently skipped. A8: failures are aggregated and
+// returned; successfully indexed files keep their partial results.
 func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	totalFiles := 0
 	totalNodes := 0
 	storeKeys := make([]string, 0, len(files))
+	var errs []error
 
 	for _, path := range files {
 		info, err := os.Stat(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				// File was deleted (or renamed away): remove the stale index.
+				if derr := o.db.DeleteFile(o.storePath(path)); derr != nil {
+					errs = append(errs, fmt.Errorf("delete index %s: %w", path, derr))
+				}
+			} else {
+				errs = append(errs, fmt.Errorf("stat %s: %w", path, err))
+			}
 			continue
 		}
 		if info.IsDir() || info.Size() > maxIndexFileSize {
@@ -669,9 +746,12 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		if lang == "" || !IsSupportedLanguage(lang) {
 			continue
 		}
-		filesN, nodes := o.indexIfNeeded(path, info, lang)
+		filesN, nodes, ierr := o.indexIfNeeded(path, info, lang)
 		totalFiles += filesN
 		totalNodes += nodes
+		if ierr != nil {
+			errs = append(errs, ierr)
+		}
 		storeKeys = append(storeKeys, o.storePath(path))
 	}
 
@@ -679,7 +759,7 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		log.Printf("resolve changes: %v", err)
 	}
 	o.runSynthesis(storeKeys)
-	return totalFiles, totalNodes, nil
+	return totalFiles, totalNodes, errors.Join(errs...)
 }
 
 // ProgressFunc is called during indexing to report progress.
@@ -697,7 +777,7 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 		return 0, 0, err
 	}
 	totalCandidates := len(jobs)
-	indexedFiles, indexedNodes := o.runIndexJobs(jobs, func(done, total int) {
+	indexedFiles, indexedNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if onProgress != nil && (done%10 == 0 || done == total) {
 			onProgress("indexing", done, totalCandidates)
 		}
@@ -714,5 +794,5 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	log.Printf("indexing complete: %d files, %d nodes, %d pending refs in %v (workers=%d)",
 		indexedFiles, indexedNodes, pending, elapsed, indexWorkerCount())
 
-	return indexedFiles, indexedNodes, nil
+	return indexedFiles, indexedNodes, jerr
 }

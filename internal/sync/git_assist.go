@@ -24,46 +24,52 @@ func GitDirtySourceFiles(workdir string) []string {
 		if len(line) < 4 {
 			continue
 		}
-		// XY<path>  or XY orig -> path (renames)
+		// XY<path>  or XY orig -> path (renames). For renames BOTH paths are
+		// dirty: the old path must be dropped from the index and the new one
+		// indexed (IndexChanges deletes old paths via os.Stat failure — A6).
 		pathPart := strings.TrimSpace(line[2:])
+		oldPath := ""
 		if i := strings.Index(pathPart, " -> "); i >= 0 {
+			oldPath = strings.TrimSpace(pathPart[:i])
 			pathPart = pathPart[i+4:]
 		}
-		pathPart = strings.Trim(pathPart, "\"")
-		pathPart = strings.ReplaceAll(pathPart, "\\\"", "\"")
-		if pathPart == "" {
-			continue
-		}
-		abs := pathPart
-		if !filepath.IsAbs(abs) {
-			abs = filepath.Join(workdir, pathPart)
-		}
-		abs = filepath.Clean(abs)
-		if _, ok := seen[abs]; ok {
-			continue
-		}
-		if !IsSupported(abs) {
-			continue
-		}
-		// Skip dependency/generated trees.
-		baseWalk := abs
-		skip := false
-		for {
-			dir := filepath.Dir(baseWalk)
-			if dir == baseWalk || dir == workdir {
-				break
+		for _, p := range []string{oldPath, pathPart} {
+			p = strings.Trim(p, "\"")
+			p = strings.ReplaceAll(p, "\\\"", "\"")
+			if p == "" {
+				continue
 			}
-			if extraction.ShouldSkipDirIn(workdir, dir, filepath.Base(dir)) {
-				skip = true
-				break
+			abs := p
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(workdir, p)
 			}
-			baseWalk = dir
+			abs = filepath.Clean(abs)
+			if _, ok := seen[abs]; ok {
+				continue
+			}
+			if !IsSupported(abs) {
+				continue
+			}
+			// Skip dependency/generated trees.
+			baseWalk := abs
+			skip := false
+			for {
+				dir := filepath.Dir(baseWalk)
+				if dir == baseWalk || dir == workdir {
+					break
+				}
+				if extraction.ShouldSkipDirIn(workdir, dir, filepath.Base(dir)) {
+					skip = true
+					break
+				}
+				baseWalk = dir
+			}
+			if skip {
+				continue
+			}
+			seen[abs] = struct{}{}
+			files = append(files, abs)
 		}
-		if skip {
-			continue
-		}
-		seen[abs] = struct{}{}
-		files = append(files, abs)
 	}
 	return files
 }

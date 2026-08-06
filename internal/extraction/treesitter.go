@@ -90,13 +90,15 @@ func NewTreeSitterExtractor(language string) *TreeSitterExtractor {
 }
 
 // Extract parses the source code and returns nodes and edges using tree-sitter.
-func (e *TreeSitterExtractor) Extract(source string, filePath string) ExtractResult {
+// A parse failure returns a non-nil error so callers can fall back to the
+// regex extractor and/or keep the previous index instead of wiping it.
+func (e *TreeSitterExtractor) Extract(source string, filePath string) (ExtractResult, error) {
 	if e.lang == nil {
-		return ExtractResult{}
+		return ExtractResult{}, fmt.Errorf("tree-sitter: no grammar for language %q", e.language)
 	}
 	pool := getParserPool(e.language)
 	if pool == nil {
-		return ExtractResult{}
+		return ExtractResult{}, fmt.Errorf("tree-sitter: no parser pool for language %q", e.language)
 	}
 	parser := pool.Get().(*sitter.Parser)
 	defer pool.Put(parser)
@@ -104,7 +106,7 @@ func (e *TreeSitterExtractor) Extract(source string, filePath string) ExtractRes
 	sourceBytes := []byte(source)
 	tree, err := parser.ParseCtx(context.Background(), nil, sourceBytes)
 	if err != nil {
-		return ExtractResult{}
+		return ExtractResult{}, fmt.Errorf("tree-sitter parse %s: %w", e.language, err)
 	}
 	defer tree.Close()
 
@@ -132,9 +134,9 @@ func (e *TreeSitterExtractor) Extract(source string, filePath string) ExtractRes
 	case "lua":
 		nodes, edges = e.extractLua(root, sourceBytes, filePath)
 	default:
-		return ExtractResult{}
+		return ExtractResult{}, fmt.Errorf("tree-sitter: unsupported language %q", e.language)
 	}
-	return promoteCallsToRefs(nodes, edges, filePath, e.language)
+	return promoteCallsToRefs(nodes, edges, filePath, e.language), nil
 }
 
 // ---------- Go extraction ----------
