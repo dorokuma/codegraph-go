@@ -80,9 +80,10 @@ func TestContentHashSkipUnchanged(t *testing.T) {
 // TestIndexIfNeededAndIndexFileConsistent verifies F4: the two entry paths
 // (indexIfNeeded with its metadata/content-hash gate, and a direct indexFile)
 // must produce identical DB state for identical bytes, and indexIfNeeded must
-// skip cleanly when nothing changed. The bytes read for the hash gate are the
-// same bytes indexFile indexes (no second read), so stored hashes always match
-// the indexed content.
+// skip cleanly when nothing changed. Stored hashes always match the indexed
+// content. The single-read property (hash-gate bytes handed to indexFile, no
+// second read) is verified by TestIndexIfNeededSingleReadSameSizeMtime, which
+// counts file reads through the readFileFn seam.
 func TestIndexIfNeededAndIndexFileConsistent(t *testing.T) {
 	root := t.TempDir()
 	database, err := db.Open(root)
@@ -99,8 +100,8 @@ func TestIndexIfNeededAndIndexFileConsistent(t *testing.T) {
 	orch := NewOrchestrator(database, root)
 	key := db.StoragePath(root, src)
 
-	// Path 1: indexIfNeeded (metadata unchanged → hash gate → reindex with
-	// the already-read bytes).
+	// Path 1: indexIfNeeded on a fresh file — no stored meta yet, so the
+	// metadata gate reports stale and indexFile reads the file itself.
 	info, err := os.Stat(src)
 	if err != nil {
 		t.Fatal(err)
@@ -172,4 +173,88 @@ func nodesInDB(t *testing.T, database *db.DB, key string) int {
 		t.Fatal(err)
 	}
 	return len(ns)
+}
+
+// TestIndexIfNeededSingleReadSameSizeMtime is the F4 regression test: when a
+// file's content changes but size and mtime stay the same (the cheap metadata
+// gate cannot see the edit), the content-hash gate must read the file once and
+// hand those exact bytes to indexFile — the file is reindexed AND read exactly
+// once during the pass (no second read for extraction). Before the fix,
+// indexIfNeeded's inner `data, rerr := os.ReadFile(path)` shadowed the outer
+// data with a new variable, so indexFile received nil and read the file again.
+func TestIndexIfNeededSingleReadSameSizeMtime(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	orch := NewOrchestrator(database, root)
+
+	// v1: index content A through the full IndexAll path.
+	src := filepath.Join(root, "a.go")
+	v1 := []byte("package p\nfunc Hello() {}\n")
+	if err := os.WriteFile(src, v1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files, nodes, err := orch.IndexAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 1 || nodes == 0 {
+		t.Fatalf("initial IndexAll: files=%d nodes=%d", files, nodes)
+	}
+	key := db.StoragePath(root, src)
+	hash1, err := database.GetFileContentHash(key)
+	if err != nil || hash1 != hashContent(v1) {
+		t.Fatalf("stored hash after v1: %q err=%v", hash1, err)
+	}
+
+	// v2: same length, different content, mtime pinned back to the exact value
+	// stored for v1 — size+mtime unchanged, only the bytes differ.
+	v2 := []byte("package p\nfunc World() {}\n")
+	if len(v2) != len(v1) {
+		t.Fatal("test requires equal-length v1/v2 bodies")
+	}
+	storedMtime, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, v2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, storedMtime.ModTime(), storedMtime.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	info2, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info2.Size() != storedMtime.Size() || info2.ModTime().UnixMilli() != storedMtime.ModTime().UnixMilli() {
+		t.Fatal("test setup failed: v2 must keep v1's size and mtime")
+	}
+
+	// Count reads: the reindex pass must read the file exactly once — the
+	// hash gate's read is reused by indexFile (F4), so extraction never
+	// triggers a second os.ReadFile.
+	reads := 0
+	orch.readFileFn = func(path string) ([]byte, error) {
+		reads++
+		return os.ReadFile(path)
+	}
+	files2, nodes2, err := orch.IndexAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files2 != 1 || nodes2 == 0 {
+		t.Fatalf("same-size same-mtime edit must reindex: files=%d nodes=%d", files2, nodes2)
+	}
+	if reads != 1 {
+		t.Fatalf("F4: expected exactly 1 file read (hash gate + index share it), got %d", reads)
+	}
+	hash2, err := database.GetFileContentHash(key)
+	if err != nil || hash2 != hashContent(v2) {
+		t.Fatalf("stored hash after v2: %q err=%v (want %q)", hash2, err, hashContent(v2))
+	}
 }

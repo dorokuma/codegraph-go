@@ -266,3 +266,74 @@ func Caller() { Missing() }
 	}
 	assertGraphCall(t, database, "Caller", "Missing")
 }
+
+// TestResolveForFilesEmptyTailChangedNames verifies S2: a row with
+// name_tail=” and reference_name holding the full qualified name ("pkg.Foo")
+// must be retried when a changed file defines the bare tail symbol ("Foo"),
+// matching the pre-F1 Go scan. The SQL pushdown alone cannot see this row
+// (reference_name "pkg.Foo" ∉ names, name_tail ” ∉ names); the empty-tail
+// supplement in ResolveForFiles re-applies nameTail matching in Go.
+func TestResolveForFilesEmptyTailChangedNames(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "caller.go"), []byte(`package p
+func Caller() { _ = 1 }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	orch := extraction.NewOrchestrator(database, dir)
+	if _, err := orch.IndexFile(filepath.Join(dir, "caller.go")); err != nil {
+		t.Fatal(err)
+	}
+	callerKey := db.StoragePath(dir, filepath.Join(dir, "caller.go"))
+	callers, err := database.GetNodesByFile(callerKey)
+	if err != nil || len(callers) == 0 {
+		t.Fatalf("caller nodes missing: %v", err)
+	}
+	var callerID int64
+	for _, n := range callers {
+		if n.Name == "Caller" {
+			callerID = n.ID
+		}
+	}
+	if callerID == 0 {
+		t.Fatalf("Caller node missing in %+v", callers)
+	}
+
+	// Historical/anomalous row: full qualified reference name, empty tail.
+	if _, err := database.InsertUnresolvedRef(&db.UnresolvedRef{
+		FromNode:      callerID,
+		ReferenceName: "pkg.Foo",
+		ReferenceKind: db.EdgeCalls,
+		Line:          2,
+		FilePath:      callerKey,
+		Language:      "go",
+		Status:        "pending",
+		NameTail:      "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Changed file defines the bare tail symbol only.
+	if _, err := database.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "Foo", File: "target.go", Line: 1, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := resolution.ResolveForFiles(database, dir, []string{"target.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Resolved != 1 {
+		t.Fatalf("expected the empty-tail ref to resolve via changedNames branch, got %+v", st)
+	}
+	if n, _ := database.CountUnresolvedRefs(""); n != 0 {
+		t.Fatalf("expected the ref row to be deleted after resolution, got %d remaining", n)
+	}
+	assertGraphCall(t, database, "Caller", "Foo")
+}

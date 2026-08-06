@@ -213,6 +213,31 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 				st.Retried++
 			}
 		}
+		// S2 (F1 regression): the SQL pushdown matches stored name_tail
+		// exactly, but historical/anomalous rows may carry name_tail='' while
+		// reference_name holds the full qualified name (e.g. "pkg.Foo") and
+		// the changed symbol is the bare tail ("Foo"). The old full-table Go
+		// scan matched those via nameTail(reference_name); re-apply that for
+		// empty-tail rows only — the SQL branches above already cover every
+		// non-empty tail row and every reference_name exact match.
+		emptyTail, err := database.ListUnresolvedRefsEmptyTail([]string{"pending", "failed"})
+		if err != nil {
+			return st, err
+		}
+		for _, r := range emptyTail {
+			if want[r.FilePath] {
+				continue // already queued via ByFiles
+			}
+			if changedNames[r.ReferenceName] {
+				continue // already returned by the reference_name IN branch
+			}
+			if changedNames[nameTail(r.ReferenceName)] {
+				batch = append(batch, r)
+				if r.Status == "failed" {
+					st.Retried++
+				}
+			}
+		}
 	}
 	// Dedupe by id
 	seen := map[int64]bool{}

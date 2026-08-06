@@ -635,6 +635,65 @@ func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]Unr
 	return out, nil
 }
 
+// ListUnresolvedRefsEmptyTail returns unresolved_refs rows whose name_tail is
+// empty (historical/anomalous rows that store the full qualified name in
+// reference_name), optionally filtered by status (empty statuses = no status
+// filter). The F1 SQL pushdown in ListUnresolvedRefsByNames matches stored
+// name_tail exactly and cannot see these rows through their tail segment;
+// callers re-apply nameTail(reference_name) matching in Go (S2). Empty-tail
+// rows are rare, so this is deliberately a simple filtered scan (it can use
+// idx_unresolved_status); the normal extraction path always writes a non-empty
+// name_tail and is never touched by it.
+func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if len(statuses) == 0 {
+		statuses = []string{""}
+	}
+	var out []UnresolvedRef
+	seen := make(map[int64]bool)
+	for _, status := range statuses {
+		prefix := ""
+		var statusArgs []interface{}
+		switch status {
+		case "pending", "failed":
+			prefix = "status = '" + status + "' AND "
+		case "":
+			// no status filter
+		default:
+			prefix = "status = ? AND "
+			statusArgs = []interface{}{status}
+		}
+		rows, err := d.conn.Query(`
+			SELECT id, from_node, reference_name, reference_kind, line, col,
+				file_path, language, status, name_tail, COALESCE(candidates,'')
+			FROM unresolved_refs WHERE `+prefix+`name_tail = ''`, statusArgs...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var r UnresolvedRef
+			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if seen[r.ID] {
+				continue
+			}
+			seen[r.ID] = true
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
 // GetEdgeByEndpoints loads one edge by endpoints + kind (for tests / inspection).
 func (d *DB) GetEdgeByEndpoints(sourceID, targetID int64, kind string) (*Edge, error) {
 	d.mu.RLock()
@@ -1163,10 +1222,14 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 	// edges requires the target rows to exist within the transaction.
 	moduleIDs := make([]int64, len(moduleNodes))
 	for i, n := range moduleNodes {
+		// S3/F5: on conflict refresh language (excluded.language), matching the
+		// old UpsertNode DO UPDATE semantics the pre-batch path used — a
+		// re-imported module from another language must not keep stale meta.
 		if _, err := tx.Exec(`
 			INSERT INTO nodes (kind, name, file, line, language)
 			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT(file, line, kind, name) DO NOTHING
+			ON CONFLICT(file, line, kind, name) DO UPDATE SET
+				language = excluded.language
 		`, n.Kind, n.Name, n.File, n.Line, n.Language); err != nil {
 			return nil, fmt.Errorf("replace file insert module node %s: %w", n.Name, err)
 		}

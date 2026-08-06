@@ -1200,4 +1200,20 @@ func TestReplaceFileIndexModuleNodesAtomic(t *testing.T) {
 	if err != nil || len(mods) != 1 {
 		t.Fatalf("successful module node must survive, got %+v err=%v", mods, err)
 	}
+
+	// S3/F5: a conflicting module node (same conflict key) must refresh its
+	// language like the old UpsertNode DO UPDATE, not silently keep the
+	// stale value.
+	_, err = database.ReplaceFileIndex("c.go", []Node{{Kind: KindFile, Name: "c.go", File: "c.go", Line: 0, Language: "go"}}, nil, nil, fr,
+		Node{Kind: "module", Name: "mod/ok", File: "mod/ok", Line: 0, Language: "rust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mods, err = database.GetNodeByName("mod/ok")
+	if err != nil || len(mods) != 1 {
+		t.Fatalf("conflicting module node must still resolve, got %+v err=%v", mods, err)
+	}
+	if mods[0].Language != "rust" {
+		t.Fatalf("conflicting module node must refresh language, got %+v", mods)
+	}
 }

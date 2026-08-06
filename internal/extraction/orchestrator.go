@@ -40,6 +40,12 @@ type Orchestrator struct {
 	// by the keep-old-index decision (S1). Test seam for the count-query
 	// failure path.
 	nodeCountFn func(path string) (int, error)
+
+	// readFileFn replaces os.ReadFile in the content-hash gate and in
+	// indexFile's nil-data path (F4 test seam): lets tests count how many
+	// times a file is read on one pass and assert the hash-gate bytes are the
+	// same bytes indexFile indexes (no second read).
+	readFileFn func(path string) ([]byte, error)
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -179,7 +185,11 @@ func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string)
 			return 0, 0, err
 		}
 		if !needsReindex {
-			data, rerr := os.ReadFile(path)
+			// F4: assign to the outer data (declared above), NOT := — a new
+			// inner variable would shadow it and indexFile would re-read the
+			// file instead of reusing these bytes.
+			var rerr error
+			data, rerr = o.readFile(path)
 			if rerr != nil {
 				return 0, 0, rerr
 			}
@@ -401,6 +411,14 @@ func hashContent(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// readFile returns file contents, honoring the readFileFn test seam.
+func (o *Orchestrator) readFile(path string) ([]byte, error) {
+	if o.readFileFn != nil {
+		return o.readFileFn(path)
+	}
+	return os.ReadFile(path)
+}
+
 // indexFile extracts and writes the index for one file. data, when non-nil,
 // is the file content already read by the caller (indexIfNeeded's content-hash
 // gate, F4) and is reused instead of reading the file a second time; nil means
@@ -409,7 +427,7 @@ func hashContent(data []byte) string {
 func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, error) {
 	if data == nil {
 		var err error
-		data, err = os.ReadFile(path)
+		data, err = o.readFile(path)
 		if err != nil {
 			return 0, err
 		}

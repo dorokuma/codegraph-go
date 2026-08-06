@@ -107,7 +107,16 @@ func TestRescanAllQueuesSourceFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w := &Watcher{workdir: dir, pending: map[string]time.Time{}}
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	orch := extraction.NewOrchestrator(database, dir)
+	w, err := NewWatcher(orch, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.rescanAll()
 
 	pending := w.PendingFiles()
@@ -120,6 +129,60 @@ func TestRescanAllQueuesSourceFiles(t *testing.T) {
 	}
 	if got["skip.md"] {
 		t.Fatalf("non-source file must not be queued, got %v", pending)
+	}
+	w.Stop()
+}
+
+// TestRescanAllRegistersNewDirs verifies S1: the overflow rescan must
+// (re)register directories with the fsnotify watcher. A directory created
+// during the overflow window would otherwise be a permanent blind spot — its
+// files get queued once, but later edits inside it never produce events.
+func TestRescanAllRegistersNewDirs(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	orch := extraction.NewOrchestrator(database, dir)
+	w, err := NewWatcher(orch, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// A directory that appears AFTER Start (e.g. created during the overflow
+	// window) is not watched yet.
+	newDir := filepath.Join(dir, "newpkg")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "a.go"), []byte("package newpkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w.rescanAll()
+
+	watched := map[string]bool{}
+	for _, p := range w.watcher.WatchList() {
+		watched[p] = true
+	}
+	if !watched[newDir] {
+		t.Fatalf("rescanAll must register %s in the watch set, got %v", newDir, watched)
+	}
+	// Its source files must be queued for reindexing too.
+	pending := w.PendingFiles()
+	found := false
+	for _, p := range pending {
+		if filepath.Base(p) == "a.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected newpkg/a.go queued by rescanAll, got %v", pending)
 	}
 }
 

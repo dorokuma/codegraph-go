@@ -168,26 +168,14 @@ func (w *Watcher) watchTree(root string) {
 // reindexing through the normal pending/debounce path (processPending →
 // IndexChanges). Used when fsnotify reports ErrEventOverflow: events may have
 // been lost, so a full sweep is the only way to guarantee no change is missed.
+// S1: the sweep reuses watchTree's semantics — directories encountered by the
+// walk are (re)registered with the fsnotify watcher before their source files
+// go to pending. A directory created during the overflow window would
+// otherwise never be watched (its events were dropped along with the create),
+// a permanent blind spot; re-adding matches the normal Start/walk path and is
+// a no-op for already-watched dirs.
 func (w *Watcher) rescanAll() {
-	_ = filepath.Walk(w.workdir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		lang := extraction.DetectLanguage(path)
-		if lang == "" || !extraction.IsSupportedLanguage(lang) {
-			return nil
-		}
-		w.mu.Lock()
-		w.pending[path] = time.Now()
-		w.mu.Unlock()
-		return nil
-	})
+	w.watchTree(w.workdir)
 }
 
 func (w *Watcher) processPending() {
