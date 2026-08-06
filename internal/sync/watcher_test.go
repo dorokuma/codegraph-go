@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
 )
@@ -84,4 +86,83 @@ func TestWatchTreeQueuesSourceFiles(t *testing.T) {
 		t.Fatalf("expected a.go queued, got %v", pending)
 	}
 	w.Stop()
+}
+
+// TestRescanAllQueuesSourceFiles verifies F3's rescan helper: every supported
+// source file under the watch root is queued into pending (skipped dirs and
+// non-source files excluded) so the debounce path reindexes them.
+func TestRescanAllQueuesSourceFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "b.ts"), []byte("export const b = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skip.md"), []byte("nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Watcher{workdir: dir, pending: map[string]time.Time{}}
+	w.rescanAll()
+
+	pending := w.PendingFiles()
+	got := map[string]bool{}
+	for _, p := range pending {
+		got[filepath.ToSlash(p)] = true
+	}
+	if !got["a.go"] || !got["pkg/b.ts"] {
+		t.Fatalf("expected a.go and pkg/b.ts queued, got %v", pending)
+	}
+	if got["skip.md"] {
+		t.Fatalf("non-source file must not be queued, got %v", pending)
+	}
+}
+
+// TestOverflowTriggersRescan verifies F3 end to end: when fsnotify reports
+// ErrEventOverflow on the Errors channel, the watcher must trigger a full
+// rescan (all supported files land in pending) instead of only logging.
+func TestOverflowTriggersRescan(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package p\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	orch := extraction.NewOrchestrator(database, dir)
+	w, err := NewWatcher(orch, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep files queued long enough to observe them; the loop test only checks
+	// that overflow queues a rescan, not that the reindex finishes.
+	w.debounce = time.Hour
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Send the overflow error through the real Errors channel; the send blocks
+	// until the loop receives it, so this also proves the branch is reached.
+	w.watcher.Errors <- fsnotify.ErrEventOverflow
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, p := range w.PendingFiles() {
+			if p == "a.go" {
+				return // overflow triggered the rescan
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ErrEventOverflow did not trigger a full rescan (a.go never queued)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

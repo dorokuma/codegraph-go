@@ -193,27 +193,24 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		}
 	}
 	if len(changedNames) > 0 {
-		pending, err := database.ListUnresolvedRefs("", "pending")
+		// F1: push the name filter down to SQL — matching is exact equality on
+		// reference_name / name_tail (the map lookup below used to run against
+		// a full-table ListUnresolvedRefs("", status) scan in Go).
+		names := make([]string, 0, len(changedNames))
+		for n := range changedNames {
+			names = append(names, n)
+		}
+		refs, err := database.ListUnresolvedRefsByNames(names, []string{"pending", "failed"})
 		if err != nil {
 			return st, err
 		}
-		failed, err := database.ListUnresolvedRefs("", "failed")
-		if err != nil {
-			return st, err
-		}
-		for _, r := range append(pending, failed...) {
+		for _, r := range refs {
 			if want[r.FilePath] {
 				continue // already queued via ByFiles
 			}
-			tail := r.NameTail
-			if tail == "" {
-				tail = nameTail(r.ReferenceName)
-			}
-			if changedNames[r.ReferenceName] || changedNames[tail] {
-				batch = append(batch, r)
-				if r.Status == "failed" {
-					st.Retried++
-				}
+			batch = append(batch, r)
+			if r.Status == "failed" {
+				st.Retried++
 			}
 		}
 	}

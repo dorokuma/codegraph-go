@@ -539,6 +539,102 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 	return out, rows.Err()
 }
 
+// ListUnresolvedRefsByNames returns unresolved_refs rows whose reference_name
+// or name_tail exactly matches one of names, optionally filtered by status
+// (empty statuses = no status filter). The name filter is pushed down to SQL
+// instead of loading every row and matching in Go (F1), reusing
+// idx_unresolved_name and idx_unresolved_failed_tail. Names are chunked so
+// the IN lists stay under SQLite's variable-number ceiling; a row matching
+// both branches is returned once.
+func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]UnresolvedRef, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	const maxNamesPerChunk = 400 // 2 IN lists x 400 + 1 status arg stays under SQLite's 999-var cap
+	selectCols := `SELECT id, from_node, reference_name, reference_kind, line, col,
+		file_path, language, status, name_tail, COALESCE(candidates,'')
+		FROM unresolved_refs`
+
+	run := func(where string, args []interface{}) ([]UnresolvedRef, error) {
+		rows, err := d.conn.Query(where, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []UnresolvedRef
+		for rows.Next() {
+			var r UnresolvedRef
+			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		return out, rows.Err()
+	}
+
+	var out []UnresolvedRef
+	seen := make(map[int64]bool)
+	add := func(rows []UnresolvedRef) {
+		for _, r := range rows {
+			if seen[r.ID] {
+				continue
+			}
+			seen[r.ID] = true
+			out = append(out, r)
+		}
+	}
+
+	if len(statuses) == 0 {
+		statuses = []string{""}
+	}
+	for _, status := range statuses {
+		// Split the name match into two index-friendly branches instead of one
+		// OR query: reference_name IN (...) can use idx_unresolved_name, and
+		// name_tail IN (...) can use idx_unresolved_failed_tail for failed
+		// refs. Known statuses are inlined as literals so the partial index
+		// (WHERE status = 'failed') stays usable by the planner.
+		prefix := ""
+		var statusArgs []interface{}
+		switch status {
+		case "pending", "failed":
+			prefix = "status = '" + status + "' AND "
+		case "":
+			// no status filter
+		default:
+			prefix = "status = ? AND "
+			statusArgs = []interface{}{status}
+		}
+		for start := 0; start < len(names); start += maxNamesPerChunk {
+			end := start + maxNamesPerChunk
+			if end > len(names) {
+				end = len(names)
+			}
+			chunk := names[start:end]
+			ph := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+			args := make([]interface{}, 0, len(chunk)+len(statusArgs))
+			args = append(args, statusArgs...)
+			for _, n := range chunk {
+				args = append(args, n)
+			}
+			nameRows, err := run(selectCols+" WHERE "+prefix+`reference_name IN (`+ph+`)`, args)
+			if err != nil {
+				return nil, err
+			}
+			add(nameRows)
+			tailRows, err := run(selectCols+" WHERE "+prefix+`name_tail IN (`+ph+`)`, args)
+			if err != nil {
+				return nil, err
+			}
+			add(tailRows)
+		}
+	}
+	return out, nil
+}
+
 // GetEdgeByEndpoints loads one edge by endpoints + kind (for tests / inspection).
 func (d *DB) GetEdgeByEndpoints(sourceID, targetID int64, kind string) (*Edge, error) {
 	d.mu.RLock()
@@ -709,6 +805,47 @@ func (d *DB) DeleteSynthesizedEdges() error {
 		  AND metadata LIKE '%synthesizedBy%'
 	`)
 	return err
+}
+
+// ReplaceSynthesizedEdges atomically replaces all synthesized edges in one
+// transaction (F2): it deletes the old heuristic/synthesizedBy edges and then
+// upserts the new edge set. Previously the delete and the per-edge upserts ran
+// in separate autocommit transactions, so a mid-batch failure left a partially
+// cleared graph and, between delete and first upsert, a window where the
+// synthesized edges were missing entirely. On any error the whole batch rolls
+// back and the old synthesized edges stay intact.
+func (d *DB) ReplaceSynthesizedEdges(edges []Edge) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+		DELETE FROM edges
+		WHERE provenance = 'heuristic'
+		  AND metadata IS NOT NULL
+		  AND metadata LIKE '%synthesizedBy%'
+	`); err != nil {
+		return fmt.Errorf("replace synthesized edges delete: %w", err)
+	}
+	for _, e := range edges {
+		if _, err := tx.Exec(`
+			INSERT INTO edges (source_id, target_id, kind, file, line, col, provenance, metadata)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(source_id, target_id, kind, line, col) DO UPDATE SET
+				col = excluded.col,
+				file = excluded.file,
+				provenance = excluded.provenance,
+				metadata = excluded.metadata
+		`, e.SourceID, e.TargetID, e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata); err != nil {
+			return fmt.Errorf("replace synthesized edges upsert: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // GetNodeByFileLine finds the node at a specific file:line position.
@@ -1005,7 +1142,14 @@ func (d *DB) ClearFile(path string) error {
 // Edges and refs may reference nodes of this same batch before they exist by
 // using negative placeholder ids: -(i+1) refers to nodes[i]. Positive ids are
 // used verbatim (e.g. module nodes created before the transaction).
-func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []UnresolvedRef, fileRecord *FileRecord) ([]int64, error) {
+//
+// moduleNodes (F5): module nodes are upserted inside this same transaction
+// (INSERT ... ON CONFLICT DO NOTHING, then SELECT id, reusing UpsertNode's
+// conflict key), so a failed batch rolls them back and leaves no orphaned
+// module nodes. Edges may reference them with placeholders
+// -(len(nodes)+i+1) for moduleNodes[i]. Existing callers that pass no module
+// nodes are unaffected.
+func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []UnresolvedRef, fileRecord *FileRecord, moduleNodes ...Node) ([]int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -1014,6 +1158,26 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	// Module nodes first (F5): edges below may reference them, and the FK on
+	// edges requires the target rows to exist within the transaction.
+	moduleIDs := make([]int64, len(moduleNodes))
+	for i, n := range moduleNodes {
+		if _, err := tx.Exec(`
+			INSERT INTO nodes (kind, name, file, line, language)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(file, line, kind, name) DO NOTHING
+		`, n.Kind, n.Name, n.File, n.Line, n.Language); err != nil {
+			return nil, fmt.Errorf("replace file insert module node %s: %w", n.Name, err)
+		}
+		var id int64
+		if err := tx.QueryRow(`
+			SELECT id FROM nodes WHERE file = ? AND line = ? AND kind = ? AND name = ?
+		`, n.File, n.Line, n.Kind, n.Name).Scan(&id); err != nil {
+			return nil, fmt.Errorf("replace file module node id lookup %s: %w", n.Name, err)
+		}
+		moduleIDs[i] = id
+	}
 
 	// Drop refs anchored on this file path (file_path column has no FK).
 	if _, err := tx.Exec(`DELETE FROM unresolved_refs WHERE file_path = ?`, store); err != nil {
@@ -1063,10 +1227,16 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 		}
 		ids[i] = id
 	}
-	// Map batch placeholder ids (negative) to the real inserted ids.
+	// Map batch placeholder ids (negative) to the real inserted ids. Values in
+	// the batch-node range -(1..len(nodes)) map to nodes; deeper negatives map
+	// to moduleNodes (F5).
 	realID := func(v int64) int64 {
 		if v < 0 {
-			return ids[-(v + 1)]
+			idx := -(v + 1)
+			if idx < int64(len(ids)) {
+				return ids[idx]
+			}
+			return moduleIDs[idx-int64(len(ids))]
 		}
 		return v
 	}

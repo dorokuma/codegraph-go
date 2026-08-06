@@ -46,7 +46,7 @@ func TestIndexFileParseFailureKeepsOldIndex(t *testing.T) {
 	}
 	defer func() { orch.extractFn = nil }()
 
-	n, err := orch.indexFile(src, "go")
+	n, err := orch.indexFile(src, "go", nil)
 	if err != nil {
 		t.Fatalf("indexFile should swallow extract failure: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestIndexFileEmptyResultClearsOldIndex(t *testing.T) {
 	}
 	defer func() { orch.extractFn = nil }()
 
-	n, err := orch.indexFile(src, "go")
+	n, err := orch.indexFile(src, "go", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
 	}
 	defer func() { orch.extractFn = nil }()
 
-	n, err := orch.indexFile(src, "go")
+	n, err := orch.indexFile(src, "go", nil)
 	if err != nil {
 		t.Fatalf("indexFile should treat ts-error+empty as recoverable: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestIndexFileTSErrorRegexEmptyCountQueryFailsKeepsOldIndex(t *testing.T) {
 		orch.nodeCountFn = nil
 	}()
 
-	n, err := orch.indexFile(src, "go")
+	n, err := orch.indexFile(src, "go", nil)
 	if err != nil {
 		t.Fatalf("indexFile should treat count-query failure as recoverable: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestIndexFileTSErrorRegexNonEmptyProceeds(t *testing.T) {
 	}
 	defer func() { orch.extractFn = nil }()
 
-	n, err := orch.indexFile(src, "go")
+	n, err := orch.indexFile(src, "go", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

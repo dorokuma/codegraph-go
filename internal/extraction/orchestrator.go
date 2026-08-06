@@ -167,8 +167,12 @@ func (o *Orchestrator) storePath(path string) string {
 // cannot see same-size same-mtime edits, so the file content is hashed and
 // compared with the stored hash — identical content skips, anything else
 // reindexes. Metadata changes reindex directly without an extra read.
+//
+// F4: the bytes read for the content-hash gate are handed to indexFile so the
+// file is never read twice on the same pass.
 func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string) (files int, nodes int, err error) {
 	key := o.storePath(path)
+	var data []byte
 	if !o.isForce() {
 		needsReindex, err := o.db.FileNeedsReindex(key, info.Size(), float64(info.ModTime().UnixMilli()))
 		if err != nil {
@@ -188,7 +192,7 @@ func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string)
 			}
 		}
 	}
-	nodeCount, err := o.indexFile(path, lang)
+	nodeCount, err := o.indexFile(path, lang, data)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -374,7 +378,7 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 	if lang == "" || !IsSupportedLanguage(lang) {
 		return 0, fmt.Errorf("unsupported language for %s", path)
 	}
-	n, err := o.indexFile(path, lang)
+	n, err := o.indexFile(path, lang, nil)
 	if err != nil {
 		return n, err
 	}
@@ -397,11 +401,18 @@ func hashContent(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
-	// Read from the real filesystem path (Walk/watcher give absolute paths).
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
+// indexFile extracts and writes the index for one file. data, when non-nil,
+// is the file content already read by the caller (indexIfNeeded's content-hash
+// gate, F4) and is reused instead of reading the file a second time; nil means
+// read from disk. contentHash is always derived from the same bytes that get
+// indexed, so the hash gate and the stored hash can never disagree.
+func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, error) {
+	if data == nil {
+		var err error
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return 0, err
+		}
 	}
 	contentHash := hashContent(data)
 	// Portable index key: workdir-relative.
@@ -584,9 +595,13 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	}
 
 	// Pre-resolve import targets: module nodes live outside this file, so they
-	// are looked up / created before the batch transaction; the batch then
-	// references them by real id.
+	// are looked up before the batch. New module nodes are NOT created here —
+	// they are queued as placeholders and upserted inside ReplaceFileIndex's
+	// transaction (F5), so a failed batch rolls back and leaves no orphaned
+	// module nodes behind.
 	importTarget := make(map[int]int64, len(edges))
+	moduleNodes := make([]db.Node, 0, len(edges))
+	moduleIdx := make(map[string]int, len(edges))
 	for i, e := range edges {
 		if e.Kind != "imports" {
 			continue
@@ -607,18 +622,25 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 				}
 			}
 		} else {
-			targetID, gerr = o.db.UpsertNode(&db.Node{
-				Kind:     "module",
-				Name:     e.TargetName,
-				File:     e.TargetName,
-				Line:     0,
-				Language: lang,
-			})
-			if gerr != nil {
-				log.Printf("upsert import module %s: %v", e.TargetName, gerr)
+			// Queue a module node for creation inside the batch transaction.
+			// Its placeholder id -(len(dbNodes)+idx+1) is resolved to the real
+			// row id by ReplaceFileIndex (module placeholders live just below
+			// the batch-node placeholder range).
+			idx, ok := moduleIdx[e.TargetName]
+			if !ok {
+				idx = len(moduleNodes)
+				moduleIdx[e.TargetName] = idx
+				moduleNodes = append(moduleNodes, db.Node{
+					Kind:     "module",
+					Name:     e.TargetName,
+					File:     e.TargetName,
+					Line:     0,
+					Language: lang,
+				})
 			}
+			targetID = -int64(len(dbNodes) + idx + 1)
 		}
-		if targetID > 0 {
+		if targetID != 0 {
 			importTarget[i] = targetID
 		}
 	}
@@ -626,7 +648,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	// Structural edges (imports, etc.)
 	for i, e := range edges {
 		if e.Kind == "imports" {
-			if tid := importTarget[i]; tid > 0 {
+			if tid := importTarget[i]; tid != 0 {
 				dbEdges = append(dbEdges, db.Edge{
 					SourceID:   ph(0),
 					TargetID:   tid,
@@ -708,7 +730,7 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	} else {
 		log.Printf("stat after index %s: %v", path, serr)
 	}
-	if _, werr := o.db.ReplaceFileIndex(store, dbNodes, dbEdges, parks, &fr); werr != nil {
+	if _, werr := o.db.ReplaceFileIndex(store, dbNodes, dbEdges, parks, &fr, moduleNodes...); werr != nil {
 		return 0, werr
 	}
 

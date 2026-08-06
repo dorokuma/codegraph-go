@@ -1,9 +1,11 @@
 package sync
 
 import (
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,6 +121,15 @@ func (w *Watcher) loop() {
 			if !ok {
 				return
 			}
+			// F3: an event overflow means the kernel dropped events — some
+			// change was almost certainly missed. Trigger a full rescan of the
+			// watch root through the normal pending/debounce path so nothing
+			// stays stale; other errors are still logged only.
+			if errors.Is(err, fsnotify.ErrEventOverflow) || strings.Contains(err.Error(), "overflow") {
+				log.Printf("watcher: event overflow — events may have been lost, triggering full rescan")
+				w.rescanAll()
+				continue
+			}
 			log.Printf("watcher error: %v", err)
 
 		case <-ticker.C:
@@ -149,6 +160,32 @@ func (w *Watcher) watchTree(root string) {
 		if err := w.watcher.Add(path); err != nil {
 			log.Printf("watcher add %s: %v", path, err)
 		}
+		return nil
+	})
+}
+
+// rescanAll queues every supported source file under the watch root for
+// reindexing through the normal pending/debounce path (processPending →
+// IndexChanges). Used when fsnotify reports ErrEventOverflow: events may have
+// been lost, so a full sweep is the only way to guarantee no change is missed.
+func (w *Watcher) rescanAll() {
+	_ = filepath.Walk(w.workdir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		lang := extraction.DetectLanguage(path)
+		if lang == "" || !extraction.IsSupportedLanguage(lang) {
+			return nil
+		}
+		w.mu.Lock()
+		w.pending[path] = time.Now()
+		w.mu.Unlock()
 		return nil
 	})
 }

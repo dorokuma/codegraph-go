@@ -217,3 +217,52 @@ func Beta() string { return "ok" }
 	db3 := indexDir(t, dir3)
 	assertGraphCall(t, db3, "Alpha", "Beta")
 }
+
+// TestResolveForFilesChangedNamesBranch verifies F1: ResolveForFiles must
+// retry refs whose name is defined by a changed file (the changedNames branch),
+// even when the ref itself lives in a different, unchanged file. The name
+// filter is pushed down to SQL (ListUnresolvedRefsByNames), so this exercises
+// the exact-equality match path end to end.
+func TestResolveForFilesChangedNamesBranch(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "caller.go"), []byte(`package p
+func Caller() { Missing() }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	orch := extraction.NewOrchestrator(database, dir)
+	if _, err := orch.IndexFile(filepath.Join(dir, "caller.go")); err != nil {
+		t.Fatal(err)
+	}
+	// Ref parked while Missing is undefined.
+	n, _ := database.CountUnresolvedRefs("")
+	if n == 0 {
+		t.Fatal("expected a parked unresolved ref while target missing")
+	}
+
+	// Target appears in another file. Insert its node directly (no IndexFile,
+	// which would itself trigger ResolveForFiles) so only the changedNames
+	// branch of the direct call below can resolve the ref.
+	if _, err := database.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "Missing", File: "target.go", Line: 1, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := resolution.ResolveForFiles(database, dir, []string{"target.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Resolved != 1 {
+		t.Fatalf("expected 1 resolved via changedNames branch, got %+v", st)
+	}
+	if st.Retried < 1 {
+		t.Fatalf("expected the failed ref to be counted as retried, got %+v", st)
+	}
+	assertGraphCall(t, database, "Caller", "Missing")
+}

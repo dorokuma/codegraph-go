@@ -40,11 +40,12 @@ var (
 
 // SynthesizeAll runs whole-graph dynamic-dispatch synthesis after base resolution.
 // Edges are provenance=heuristic with metadata.synthesizedBy (official-aligned).
+// F2: all passes' edges are collected (deduped) first and written in one atomic
+// ReplaceSynthesizedEdges call — the delete of stale synthesized edges and the
+// inserts share a transaction, so a failure rolls back cleanly instead of
+// leaving the graph partially cleared.
 func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 	st := SynthStats{ByPass: map[string]int{}}
-	if err := database.DeleteSynthesizedEdges(); err != nil {
-		return st, err
-	}
 
 	ctx := newSynthCtx(database, workdir)
 
@@ -84,9 +85,12 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 		st.ByPass[p.name] = n
 	}
 
+	// Single atomic replace: delete stale synthesized edges + upsert the new
+	// set inside one transaction (F2).
+	edges := make([]db.Edge, 0, len(merged))
 	for _, e := range merged {
 		meta, _ := json.Marshal(e.Meta)
-		if _, err := database.UpsertEdge(&db.Edge{
+		edges = append(edges, db.Edge{
 			SourceID:   e.SourceID,
 			TargetID:   e.TargetID,
 			Kind:       e.Kind,
@@ -94,12 +98,13 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 			Line:       e.Line,
 			Provenance: ProvHeuristic,
 			Metadata:   string(meta),
-		}); err != nil {
-			log.Printf("synthesis upsert edge %d->%d [%s] %s:%d: %v", e.SourceID, e.TargetID, e.Kind, e.File, e.Line, err)
-			continue
-		}
-		st.Written++
+		})
 	}
+	if err := database.ReplaceSynthesizedEdges(edges); err != nil {
+		log.Printf("synthesize replace edges: %v", err)
+		return st, err
+	}
+	st.Written = len(edges)
 	return st, nil
 }
 

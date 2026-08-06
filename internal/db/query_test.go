@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -946,5 +947,257 @@ func TestSupersedeChain(t *testing.T) {
 	}
 	if f3.Status != "active" || f3.SupersededBy != 0 {
 		t.Fatalf("v3 wrong: status=%q superseded_by=%d", f3.Status, f3.SupersededBy)
+	}
+}
+
+func TestListUnresolvedRefsByNames(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	fromID, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "holder", File: "/h.go", Line: 1, Language: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(name, tail, status string) int64 {
+		t.Helper()
+		id, err := database.InsertUnresolvedRef(&UnresolvedRef{
+			FromNode:      fromID,
+			ReferenceName: name,
+			ReferenceKind: EdgeCalls,
+			Line:          2,
+			FilePath:      "/a.go",
+			Language:      "go",
+			Status:        status,
+			NameTail:      tail,
+		})
+		if err != nil {
+			t.Fatalf("insert ref %s: %v", name, err)
+		}
+		return id
+	}
+	rName := insert("Foo", "Foo", "failed")           // matches by reference_name
+	rTail := insert("pkg.Foo", "Foo", "pending")      // matches by name_tail
+	rBoth := insert("Bar", "Bar", "failed")           // matches both branches (dedupe)
+	rNoMatch := insert("Baz", "Baz", "pending")       // no match
+	rWrongStatus := insert("Quux", "Quux", "pending") // name matches only in failed query
+
+	got, err := database.ListUnresolvedRefsByNames([]string{"Foo", "Bar", "Nope"}, []string{"pending", "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]bool{rName: true, rTail: true, rBoth: true}
+	if len(got) != len(want) {
+		t.Fatalf("want %d rows, got %d: %+v", len(want), len(got), got)
+	}
+	for _, r := range got {
+		if !want[r.ID] {
+			t.Fatalf("unexpected row id %d (%s/%s)", r.ID, r.ReferenceName, r.Status)
+		}
+	}
+	if r := got[0]; r.ID != rName && r.ID != rTail && r.ID != rBoth {
+		t.Fatalf("expected a matched ref, got %+v", got[0])
+	}
+	_ = rNoMatch
+	_ = rWrongStatus
+
+	// Status filter: only failed.
+	got, err = database.ListUnresolvedRefsByNames([]string{"Foo", "Bar"}, []string{"failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 { // rName + rBoth; rTail is pending
+		t.Fatalf("failed-only: want 2 rows, got %d: %+v", len(got), got)
+	}
+	// Status filter excludes: rWrongStatus is pending, so a failed query finds nothing.
+	got, err = database.ListUnresolvedRefsByNames([]string{"Quux"}, []string{"failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Quux is pending: failed query must return 0, got %+v", got)
+	}
+	// No status filter returns both statuses.
+	got, err = database.ListUnresolvedRefsByNames([]string{"Quux"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != rWrongStatus {
+		t.Fatalf("no-status query: want Quux row, got %+v", got)
+	}
+	// Empty names → nil without querying.
+	got, err = database.ListUnresolvedRefsByNames(nil, nil)
+	if err != nil || got != nil {
+		t.Fatalf("empty names: got %+v err %v", got, err)
+	}
+	// Chunking: >400 names must not exceed SQLite's variable limit and must
+	// still find matches in later chunks.
+	names := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		names = append(names, fmt.Sprintf("no_such_%d", i))
+	}
+	names[999] = "Bar"
+	got, err = database.ListUnresolvedRefsByNames(names, []string{"failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != rBoth {
+		t.Fatalf("chunked query: want rBoth, got %+v", got)
+	}
+}
+
+func TestReplaceSynthesizedEdges(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	a, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "a", File: "/a.go", Line: 1, Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "b", File: "/b.go", Line: 1, Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	countSynthesized := func() int {
+		var n int
+		if err := database.conn.QueryRow(`
+			SELECT COUNT(*) FROM edges
+			WHERE provenance = 'heuristic' AND metadata LIKE '%synthesizedBy%'
+		`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	countTotal := func() int {
+		var n int
+		if err := database.conn.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// Seed: one synthesized edge (line 0) + one non-synthesized exact edge (line 10).
+	if _, err := database.UpsertEdge(&Edge{
+		SourceID: a, TargetID: b, Kind: EdgeCalls, File: "/a.go",
+		Line: 0, Provenance: "heuristic", Metadata: `{"synthesizedBy":"old"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.UpsertEdge(&Edge{
+		SourceID: a, TargetID: b, Kind: EdgeCalls, File: "/a.go",
+		Line: 10, Provenance: "exact", Metadata: "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Success: old synthesized edges replaced, non-synthesized untouched.
+	if err := database.ReplaceSynthesizedEdges([]Edge{{
+		SourceID: a, TargetID: b, Kind: EdgeCalls, File: "/a.go",
+		Line: 0, Provenance: "heuristic", Metadata: `{"synthesizedBy":"new"}`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := countSynthesized(); n != 1 {
+		t.Fatalf("want 1 synthesized edge after replace, got %d", n)
+	}
+	if n := countTotal(); n != 2 {
+		t.Fatalf("want 2 edges total (synth + exact), got %d", n)
+	}
+	var meta string
+	if err := database.conn.QueryRow(`
+		SELECT metadata FROM edges WHERE source_id = ? AND target_id = ? AND kind = ? AND line = 0
+	`, a, b, EdgeCalls).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta != `{"synthesizedBy":"new"}` {
+		t.Fatalf("expected new metadata, got %q", meta)
+	}
+
+	// Failure injection: an edge whose source violates the nodes FK. The whole
+	// batch must roll back and the old synthesized edge must survive.
+	if err := database.ReplaceSynthesizedEdges([]Edge{{
+		SourceID: 999999, TargetID: b, Kind: EdgeCalls, File: "/a.go",
+		Line: 0, Provenance: "heuristic", Metadata: `{"synthesizedBy":"bad"}`,
+	}}); err == nil {
+		t.Fatal("expected FK violation error")
+	}
+	if n := countSynthesized(); n != 1 {
+		t.Fatalf("old synthesized edges must survive a failed replace, got %d", n)
+	}
+	if n := countTotal(); n != 2 {
+		t.Fatalf("total edges must survive a failed replace, got %d", n)
+	}
+	if err := database.conn.QueryRow(`
+		SELECT metadata FROM edges WHERE source_id = ? AND target_id = ? AND kind = ? AND line = 0
+	`, a, b, EdgeCalls).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta != `{"synthesizedBy":"new"}` {
+		t.Fatalf("metadata must stay at the pre-failure value, got %q", meta)
+	}
+
+	// Empty edge set clears synthesized edges (idempotent re-run) but keeps exact.
+	if err := database.ReplaceSynthesizedEdges(nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := countSynthesized(); n != 0 {
+		t.Fatalf("empty replace must clear synthesized edges, got %d", n)
+	}
+	if n := countTotal(); n != 1 {
+		t.Fatalf("exact edge must survive empty replace, got %d", n)
+	}
+}
+
+func TestReplaceFileIndexModuleNodesAtomic(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	fileNode := Node{Kind: KindFile, Name: "a.go", File: "a.go", Line: 0, Language: "go"}
+	fr := &FileRecord{Path: "a.go", Size: 10, Mtime: 1, ContentHash: "h", Language: "go", NodeCount: 1}
+
+	// Success: the module node is created inside the transaction and the
+	// import edge (placeholder -2 = moduleNodes[0] since len(nodes)==1)
+	// resolves to its real id.
+	ids, err := database.ReplaceFileIndex("a.go", []Node{fileNode}, []Edge{{
+		SourceID: -1, TargetID: -2, Kind: EdgeImports, File: "a.go", Line: 1, Provenance: "exact",
+	}}, nil, fr, Node{Kind: "module", Name: "mod/ok", File: "mod/ok", Line: 0, Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mods, err := database.GetNodeByName("mod/ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mods) != 1 || mods[0].Kind != "module" {
+		t.Fatalf("expected one module node, got %+v", mods)
+	}
+	e, err := database.GetEdgeByEndpoints(ids[0], mods[0].ID, EdgeImports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e == nil {
+		t.Fatal("expected imports edge file → module")
+	}
+
+	// Failure: a dangling positive target id violates the edges FK mid-batch.
+	// The module node must roll back with the transaction — no orphan left.
+	_, err = database.ReplaceFileIndex("b.go", []Node{{Kind: KindFile, Name: "b.go", File: "b.go", Line: 0, Language: "go"}}, []Edge{{
+		SourceID: -1, TargetID: 999999, Kind: EdgeImports, File: "b.go", Line: 1, Provenance: "exact",
+	}}, nil, fr, Node{Kind: "module", Name: "mod/bad", File: "mod/bad", Line: 0, Language: "go"})
+	if err == nil {
+		t.Fatal("expected FK violation error")
+	}
+	bad, err := database.GetNodeByName("mod/bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 0 {
+		t.Fatalf("module node must not survive a failed batch, got %+v", bad)
+	}
+	// The successful batch's module node and edge are untouched.
+	mods, err = database.GetNodeByName("mod/ok")
+	if err != nil || len(mods) != 1 {
+		t.Fatalf("successful module node must survive, got %+v err=%v", mods, err)
 	}
 }
