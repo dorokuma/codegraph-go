@@ -25,6 +25,11 @@ type LockInfo struct {
 	Version    string `json:"version"`
 	SocketPath string `json:"socketPath"`
 	StartedAt  int64  `json:"startedAt"` // unix ms
+	// ProcStart is the /proc/<pid>/stat starttime of the owning process at
+	// acquire time (0 on platforms without /proc, or for pidfiles written by
+	// older builds). KillStaleDaemon compares it against the live /proc value
+	// before signaling to detect PID reuse (S3).
+	ProcStart int64 `json:"procStart,omitempty"`
 }
 
 // CodeGraphDir returns <root>/.codegraph.

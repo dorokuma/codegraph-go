@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,6 +114,7 @@ func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sleep", "30")
+	cmd.Args[0] = "codegraph-go" // pass the cmdline identity check on procfs platforms
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	defer cmd.Process.Kill() //nolint:errcheck
-	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1}
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
 	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +143,54 @@ func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
 	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 		t.Fatal("stale pidfile not cleared after kill")
 	}
+}
+
+func TestKillStaleDaemonRefusesPIDReuse(t *testing.T) {
+	// S3: the pidfile names a live process whose recorded start time no
+	// longer matches /proc (the pid was recycled by an unrelated process).
+	// KillStaleDaemon must NOT signal it and must NOT remove the lock;
+	// it returns a clear error instead.
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	// ProcStart=1 can never match a real process started after boot: this is
+	// the PID-reuse window (a different process now owns the pid).
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: 1}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal when recorded start time does not match")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	// The unrelated process must still be running and the lock still present.
+	select {
+	case <-done:
+		t.Fatal("helper process was killed despite identity mismatch")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite identity mismatch: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
 }
 
 func TestRegistryRoundtrip(t *testing.T) {

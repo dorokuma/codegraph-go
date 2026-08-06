@@ -92,6 +92,7 @@ func (d *Daemon) Start() error {
 		Version:    PackageVersion,
 		SocketPath: d.socketPath,
 		StartedAt:  time.Now().UnixMilli(),
+		ProcStart:  procStartTime(os.Getpid()),
 	}
 	// Rewrite pidfile if we relocated off candidate 0.
 	if pref := PreferredSocket(d.root); pref != "" && d.socketPath != pref {

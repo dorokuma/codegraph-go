@@ -88,6 +88,16 @@ func Open(workdir string) (db *DB, err error) {
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
 	}
 
+	db = &DB{conn: conn, path: dbPath, lockFile: lockFile}
+
+	// Finish any edges rebuild interrupted by a crash in pre-transaction
+	// builds BEFORE schema.sql runs: schema.sql would otherwise recreate an
+	// empty edges table and orphan the rows still sitting in edges_new.
+	if err := db.recoverEdgesRebuild(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("recover edges rebuild: %w", err)
+	}
+
 	// Apply schema (CREATE IF NOT EXISTS — does not ALTER existing tables).
 	if _, err := conn.Exec(schemaSQL); err != nil {
 		conn.Close()
@@ -103,7 +113,6 @@ func Open(workdir string) (db *DB, err error) {
 		return nil, fmt.Errorf("ensure meta: %w", err)
 	}
 
-	db = &DB{conn: conn, path: dbPath, lockFile: lockFile}
 	// Bring pre-v7 tables up to current columns/indexes without wiping data here.
 	// Logic-version mismatch still triggers Wipe+Rebuild separately.
 	if err := db.ensureSchema(); err != nil {
@@ -151,12 +160,15 @@ func (d *DB) ensureFTSBackfill() error {
 }
 
 // Close closes the database connection and releases the single-writer lock.
+// Idempotent: a second Close is a no-op returning nil (the connection and the
+// flock are each released exactly once).
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var err error
 	if d.conn != nil {
 		err = d.conn.Close()
+		d.conn = nil
 	}
 	if d.lockFile != nil {
 		// LOCK_UN + close releases the A1 process lock so the next Open wins.

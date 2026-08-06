@@ -48,6 +48,20 @@ func runInit(root string) error {
 	return nil
 }
 
+// dbInUseError rewrites a db.Open failure into the canonical actionable
+// "database in use" message when the underlying cause is a held lock, so
+// every entry path (daemon-fallback probe, CODEGRAPH_NO_DAEMON direct mode)
+// reports one consistent wording and exit code instead of a raw Open error.
+func dbInUseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "in use") || strings.Contains(err.Error(), "locked") {
+		return fmt.Errorf("database in use by another process: %v (stop the other process first, or set CODEGRAPH_NO_DAEMON=1)", err)
+	}
+	return err
+}
+
 // checkDirectFallbackSafe verifies the index is not owned by another live
 // process before falling back to direct mode (B1). If a daemon still holds
 // the DB — e.g. it survived the version-mismatch kill — running direct would
@@ -62,10 +76,7 @@ func checkDirectFallbackSafe(root string) error {
 	// DB-level probe: a non-daemon writer may hold the index too.
 	database, err := db.Open(root)
 	if err != nil {
-		if strings.Contains(err.Error(), "in use") || strings.Contains(err.Error(), "locked") {
-			return fmt.Errorf("database in use by another process: %v (stop the other process first, or set CODEGRAPH_NO_DAEMON=1)", err)
-		}
-		return err
+		return dbInUseError(err)
 	}
 	_ = database.Close()
 	return nil
@@ -123,6 +134,17 @@ func main() {
 	}
 	if daemon.OptOut() {
 		slog.Info("mode=direct (CODEGRAPH_NO_DAEMON)")
+		// S4: fail fast with the canonical "database in use" error and exit
+		// code (same wording as checkDirectFallbackSafe) when another process
+		// holds the index, instead of a raw Open error from inside RunDirect.
+		if database, err := db.Open(cfg.Workdir); err != nil {
+			err = dbInUseError(err)
+			fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
+			slog.Error("direct mode blocked", "error", err)
+			os.Exit(1)
+		} else {
+			_ = database.Close()
+		}
 		if err := server.RunDirect(cfg); err != nil {
 			slog.Error("runDirect failed", "error", err)
 			os.Exit(1)

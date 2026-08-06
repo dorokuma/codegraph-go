@@ -30,8 +30,11 @@ type Orchestrator struct {
 	force   bool // when true, indexIfNeeded always reindexes
 
 	// extractFn, when non-nil, replaces the built-in ts→regex extraction
-	// pipeline. Test seam for parse-failure paths (A4).
-	extractFn func(lang, source, store string) (ExtractResult, error)
+	// pipeline. Test seam for parse-failure paths (A4/S1). The bool reports
+	// whether tree-sitter itself errored (regex fallback took over); it lets
+	// the caller distinguish "unparseable file" from "successfully empty"
+	// when the fallback result is empty.
+	extractFn func(lang, source, store string) (ExtractResult, bool, error)
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -406,13 +409,30 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	// index is KEPT (no ClearFile, no empty file record) — only the file meta
 	// is touched so full scans don't retry the broken file every pass, and
 	// IndexAll continues with other files (A4/Critical#3).
-	result, extractErr := o.extractFile(lang, string(data), store)
+	result, tsErrored, extractErr := o.extractFile(lang, string(data), store)
 	if extractErr != nil {
 		log.Printf("warning: extraction failed for %s: %v (keeping existing index)", path, extractErr)
 		if info, serr := os.Stat(path); serr == nil {
 			_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
 		}
 		return 0, nil
+	}
+	// S1: tree-sitter reported a real parse error AND the regex fallback
+	// found nothing (nodes+edges+refs all zero) while the file still has an
+	// old index with symbols — the file is unparseable, not empty. Clearing
+	// it would destroy the previous symbols, so treat it as an extraction
+	// failure: keep the old index, log a warning, touch meta (so full scans
+	// don't retry the broken file every pass) and return nil so IndexAll
+	// continues. A successful tree-sitter parse with an empty result (file
+	// genuinely cleared) still clears the old index as before.
+	if tsErrored && len(result.Nodes) == 0 && len(result.Edges) == 0 && len(result.Refs) == 0 {
+		if old, cerr := o.db.GetFileNodeCount(store); cerr == nil && old > 0 {
+			log.Printf("warning: extraction failed for %s (tree-sitter error, regex found nothing), keeping existing index", path)
+			if info, serr := os.Stat(path); serr == nil {
+				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)
+			}
+			return 0, nil
+		}
 	}
 	nodes := result.Nodes
 	edges := result.Edges
@@ -680,20 +700,28 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 }
 
 // extractFile runs the extraction pipeline: tree-sitter preferred, regex
-// fallback when tree-sitter fails. Returns an error only when every extractor
-// failed (A4) — callers then keep the previous index for the file.
-func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, error) {
+// fallback when tree-sitter fails. Returns the result, whether tree-sitter
+// itself errored (false when it succeeded, was unavailable, or regex is the
+// only extractor), and an error only when every extractor failed (A4) —
+// callers then keep the previous index for the file.
+func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, bool, error) {
 	if o.extractFn != nil {
 		return o.extractFn(lang, source, store)
 	}
 	if ts := NewTreeSitterExtractor(lang); ts != nil {
 		res, err := ts.Extract(source, store)
 		if err == nil {
-			return res, nil
+			return res, false, nil
 		}
 		log.Printf("tree-sitter extraction failed for %s (%s), falling back to regex: %v", store, lang, err)
+		// S1: remember the tree-sitter failure so the caller can tell an
+		// unparseable file (fallback also empty) apart from a successfully
+		// extracted empty file, and keep the old index in the former case.
+		fb, ferr := NewExtractor(lang).Extract(source, store)
+		return fb, true, ferr
 	}
-	return NewExtractor(lang).Extract(source, store)
+	res, err := NewExtractor(lang).Extract(source, store)
+	return res, false, err
 }
 
 // resolveSourceIdx finds the dbNodes index for a ref/edge source name.

@@ -41,8 +41,8 @@ func TestIndexFileParseFailureKeepsOldIndex(t *testing.T) {
 	if err := os.WriteFile(src, broken, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	orch.extractFn = func(lang, source, store string) (ExtractResult, error) {
-		return ExtractResult{}, errors.New("injected parse failure")
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{}, false, errors.New("injected parse failure")
 	}
 	defer func() { orch.extractFn = nil }()
 
@@ -93,8 +93,8 @@ func TestIndexFileEmptyResultClearsOldIndex(t *testing.T) {
 	if err := os.WriteFile(src, empty, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	orch.extractFn = func(lang, source, store string) (ExtractResult, error) {
-		return ExtractResult{}, nil // success, empty result
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{}, false, nil // success, empty result
 	}
 	defer func() { orch.extractFn = nil }()
 
@@ -114,6 +114,120 @@ func TestIndexFileEmptyResultClearsOldIndex(t *testing.T) {
 	nodeCount, err := database.GetFileNodeCount(key)
 	if err != nil || nodeCount != 0 {
 		t.Fatalf("want node_count=0 file record, got %d err=%v", nodeCount, err)
+	}
+}
+
+// TestIndexFileTSErrorRegexEmptyKeepsOldIndex: tree-sitter reports a real
+// parse error AND the regex fallback finds nothing, while the file already
+// has an index with symbols — the old symbols must be kept (S1). The failure
+// must not ClearFile, must not write a node_count=0 record, must touch the
+// file meta (so full scans don't retry every pass), and must return nil so
+// IndexAll continues with other files.
+func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src := filepath.Join(root, "a.go")
+	body := []byte("package p\nfunc Hello() {}\n")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := NewOrchestrator(database, root)
+	if _, err := orch.IndexFile(src); err != nil {
+		t.Fatal(err)
+	}
+	hs, _ := database.GetNodeByName("Hello")
+	if len(hs) != 1 {
+		t.Fatalf("setup: expected Hello indexed, got %d", len(hs))
+	}
+
+	// Content changes (passes the content-hash gate), then tree-sitter
+	// errors while the regex fallback yields an empty result.
+	broken := []byte("package p\nfunc Broken( {\n")
+	if err := os.WriteFile(src, broken, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{}, true, nil // ts error + regex empty
+	}
+	defer func() { orch.extractFn = nil }()
+
+	n, err := orch.indexFile(src, "go")
+	if err != nil {
+		t.Fatalf("indexFile should treat ts-error+empty as recoverable: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 nodes on failed extraction, got %d", n)
+	}
+	// Old symbols preserved — the production-path hollow-out bug cleared them.
+	hs, _ = database.GetNodeByName("Hello")
+	if len(hs) != 1 {
+		t.Fatalf("old symbol was wiped on ts-error + empty regex fallback: %d", len(hs))
+	}
+	// No node_count=0 record: the stored count still reflects the old index.
+	key := db.StoragePath(root, src)
+	nodeCount, err := database.GetFileNodeCount(key)
+	if err != nil || nodeCount == 0 {
+		t.Fatalf("node_count must stay >0 on failed extraction, got %d err=%v", nodeCount, err)
+	}
+	// Meta touched so full scans don't retry the broken file every pass.
+	same, herr := database.FileHasContentHash(key, hashContent(broken))
+	if herr != nil || !same {
+		t.Fatalf("expected touched content_hash after failed extraction: same=%v err=%v", same, herr)
+	}
+}
+
+// TestIndexFileTSErrorRegexNonEmptyProceeds: tree-sitter errors but the regex
+// fallback finds symbols — the fallback result must be indexed (the failure
+// path only triggers when the fallback is also empty).
+func TestIndexFileTSErrorRegexNonEmptyProceeds(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src := filepath.Join(root, "a.go")
+	body := []byte("package p\nfunc Hello() {}\n")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := NewOrchestrator(database, root)
+	if _, err := orch.IndexFile(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("package p\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{Nodes: []ExtractedNode{
+			{Kind: "function", Name: "FallbackFn", File: store, Line: 3},
+		}}, true, nil // ts error, but regex found a symbol
+	}
+	defer func() { orch.extractFn = nil }()
+
+	n, err := orch.indexFile(src, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 node from fallback, got %d", n)
+	}
+	fs, _ := database.GetNodeByName("FallbackFn")
+	if len(fs) != 1 {
+		t.Fatalf("fallback symbol should be indexed, got %d", len(fs))
+	}
+	// The old index was replaced by the fallback results (not kept).
+	hs, _ := database.GetNodeByName("Hello")
+	if len(hs) != 0 {
+		t.Fatalf("old symbol should be replaced by fallback results, got %d", len(hs))
 	}
 }
 

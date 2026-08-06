@@ -256,6 +256,190 @@ func TestEdgesUniqueKeyMigration(t *testing.T) {
 	}
 }
 
+// TestEdgesUniqueKeyMigrationLeftoverEdgesNew simulates a crash between
+// CREATE TABLE edges_new and DROP TABLE edges in pre-transaction builds:
+// edges_new exists with a copy of the rows while edges still carries the old
+// 3-column key. Open must drop the leftover, redo the migration, keep every
+// row, and end with the new 5-column key effective (M1).
+func TestEdgesUniqueKeyMigrationLeftoverEdgesNew(t *testing.T) {
+	dir := t.TempDir()
+	codegraph := filepath.Join(dir, ".codegraph")
+	if err := os.MkdirAll(codegraph, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(codegraph, "codegraph.db")
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// edges_new mirrors what the interrupted pre-transaction migration left:
+	// the new 5-column key structure with the copied rows, while edges is
+	// untouched with the old key.
+	if _, err := raw.Exec(`
+		CREATE TABLE nodes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind TEXT NOT NULL, name TEXT NOT NULL, file TEXT NOT NULL,
+			line INTEGER NOT NULL, end_line INTEGER, body TEXT, language TEXT,
+			UNIQUE(file, line, kind, name)
+		);
+		INSERT INTO nodes(kind, name, file, line) VALUES ('function','caller','/a.go',1), ('function','callee','/b.go',1);
+		CREATE TABLE edges (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id INTEGER, target_id INTEGER,
+			kind TEXT NOT NULL, file TEXT, line INTEGER, col INTEGER,
+			provenance TEXT, metadata TEXT,
+			UNIQUE(source_id, target_id, kind)
+		);
+		INSERT INTO edges (source_id, target_id, kind, file, line) VALUES (1, 2, 'calls', 'a.go', 5);
+		INSERT INTO edges (source_id, target_id, kind, file, line) VALUES (2, 1, 'calls', 'b.go', NULL);
+		CREATE TABLE edges_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id INTEGER, target_id INTEGER,
+			kind TEXT NOT NULL, file TEXT,
+			line INTEGER NOT NULL DEFAULT 0, col INTEGER NOT NULL DEFAULT 0,
+			provenance TEXT, metadata TEXT,
+			UNIQUE(source_id, target_id, kind, line, col)
+		);
+		INSERT INTO edges_new (id, source_id, target_id, kind, file, line, col, provenance, metadata)
+			SELECT id, source_id, target_id, kind, file, COALESCE(line,0), COALESCE(col,0), provenance, metadata FROM edges;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open db with leftover edges_new: %v", err)
+	}
+	defer database.Close()
+
+	ddl, err := database.tableSQL("edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "UNIQUE(source_id, target_id, kind, line, col)") {
+		t.Fatalf("edges not migrated to new unique key; ddl=%s", ddl)
+	}
+	// The leftover copy must be gone.
+	en, err := database.tableExists("edges_new")
+	if err != nil || en {
+		t.Fatalf("leftover edges_new must be cleaned up: exists=%v err=%v", en, err)
+	}
+	// Rows preserved; NULL line coalesced to 0.
+	edges, err := database.GetIncomingEdges(2, nil)
+	if err != nil || len(edges) != 1 || edges[0].Line != 5 || edges[0].Col != 0 {
+		t.Fatalf("row 1 (1→2): want line=5 col=0, got %+v err=%v", edges, err)
+	}
+	edges2, err := database.GetIncomingEdges(1, nil)
+	if err != nil || len(edges2) != 1 || edges2[0].Line != 0 || edges2[0].Col != 0 {
+		t.Fatalf("row 2 (2→1): want line=0 col=0 (NULL coalesced), got %+v err=%v", edges2, err)
+	}
+}
+
+// TestEdgesUniqueKeyMigrationPromotesEdgesNew simulates a crash between
+// DROP TABLE edges and RENAME (pre-transaction builds): edges is gone and
+// edges_new holds the only copy of the data. Open must promote edges_new
+// (RENAME + lookup indexes) before schema.sql can recreate an empty edges,
+// keeping every row under the new key (M1).
+func TestEdgesUniqueKeyMigrationPromotesEdgesNew(t *testing.T) {
+	dir := t.TempDir()
+	codegraph := filepath.Join(dir, ".codegraph")
+	if err := os.MkdirAll(codegraph, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(codegraph, "codegraph.db")
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Crash state: only edges_new exists, holding the data (no edges table).
+	if _, err := raw.Exec(`
+		CREATE TABLE nodes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind TEXT NOT NULL, name TEXT NOT NULL, file TEXT NOT NULL,
+			line INTEGER NOT NULL, end_line INTEGER, body TEXT, language TEXT,
+			UNIQUE(file, line, kind, name)
+		);
+		INSERT INTO nodes(kind, name, file, line) VALUES ('function','caller','/a.go',1), ('function','callee','/b.go',1);
+		CREATE TABLE edges_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+			target_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL, file TEXT,
+			line INTEGER NOT NULL DEFAULT 0, col INTEGER NOT NULL DEFAULT 0,
+			provenance TEXT, metadata TEXT,
+			UNIQUE(source_id, target_id, kind, line, col)
+		);
+		INSERT INTO edges_new (source_id, target_id, kind, file, line) VALUES (1, 2, 'calls', 'a.go', 5);
+		INSERT INTO edges_new (source_id, target_id, kind, file, line) VALUES (2, 1, 'calls', 'b.go', 3);
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open db with promoted candidate: %v", err)
+	}
+	defer database.Close()
+
+	ddl, err := database.tableSQL("edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "UNIQUE(source_id, target_id, kind, line, col)") {
+		t.Fatalf("edges not promoted with new unique key; ddl=%s", ddl)
+	}
+	// Rows preserved through the promotion.
+	edges, err := database.GetIncomingEdges(2, nil)
+	if err != nil || len(edges) != 1 || edges[0].Line != 5 {
+		t.Fatalf("row 1 (1→2): want line=5, got %+v err=%v", edges, err)
+	}
+	edges2, err := database.GetIncomingEdges(1, nil)
+	if err != nil || len(edges2) != 1 || edges2[0].Line != 3 {
+		t.Fatalf("row 2 (2→1): want line=3, got %+v err=%v", edges2, err)
+	}
+	// Lookup indexes dropped with the old table must be rebuilt.
+	for _, idx := range []string{"idx_edges_source", "idx_edges_target", "idx_edges_kind", "idx_edges_provenance"} {
+		var name string
+		if err := database.conn.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&name); err != nil {
+			t.Fatalf("index %s missing after promotion: %v", idx, err)
+		}
+	}
+	en, err := database.tableExists("edges_new")
+	if err != nil || en {
+		t.Fatalf("edges_new must be gone after promotion: exists=%v err=%v", en, err)
+	}
+}
+
+// TestCloseIdempotent: a second Close must be a no-op returning nil (no
+// "sql: database is closed"), and the flock is released exactly once so a
+// fresh Open wins (S2).
+func TestCloseIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("second close must be a no-op, got: %v", err)
+	}
+	database2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open after double close should succeed: %v", err)
+	}
+	if err := database2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // ---- A7: snapshot truncation ----
 
 func TestGraphSnapshotTruncation(t *testing.T) {

@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -33,6 +36,7 @@ func TryAcquireLock(projectRoot string) (AcquireResult, error) {
 		Version:    PackageVersion,
 		SocketPath: PreferredSocket(projectRoot),
 		StartedAt:  time.Now().UnixMilli(),
+		ProcStart:  procStartTime(os.Getpid()),
 	}
 
 	tmp := pidPath + "." + itoa(os.Getpid()) + ".tmp"
@@ -105,9 +109,10 @@ func ClearStaleLock(pidPath string, expectedDeadPID int) bool {
 
 // KillStaleDaemon terminates a live daemon whose version no longer matches
 // (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
-// pidfile, SIGTERMs the process when alive, polls up to 5s for exit, then
-// clears the stale pidfile. ClearStaleLock's expectedDeadPID guard ensures we
-// never remove a pidfile that was rewritten to name a different process.
+// pidfile, verifies the target is really the daemon we recorded (S3: PID-reuse
+// guard), SIGTERMs it when alive, polls up to 5s for exit, then clears the
+// stale pidfile. ClearStaleLock's expectedDeadPID guard ensures we never
+// remove a pidfile that was rewritten to name a different process.
 func KillStaleDaemon(projectRoot string) error {
 	pidPath := PidPath(projectRoot)
 	raw, err := os.ReadFile(pidPath)
@@ -124,6 +129,13 @@ func KillStaleDaemon(projectRoot string) error {
 		return nil
 	}
 	if IsProcessAlive(info.PID) {
+		// S3: PID-reuse window — the pid may have died since the pidfile was
+		// written and been recycled by an unrelated process. Never signal a
+		// process that is not the daemon we recorded: on mismatch, return a
+		// clear error without signaling and without touching the lock.
+		if err := verifyDaemonIdentity(info); err != nil {
+			return err
+		}
 		proc, ferr := os.FindProcess(info.PID)
 		if ferr != nil {
 			return ferr
@@ -148,6 +160,70 @@ func KillStaleDaemon(projectRoot string) error {
 	}
 	ClearStaleLock(pidPath, info.PID)
 	return nil
+}
+
+// verifyDaemonIdentity guards the SIGTERM in KillStaleDaemon against PID
+// reuse: between reading the pidfile and signaling, the recorded pid may have
+// died and been recycled by an unrelated process. When /proc is available the
+// target must actually be the daemon we recorded — either the /proc start
+// time matches the pidfile record (strong check, for pidfiles written with
+// ProcStart) or, for older pidfiles without it, the command line must name a
+// codegraph process. Platforms without /proc cannot verify and degrade to the
+// historical probe-and-signal behavior. Returns nil when the process passes
+// verification or verification is impossible.
+func verifyDaemonIdentity(info *LockInfo) error {
+	if info.ProcStart > 0 {
+		if cur := procStartTime(info.PID); cur > 0 {
+			if cur != info.ProcStart {
+				return fmt.Errorf("refusing to kill pid %d: process start time changed (pid reused by another process)", info.PID)
+			}
+			return nil
+		}
+	}
+	if cmdline := procCmdline(info.PID); cmdline != "" {
+		if !strings.Contains(strings.ToLower(cmdline), "codegraph") {
+			return fmt.Errorf("refusing to kill pid %d: not a codegraph daemon (cmdline %q; pid reused by another process)", info.PID, cmdline)
+		}
+		return nil
+	}
+	// No /proc on this platform: cannot verify — keep historical behavior.
+	return nil
+}
+
+// procStartTime returns the starttime field (22nd) of /proc/<pid>/stat, or 0
+// when unavailable (non-procfs platforms, permission, vanished process).
+// starttime counts clock ticks since boot and uniquely identifies a process
+// incarnation, so comparing it detects PID reuse.
+func procStartTime(pid int) int64 {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// comm (field 2) may contain spaces/parens; fields restart after the last ')',
+	// where field 3 (state) becomes index 0. starttime is field 22 → index 19.
+	i := bytes.LastIndexByte(raw, ')')
+	if i < 0 || i+2 >= len(raw) {
+		return 0
+	}
+	fields := strings.Fields(string(raw[i+2:]))
+	if len(fields) < 20 {
+		return 0
+	}
+	v, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// procCmdline returns the NUL-joined argv of pid from /proc, or "" when
+// unavailable.
+func procCmdline(pid int) string {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // IsProcessAlive probes pid with signal 0. EPERM counts as alive.
