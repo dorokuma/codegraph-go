@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -48,16 +49,28 @@ func runInit(root string) error {
 	return nil
 }
 
+// dbInUseMessage builds the canonical actionable "database in use" wording
+// shared by every entry path. suggestNoDaemon controls whether the message
+// suggests setting CODEGRAPH_NO_DAEMON=1: in NO_DAEMON direct mode that hint
+// is already in effect, so appending it would be self-contradictory.
+func dbInUseMessage(detail string, suggestNoDaemon bool) string {
+	if suggestNoDaemon {
+		return fmt.Sprintf("database in use by another process: %s (stop the other process first, or set CODEGRAPH_NO_DAEMON=1)", detail)
+	}
+	return fmt.Sprintf("database in use by another process: %s (stop the other process first)", detail)
+}
+
 // dbInUseError rewrites a db.Open failure into the canonical actionable
 // "database in use" message when the underlying cause is a held lock, so
 // every entry path (daemon-fallback probe, CODEGRAPH_NO_DAEMON direct mode)
 // reports one consistent wording and exit code instead of a raw Open error.
-func dbInUseError(err error) error {
+// suggestNoDaemon is forwarded to dbInUseMessage (see G2).
+func dbInUseError(err error, suggestNoDaemon bool) error {
 	if err == nil {
 		return nil
 	}
 	if strings.Contains(err.Error(), "in use") || strings.Contains(err.Error(), "locked") {
-		return fmt.Errorf("database in use by another process: %v (stop the other process first, or set CODEGRAPH_NO_DAEMON=1)", err)
+		return errors.New(dbInUseMessage(err.Error(), suggestNoDaemon))
 	}
 	return err
 }
@@ -70,13 +83,13 @@ func checkDirectFallbackSafe(root string) error {
 	pidPath := daemon.PidPath(root)
 	if raw, err := os.ReadFile(pidPath); err == nil {
 		if info := daemon.DecodeLock(raw); info != nil && info.PID > 0 && daemon.IsProcessAlive(info.PID) {
-			return fmt.Errorf("database in use by another process (daemon pid %d): stop the daemon first, or set CODEGRAPH_NO_DAEMON=1 to disable the shared daemon", info.PID)
+			return errors.New(dbInUseMessage(fmt.Sprintf("daemon pid %d", info.PID), true))
 		}
 	}
 	// DB-level probe: a non-daemon writer may hold the index too.
 	database, err := db.Open(root)
 	if err != nil {
-		return dbInUseError(err)
+		return dbInUseError(err, true)
 	}
 	_ = database.Close()
 	return nil
@@ -137,8 +150,10 @@ func main() {
 		// S4: fail fast with the canonical "database in use" error and exit
 		// code (same wording as checkDirectFallbackSafe) when another process
 		// holds the index, instead of a raw Open error from inside RunDirect.
+		// G2: CODEGRAPH_NO_DAEMON is already set here, so the message must not
+		// suggest setting it again.
 		if database, err := db.Open(cfg.Workdir); err != nil {
-			err = dbInUseError(err)
+			err = dbInUseError(err, false)
 			fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
 			slog.Error("direct mode blocked", "error", err)
 			os.Exit(1)
@@ -175,11 +190,20 @@ func main() {
 	// Probe → spawn → dial shared daemon; on failure fall back to direct.
 	// Pass parent -config / -no-sync so the detached writer matches this session.
 	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync}
-	conn, br, hello, ok := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
+	conn, br, hello, ok, err := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
 	if ok {
 		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)
 		_ = daemon.RunProxy(conn, br, hello)
 		return
+	}
+	if err != nil && errors.Is(err, daemon.ErrStaleDaemonRefused) {
+		// G1: the PID-reuse guard refused to kill the stale daemon because an
+		// unidentified live process holds the lock. Neither spawning on top of
+		// it nor falling back to direct mode is safe (double-write risk), so
+		// surface an actionable error and exit non-zero instead.
+		fmt.Fprintf(os.Stderr, "codegraph-go: %v; remove the pidfile manually and retry\n", err)
+		slog.Error("daemon path blocked: unidentified process holds the daemon lock", "error", err)
+		os.Exit(1)
 	}
 	slog.Info("mode=direct (daemon unavailable)")
 	// Never double-write: refuse direct mode while a live daemon still owns

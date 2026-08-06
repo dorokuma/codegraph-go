@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -107,11 +108,16 @@ func DialAnyCandidate(projectRoot string) (net.Conn, *bufio.Reader, Hello, bool,
 
 // EnsureAndDial probes for a live daemon, spawning one if needed, then dials.
 // Returns ok=false when the daemon path is unavailable (caller → direct mode).
+// The returned error is non-nil when the daemon path is unusable for a reason
+// the caller must surface: it wraps ErrStaleDaemonRefused when the stale-daemon
+// kill was REFUSED (PID-reuse guard — an unidentified live process holds the
+// lock; do NOT spawn and do NOT fall back to direct mode), and it carries the
+// spawn error when SpawnDetached itself failed (safe to fall back to direct).
 // opts is passed to SpawnDetached so -config / -no-sync match the parent.
-func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, opts *SpawnOpts) (net.Conn, *bufio.Reader, Hello, bool) {
+func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, opts *SpawnOpts) (net.Conn, *bufio.Reader, Hello, bool, error) {
 	conn, br, hello, ok, reason := DialAnyCandidate(projectRoot)
 	if ok {
-		return conn, br, hello, true
+		return conn, br, hello, true, nil
 	}
 	if contains(reason, "version mismatch") {
 		// Definitive version mismatch (B1): the running daemon belongs to a
@@ -120,21 +126,32 @@ func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, o
 		// daemon must not keep writing an index this build is about to
 		// migrate/replace.
 		if err := KillStaleDaemon(projectRoot); err != nil {
+			if errors.Is(err, ErrStaleDaemonRefused) {
+				// G1: the PID-reuse guard refused to signal the recorded
+				// process because its identity could not be confirmed. The
+				// lock is still held by a live, unidentified process: spawning
+				// on top of it or falling back to direct mode would risk
+				// double-writing the index, so stop and hand the refusal to
+				// the caller (main prints an actionable message and exits).
+				return nil, nil, Hello{}, false, fmt.Errorf("stale daemon at %s failed identity check: %w", PidPath(projectRoot), err)
+			}
+			// Ordinary failure (e.g. signal sent but exit wait timed out):
+			// keep historical behavior — log and retry via a fresh spawn.
 			log.Printf("kill stale daemon: %v", err)
 		}
 	}
 	if err := SpawnDetached(projectRoot, opts); err != nil {
 		log.Printf("spawn daemon: %v", err)
-		return nil, nil, Hello{}, false
+		return nil, nil, Hello{}, false, err
 	}
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		time.Sleep(poll)
 		if conn, br, hello, ok, _ := DialAnyCandidate(projectRoot); ok {
-			return conn, br, hello, true
+			return conn, br, hello, true, nil
 		}
 	}
-	return nil, nil, Hello{}, false
+	return nil, nil, Hello{}, false, nil
 }
 
 func contains(s, sub string) bool {

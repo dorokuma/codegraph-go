@@ -107,6 +107,17 @@ func ClearStaleLock(pidPath string, expectedDeadPID int) bool {
 	return true
 }
 
+// ErrStaleDaemonRefused is wrapped by every KillStaleDaemon error that REFUSES
+// to terminate the recorded process because its identity could not be
+// confirmed against /proc (PID-reuse guard: start time unreadable or changed,
+// or the process is not a codegraph daemon). Callers must treat it as fatal
+// for the daemon path: neither spawn a replacement nor fall back to direct
+// mode while an unidentified live process holds the lock — both would risk
+// double-writing the index. Transient kill failures (e.g. signal sent but
+// exit wait timed out) do NOT wrap this sentinel and may be retried via a
+// fresh spawn.
+var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed (pid reused by another process)")
+
 // KillStaleDaemon terminates a live daemon whose version no longer matches
 // (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
 // pidfile, verifies the target is really the daemon we recorded (S3: PID-reuse
@@ -187,16 +198,16 @@ func verifyDaemonIdentity(info *LockInfo) error {
 			// one: data is insufficient to confirm identity, so refuse rather
 			// than degrade to a weaker check (never risk SIGTERMing a process
 			// we cannot identify).
-			return fmt.Errorf("refusing to kill pid %d: cannot read process start time (pid reused by another process?)", info.PID)
+			return fmt.Errorf("%w: pid %d: cannot read process start time", ErrStaleDaemonRefused, info.PID)
 		}
 		if cur != info.ProcStart {
-			return fmt.Errorf("refusing to kill pid %d: process start time changed (pid reused by another process)", info.PID)
+			return fmt.Errorf("%w: pid %d: process start time changed", ErrStaleDaemonRefused, info.PID)
 		}
 		return nil
 	}
 	if cmdline := procCmdlineFn(info.PID); cmdline != "" {
 		if !isCodegraphCmdline(cmdline) {
-			return fmt.Errorf("refusing to kill pid %d: not a codegraph daemon (cmdline %q; pid reused by another process)", info.PID, cmdline)
+			return fmt.Errorf("%w: pid %d: not a codegraph daemon (cmdline %q)", ErrStaleDaemonRefused, info.PID, cmdline)
 		}
 		return nil
 	}

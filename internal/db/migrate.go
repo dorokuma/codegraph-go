@@ -254,21 +254,40 @@ func (d *DB) recoverEdgesRebuild() error {
 // promoteEdgesNew completes a rebuild interrupted right after DROP TABLE
 // edges: edges_new holds the only copy of the edge data. It is renamed to
 // edges and the lookup indexes are recreated (they were dropped with the old
-// table). If the promoted table still carries the old 3-column unique key,
-// rebuildEdgesUniqueKey migrates it afterwards.
+// table) — all in ONE transaction, matching rebuildEdgesUniqueKey's style
+// (G3). No FK toggle is needed on this path: it performs no DROP, and the
+// RENAME + CREATE INDEX statements are valid inside a transaction with
+// foreign_keys=ON. A mid-run failure rolls back and leaves edges_new in
+// place, so recoverEdgesRebuild can retry the promotion on the next Open —
+// never a half-promoted state. If the promoted table still carries the old
+// 3-column unique key, rebuildEdgesUniqueKey migrates it afterwards.
 func (d *DB) promoteEdgesNew() error {
-	if _, err := d.conn.Exec(`ALTER TABLE edges_new RENAME TO edges`); err != nil {
-		return fmt.Errorf("edges rebuild recovery: promote edges_new: %w", err)
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("edges rebuild recovery: begin tx: %w", err)
 	}
-	for _, q := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`,
-	} {
-		if _, err := d.conn.Exec(q); err != nil {
-			return fmt.Errorf("edges rebuild recovery: index after promote: %w", err)
+	queries := []struct {
+		label string
+		sql   string
+	}{
+		{"promote edges_new", `ALTER TABLE edges_new RENAME TO edges`},
+		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`},
+		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`},
+		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)`},
+		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`},
+	}
+	for _, q := range queries {
+		if _, err := tx.Exec(q.sql); err != nil {
+			_ = tx.Rollback()
+			// Do NOT drop edges_new here: it holds the only copy of the edge
+			// data (edges does not exist yet), and the rollback has already
+			// undone the RENAME — recovery retries on the next Open.
+			return fmt.Errorf("edges rebuild recovery: %s: %w", q.label, err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("edges rebuild recovery: commit: %w", err)
 	}
 	return nil
 }
