@@ -2,6 +2,8 @@ module github.com/dorokuma/codegraph-go
 
 go 1.25.12
 
+toolchain go1.26.5
+
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/fsnotify/fsnotify v1.10.1
