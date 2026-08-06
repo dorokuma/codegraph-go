@@ -35,6 +35,11 @@ type Orchestrator struct {
 	// the caller distinguish "unparseable file" from "successfully empty"
 	// when the fallback result is empty.
 	extractFn func(lang, source, store string) (ExtractResult, bool, error)
+
+	// nodeCountFn, when non-nil, replaces the stored node-count lookup used
+	// by the keep-old-index decision (S1). Test seam for the count-query
+	// failure path.
+	nodeCountFn func(path string) (int, error)
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -53,6 +58,15 @@ func (o *Orchestrator) isForce() bool {
 	o.forceMu.Lock()
 	defer o.forceMu.Unlock()
 	return o.force
+}
+
+// fileNodeCount returns the stored node_count for store, honoring the
+// nodeCountFn test seam.
+func (o *Orchestrator) fileNodeCount(store string) (int, error) {
+	if o.nodeCountFn != nil {
+		return o.nodeCountFn(store)
+	}
+	return o.db.GetFileNodeCount(store)
 }
 
 // splitNameLineKey parses keys produced as fmt.Sprintf("%s:%d", name, line).
@@ -423,10 +437,12 @@ func (o *Orchestrator) indexFile(path string, lang string) (int, error) {
 	// it would destroy the previous symbols, so treat it as an extraction
 	// failure: keep the old index, log a warning, touch meta (so full scans
 	// don't retry the broken file every pass) and return nil so IndexAll
-	// continues. A successful tree-sitter parse with an empty result (file
-	// genuinely cleared) still clears the old index as before.
+	// continues. The same applies when the stored node-count query itself
+	// fails (cerr != nil): the old index could not be inspected, so never
+	// gamble on clearing it. A successful tree-sitter parse with an empty
+	// result (file genuinely cleared) still clears the old index as before.
 	if tsErrored && len(result.Nodes) == 0 && len(result.Edges) == 0 && len(result.Refs) == 0 {
-		if old, cerr := o.db.GetFileNodeCount(store); cerr == nil && old > 0 {
+		if old, cerr := o.fileNodeCount(store); cerr != nil || old > 0 {
 			log.Printf("warning: extraction failed for %s (tree-sitter error, regex found nothing), keeping existing index", path)
 			if info, serr := os.Stat(path); serr == nil {
 				_ = o.db.TouchFileMeta(store, info.Size(), float64(info.ModTime().UnixMilli()), contentHash)

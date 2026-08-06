@@ -193,6 +193,172 @@ func TestKillStaleDaemonRefusesPIDReuse(t *testing.T) {
 	<-done
 }
 
+func TestIsCodegraphCmdline(t *testing.T) {
+	cases := []struct {
+		cmdline string
+		want    bool
+	}{
+		{"codegraph\x00-workdir /x", true},
+		{"codegraph-go\x00-workdir /x", true},
+		{"/usr/local/bin/codegraph\x00-workdir /x", true},
+		{"./codegraph-go\x00-workdir /x", true},
+		{"/opt/my tools/codegraph-go\x00-workdir /x", true}, // argv[0] path with spaces
+		{"sleep\x001000", false},                            // unrelated process
+		{"/opt/editor-codegraph/editor\x00/x", false},       // substring only, not a segment
+		{"codegraph-editor\x00", false},                     // basename is not exactly codegraph
+		{"codegraph-server\x00", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isCodegraphCmdline(c.cmdline); got != c.want {
+			t.Errorf("isCodegraphCmdline(%q) = %v, want %v", c.cmdline, got, c.want)
+		}
+	}
+}
+
+// TestKillStaleDaemonRefusesUnrelatedCmdline: an older pidfile without a
+// recorded start time (ProcStart==0) whose live process is unrelated — its
+// argv[0] is not a codegraph binary — must be refused: no signal, no lock
+// removal.
+func TestKillStaleDaemonRefusesUnrelatedCmdline(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for unrelated process cmdline")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	// The unrelated process must still be running and the lock still present.
+	select {
+	case <-done:
+		t.Fatal("unrelated process was killed despite identity mismatch")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite identity mismatch: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonRefusesCodegraphSubstringCmdline: an unrelated process
+// whose argv[0] merely CONTAINS "codegraph" (e.g. an editor installed under
+// .../codegraph-editor/) must not pass the identity check — only exact
+// basename/path-segment matches count.
+func TestKillStaleDaemonRefusesCodegraphSubstringCmdline(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	cmd.Args[0] = "/opt/editor-codegraph/editor" // path contains the word, binary is not codegraph
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for codegraph-substring cmdline")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("unrelated process was killed despite identity mismatch")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite identity mismatch: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonRefusesUnreadableStartTime: the pidfile records a start
+// time (ProcStart>0) but /proc no longer reports one — data is insufficient,
+// so verification must refuse instead of degrading to the weaker cmdline
+// check (never risk SIGTERMing a recycled pid).
+func TestKillStaleDaemonRefusesUnreadableStartTime(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate /proc becoming unreadable (permission change, procfs unmounted)
+	// while the process is still alive.
+	orig := procStartTimeFn
+	procStartTimeFn = func(int) int64 { return 0 }
+	defer func() { procStartTimeFn = orig }()
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal when start time is unreadable")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("process was killed despite unreadable start time")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite unreadable start time: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
 func TestRegistryRoundtrip(t *testing.T) {
 	// Use a unique root so we don't clobber real registry entries.
 	root := filepath.Join(t.TempDir(), "proj")

@@ -162,6 +162,14 @@ func KillStaleDaemon(projectRoot string) error {
 	return nil
 }
 
+// procStartTimeFn/procCmdlineFn are the /proc readers used by
+// verifyDaemonIdentity. They are variables so tests can simulate an
+// unreadable /proc; production behavior always uses the real implementations.
+var (
+	procStartTimeFn = procStartTime
+	procCmdlineFn   = procCmdline
+)
+
 // verifyDaemonIdentity guards the SIGTERM in KillStaleDaemon against PID
 // reuse: between reading the pidfile and signaling, the recorded pid may have
 // died and been recycled by an unrelated process. When /proc is available the
@@ -173,21 +181,57 @@ func KillStaleDaemon(projectRoot string) error {
 // verification or verification is impossible.
 func verifyDaemonIdentity(info *LockInfo) error {
 	if info.ProcStart > 0 {
-		if cur := procStartTime(info.PID); cur > 0 {
-			if cur != info.ProcStart {
-				return fmt.Errorf("refusing to kill pid %d: process start time changed (pid reused by another process)", info.PID)
-			}
-			return nil
+		cur := procStartTimeFn(info.PID)
+		if cur == 0 {
+			// The pidfile records a start time but /proc no longer reports
+			// one: data is insufficient to confirm identity, so refuse rather
+			// than degrade to a weaker check (never risk SIGTERMing a process
+			// we cannot identify).
+			return fmt.Errorf("refusing to kill pid %d: cannot read process start time (pid reused by another process?)", info.PID)
 		}
+		if cur != info.ProcStart {
+			return fmt.Errorf("refusing to kill pid %d: process start time changed (pid reused by another process)", info.PID)
+		}
+		return nil
 	}
-	if cmdline := procCmdline(info.PID); cmdline != "" {
-		if !strings.Contains(strings.ToLower(cmdline), "codegraph") {
+	if cmdline := procCmdlineFn(info.PID); cmdline != "" {
+		if !isCodegraphCmdline(cmdline) {
 			return fmt.Errorf("refusing to kill pid %d: not a codegraph daemon (cmdline %q; pid reused by another process)", info.PID, cmdline)
 		}
 		return nil
 	}
 	// No /proc on this platform: cannot verify — keep historical behavior.
 	return nil
+}
+
+// isCodegraphCmdline reports whether the process argv names a codegraph
+// daemon binary. Only argv[0] (the executable path) is inspected, and only
+// via exact basename/path-segment matching — never a bare substring match,
+// which would let an unrelated process whose path merely contains
+// "codegraph" (e.g. an editor under .../codegraph-editor/) pass the check
+// and get SIGTERMed. argv[0] may be relative or absolute and may contain
+// spaces (a path with spaces); the basename comparison handles both.
+func isCodegraphCmdline(cmdline string) bool {
+	argv0 := cmdline
+	if i := strings.IndexByte(cmdline, 0); i >= 0 {
+		argv0 = cmdline[:i]
+	}
+	if argv0 == "" {
+		return false
+	}
+	switch filepath.Base(argv0) {
+	case "codegraph", "codegraph-go":
+		return true
+	}
+	// Path-segment fallback for relative or cleaned paths: a segment equal to
+	// "codegraph-go", or a path ending in "codegraph" or "codegraph-go".
+	cleaned := filepath.Clean(argv0)
+	for _, seg := range strings.Split(cleaned, string(filepath.Separator)) {
+		if seg == "codegraph-go" {
+			return true
+		}
+	}
+	return cleaned == "codegraph" || strings.HasSuffix(cleaned, "/codegraph") || strings.HasSuffix(cleaned, "/codegraph-go")
 }
 
 // procStartTime returns the starttime field (22nd) of /proc/<pid>/stat, or 0

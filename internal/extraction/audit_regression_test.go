@@ -182,6 +182,77 @@ func TestIndexFileTSErrorRegexEmptyKeepsOldIndex(t *testing.T) {
 	}
 }
 
+// TestIndexFileTSErrorRegexEmptyCountQueryFailsKeepsOldIndex: tree-sitter
+// errors, the regex fallback is empty, and the stored node-count query itself
+// fails (cerr != nil) — the orchestrator must NOT fall into the
+// "successful empty result clears the old index" path. It keeps the old
+// symbols, touches meta, and returns nil: never gamble on clearing an index
+// it could not inspect.
+func TestIndexFileTSErrorRegexEmptyCountQueryFailsKeepsOldIndex(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src := filepath.Join(root, "a.go")
+	body := []byte("package p\nfunc Hello() {}\n")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := NewOrchestrator(database, root)
+	if _, err := orch.IndexFile(src); err != nil {
+		t.Fatal(err)
+	}
+	hs, _ := database.GetNodeByName("Hello")
+	if len(hs) != 1 {
+		t.Fatalf("setup: expected Hello indexed, got %d", len(hs))
+	}
+
+	// Content changes (passes the content-hash gate), then tree-sitter errors
+	// with an empty regex fallback while the node-count query fails.
+	broken := []byte("package p\nfunc Broken( {\n")
+	if err := os.WriteFile(src, broken, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orch.extractFn = func(lang, source, store string) (ExtractResult, bool, error) {
+		return ExtractResult{}, true, nil // ts error + regex empty
+	}
+	orch.nodeCountFn = func(path string) (int, error) {
+		return 0, errors.New("injected count query failure")
+	}
+	defer func() {
+		orch.extractFn = nil
+		orch.nodeCountFn = nil
+	}()
+
+	n, err := orch.indexFile(src, "go")
+	if err != nil {
+		t.Fatalf("indexFile should treat count-query failure as recoverable: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 nodes on failed extraction, got %d", n)
+	}
+	// Old symbols preserved — a failed count query must not clear them.
+	hs, _ = database.GetNodeByName("Hello")
+	if len(hs) != 1 {
+		t.Fatalf("old symbol was wiped when node-count query failed: %d", len(hs))
+	}
+	// No node_count=0 record: the stored count still reflects the old index.
+	key := db.StoragePath(root, src)
+	nodeCount, err := database.GetFileNodeCount(key)
+	if err != nil || nodeCount == 0 {
+		t.Fatalf("node_count must stay >0 when count query failed, got %d err=%v", nodeCount, err)
+	}
+	// Meta touched so full scans don't retry the broken file every pass.
+	same, herr := database.FileHasContentHash(key, hashContent(broken))
+	if herr != nil || !same {
+		t.Fatalf("expected touched content_hash after failed extraction: same=%v err=%v", same, herr)
+	}
+}
+
 // TestIndexFileTSErrorRegexNonEmptyProceeds: tree-sitter errors but the regex
 // fallback finds symbols — the fallback result must be indexed (the failure
 // path only triggers when the fallback is also empty).
