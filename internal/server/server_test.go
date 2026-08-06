@@ -38,6 +38,67 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
+func TestResolvePathSymlinkEscape(t *testing.T) {
+	// B6/W8: a symlink inside the workspace pointing outside must be rejected
+	// by resolvePath/resolvePathIn (search/files/explore all go through it).
+	base := t.TempDir()
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "ws")
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(ws, "evil")
+	if err := os.Symlink(outside, evil); err != nil {
+		t.Fatal(err)
+	}
+	good := filepath.Join(ws, "good")
+	inner := filepath.Join(ws, "sub")
+	if err := os.Symlink(inner, good); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{Workdir: ws, Workdirs: []string{ws}}
+
+	// Direct link target outside → rejected.
+	if _, err := s.resolvePathIn(ws, "evil"); err == nil {
+		t.Fatal("expected symlink escape (evil) to be rejected")
+	}
+	// Child path through the escaping link → rejected.
+	if _, err := s.resolvePathIn(ws, "evil/file.txt"); err == nil {
+		t.Fatal("expected symlink escape (evil/file.txt) to be rejected")
+	}
+	// Nonexistent tail under the escaping link → rejected (ancestor resolved).
+	if _, err := s.resolvePathIn(ws, "evil/notyet"); err == nil {
+		t.Fatal("expected symlink escape (evil/notyet) to be rejected")
+	}
+	// resolvePath across workdirs → rejected too.
+	if _, err := s.resolvePath("evil"); err == nil {
+		t.Fatal("expected resolvePath to reject symlink escape")
+	}
+	// Absolute path through the escaping link → rejected.
+	if _, err := s.resolvePathIn(ws, evil); err == nil {
+		t.Fatal("expected absolute symlink escape to be rejected")
+	}
+
+	// Symlink to a location INSIDE the workspace → allowed, returns the real path.
+	got, err := s.resolvePathIn(ws, "good")
+	if err != nil {
+		t.Fatalf("internal symlink rejected: %v", err)
+	}
+	if got != inner {
+		t.Fatalf("resolvePathIn(good) = %q, want %q", got, inner)
+	}
+
+	// Ordinary paths inside the workspace still resolve.
+	got, err = s.resolvePathIn(ws, "sub")
+	if err != nil || got != inner {
+		t.Fatalf("resolvePathIn(sub) = %q err=%v, want %q", got, err, inner)
+	}
+}
+
 func TestStripStringsAndComments(t *testing.T) {
 	tests := []struct {
 		input string
@@ -157,8 +218,8 @@ func TestResolveProjectDefaultAndNearest(t *testing.T) {
 	}
 	defer defDB.Close()
 
-	// separate project with its own index
-	other := filepath.Join(base, "other")
+	// separate project with its own index, INSIDE the configured workdir
+	other := filepath.Join(def, "other")
 	os.MkdirAll(filepath.Join(other, "pkg"), 0o755)
 	otherDB, err := db.Open(other)
 	if err != nil {
@@ -185,11 +246,69 @@ func TestResolveProjectDefaultAndNearest(t *testing.T) {
 	}
 	s.closeProjectCache()
 
-	// unindexed path
+	// unindexed path (no .codegraph anywhere up the tree → error before the
+	// workdir whitelist even applies)
 	lonely := filepath.Join(base, "lonely")
 	os.MkdirAll(lonely, 0o755)
 	if _, _, err := s.resolveProject(lonely); err == nil {
 		t.Fatal("expected error for unindexed projectPath")
+	}
+}
+
+func TestResolveProjectWorkdirWhitelist(t *testing.T) {
+	// B7/W9: projectPath must resolve to a project root inside the configured
+	// workdirs; indexed projects elsewhere are rejected.
+	base := t.TempDir()
+	ws := filepath.Join(base, "ws")
+	if err := os.MkdirAll(filepath.Join(ws, "proj", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wsDB, err := db.Open(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsDB.Close()
+	// indexed project inside the workdir
+	projDB, err := db.Open(filepath.Join(ws, "proj"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projDB.Close()
+	// indexed project OUTSIDE the workdirs
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outDB, err := db.Open(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outDB.Close()
+
+	s := &Server{Workdir: ws, Workdirs: []string{ws}, Database: wsDB}
+
+	// Inside → accepted.
+	root, database, err := s.resolveProject(filepath.Join(ws, "proj", "pkg"))
+	if err != nil {
+		t.Fatalf("inside project rejected: %v", err)
+	}
+	if root != filepath.Join(ws, "proj") {
+		t.Fatalf("root = %q", root)
+	}
+	s.releaseProject(root)
+	s.closeProjectCache()
+
+	// Outside → rejected with a clear error.
+	if _, _, err := s.resolveProject(outside); err == nil {
+		t.Fatal("expected outside project to be rejected")
+	} else if !strings.Contains(err.Error(), "outside configured workdirs") {
+		t.Fatalf("error %q should mention configured workdirs", err)
+	}
+
+	// Default (empty projectPath) still works.
+	root, database, err = s.resolveProject("")
+	if err != nil || root != ws || database != wsDB {
+		t.Fatalf("default: root=%q err=%v", root, err)
 	}
 }
 

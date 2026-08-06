@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTryAcquireLockExclusive(t *testing.T) {
@@ -76,6 +78,68 @@ func TestIsProcessAliveSelf(t *testing.T) {
 	}
 	if IsProcessAlive(0) || IsProcessAlive(-1) {
 		t.Fatal("invalid pids")
+	}
+}
+
+func TestKillStaleDaemonDeadPID(t *testing.T) {
+	// B1: KillStaleDaemon with a pidfile naming a dead process must clear the
+	// stale lock and return nil (no signal needed).
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dead := LockInfo{PID: 1 << 30, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1}
+	if err := os.WriteFile(pidPath, EncodeLock(dead), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if IsProcessAlive(dead.PID) {
+		t.Skip("unlikely pid is alive on this host")
+	}
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon: %v", err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pidfile not cleared")
+	}
+}
+
+func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
+	// B1: KillStaleDaemon SIGTERMs the live process named in the pidfile,
+	// waits for it to exit, then clears the lock.
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	// Reap the child in the background — like a real daemon (reparented via
+	// SpawnDetached's Process.Release), the helper must not linger as a
+	// zombie or IsProcessAlive would see it as still alive.
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	defer cmd.Process.Kill() //nolint:errcheck
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon: %v", err)
+	}
+	// The helper must have been terminated and the lock cleared.
+	select {
+	case werr := <-waited:
+		if werr == nil {
+			t.Fatal("helper process still running after KillStaleDaemon")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper process not terminated after KillStaleDaemon")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pidfile not cleared after kill")
 	}
 }
 

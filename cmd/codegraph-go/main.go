@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dorokuma/codegraph-go/internal/config"
@@ -44,6 +45,29 @@ func runInit(root string) error {
 		return err
 	}
 	slog.Info("init ok", "workdir", abs, "db", filepath.Join(abs, ".codegraph", "codegraph.db"))
+	return nil
+}
+
+// checkDirectFallbackSafe verifies the index is not owned by another live
+// process before falling back to direct mode (B1). If a daemon still holds
+// the DB — e.g. it survived the version-mismatch kill — running direct would
+// double-write the same index, so we return an actionable error instead.
+func checkDirectFallbackSafe(root string) error {
+	pidPath := daemon.PidPath(root)
+	if raw, err := os.ReadFile(pidPath); err == nil {
+		if info := daemon.DecodeLock(raw); info != nil && info.PID > 0 && daemon.IsProcessAlive(info.PID) {
+			return fmt.Errorf("database in use by another process (daemon pid %d): stop the daemon first, or set CODEGRAPH_NO_DAEMON=1 to disable the shared daemon", info.PID)
+		}
+	}
+	// DB-level probe: a non-daemon writer may hold the index too.
+	database, err := db.Open(root)
+	if err != nil {
+		if strings.Contains(err.Error(), "in use") || strings.Contains(err.Error(), "locked") {
+			return fmt.Errorf("database in use by another process: %v (stop the other process first, or set CODEGRAPH_NO_DAEMON=1)", err)
+		}
+		return err
+	}
+	_ = database.Close()
 	return nil
 }
 
@@ -136,6 +160,13 @@ func main() {
 		return
 	}
 	slog.Info("mode=direct (daemon unavailable)")
+	// Never double-write: refuse direct mode while a live daemon still owns
+	// the index, with an actionable error and a non-zero exit.
+	if err := checkDirectFallbackSafe(root); err != nil {
+		fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
+		slog.Error("direct fallback blocked", "error", err)
+		os.Exit(1)
+	}
 	if err := server.RunDirect(cfg); err != nil {
 		slog.Error("runDirect failed", "error", err)
 		os.Exit(1)

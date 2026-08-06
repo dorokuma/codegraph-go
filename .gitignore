@@ -1,6 +1,10 @@
 # binary
+/codegraph
 /codegraph-go
 /codegraph-go.bak
+
+# ctxmode session db
+context_mode.db*
 
 # Go build/test artifacts
 *.test
@@ -14,3 +18,6 @@ vendor/
 
 # index database
 .codegraph/
+
+# coverage
+coverage.out

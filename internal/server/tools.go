@@ -535,6 +535,15 @@ func (s *Server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 		return recoverableProjectErr(err)
 	}
 	defer s.releaseProject(root)
+	// B6: explore's path filter must pass the same symlink-aware jail check as
+	// search/files — ToolExplore's own prefix test is not symlink-aware.
+	if args.Path != "" {
+		resolvedPath, perr := s.resolvePathIn(root, args.Path)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		args.Path = resolvedPath
+	}
 	text, err := tools.ToolExplore(ctx, database, s.Workdirs, root, tools.ExploreArgs{
 		Query:    args.Query,
 		Path:     args.Path,
@@ -583,7 +592,7 @@ func (s *Server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 
 	// Fallback: body-parse via rg (legacy path in callees_fallback.go).
-	return s.toolCalleesBodyFallback(ctx, root, args)
+	return s.toolCalleesBodyFallback(ctx, root, database, args)
 }
 
 func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {

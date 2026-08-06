@@ -18,6 +18,28 @@ func TestToolAffectedNoFiles(t *testing.T) {
 	}
 }
 
+func TestAffectedDepthClamp(t *testing.T) {
+	// B4/W5: Depth is clamped to 1–10; invalid values (<=0 or over the cap)
+	// fall back to the default 5.
+	tests := []struct {
+		in   int
+		want int
+	}{
+		{0, 5},   // zero → default
+		{5, 5},   // default passes through
+		{1, 1},   // lower bound
+		{10, 10}, // upper bound
+		{-3, 5},  // negative → default
+		{11, 5},  // over cap → default
+		{99, 5},  // way over cap → default
+	}
+	for _, tt := range tests {
+		if got := clampedDepth(tt.in); got != tt.want {
+			t.Errorf("clampedDepth(%d) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestToolAffectedWithTestFiles(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()

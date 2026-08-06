@@ -58,10 +58,11 @@ func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) ProxyResult {
 		log.Printf("write client hello: %v", err)
 	}
 
-	// PPID watchdog closes the socket (daemon refcount--) then we exit.
+	// PPID watchdog: closing the socket ends both io.Copy legs (daemon
+	// refcount--), so RunProxy returns normally and deferred cleanup runs.
+	// No os.Exit here — graceful shutdown keeps defer chains intact (B3).
 	stopWD := StartPPIDWatchdog(PPIDPollInterval(), func() {
 		_ = conn.Close()
-		os.Exit(0)
 	})
 	defer stopWD()
 
@@ -88,26 +89,39 @@ func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) ProxyResult {
 }
 
 // DialAnyCandidate walks SocketCandidates and returns the first same-version connection.
-func DialAnyCandidate(projectRoot string) (net.Conn, *bufio.Reader, Hello, bool) {
+// The returned reason is non-empty when a definitive version-mismatch daemon was found
+// (callers use it to decide whether a stale daemon needs to be killed first).
+func DialAnyCandidate(projectRoot string) (net.Conn, *bufio.Reader, Hello, bool, string) {
 	for _, c := range SocketCandidates(projectRoot) {
 		conn, br, hello, res := ConnectHello(c)
 		if res.Outcome == "proxied" {
-			return conn, br, hello, true
+			return conn, br, hello, true, ""
 		}
 		if res.Reason != "" && contains(res.Reason, "version mismatch") {
 			// Definitive — don't keep probing.
-			return nil, nil, Hello{}, false
+			return nil, nil, Hello{}, false, res.Reason
 		}
 	}
-	return nil, nil, Hello{}, false
+	return nil, nil, Hello{}, false, ""
 }
 
 // EnsureAndDial probes for a live daemon, spawning one if needed, then dials.
 // Returns ok=false when the daemon path is unavailable (caller → direct mode).
 // opts is passed to SpawnDetached so -config / -no-sync match the parent.
 func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, opts *SpawnOpts) (net.Conn, *bufio.Reader, Hello, bool) {
-	if conn, br, hello, ok := DialAnyCandidate(projectRoot); ok {
+	conn, br, hello, ok, reason := DialAnyCandidate(projectRoot)
+	if ok {
 		return conn, br, hello, true
+	}
+	if contains(reason, "version mismatch") {
+		// Definitive version mismatch (B1): the running daemon belongs to a
+		// different build and will never accept us. Kill it and clear its
+		// pidfile so the fresh spawn below can acquire the lock; the old
+		// daemon must not keep writing an index this build is about to
+		// migrate/replace.
+		if err := KillStaleDaemon(projectRoot); err != nil {
+			log.Printf("kill stale daemon: %v", err)
+		}
 	}
 	if err := SpawnDetached(projectRoot, opts); err != nil {
 		log.Printf("spawn daemon: %v", err)
@@ -116,7 +130,7 @@ func EnsureAndDial(projectRoot string, wait time.Duration, poll time.Duration, o
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		time.Sleep(poll)
-		if conn, br, hello, ok := DialAnyCandidate(projectRoot); ok {
+		if conn, br, hello, ok, _ := DialAnyCandidate(projectRoot); ok {
 			return conn, br, hello, true
 		}
 	}

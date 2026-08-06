@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -44,6 +45,10 @@ type Server struct {
 	// DefReCache avoids recompiling the caller-filter regex per toolCallers invocation.
 	DefReCache stdsync.Map // string → *regexp.Regexp
 
+	// pathMu guards realRoots (B6: EvalSymlinks cache for resolvePathIn).
+	pathMu    stdsync.Mutex
+	realRoots map[string]string // workspace root → symlink-resolved real path
+
 	// detectCache avoids repeated os.ReadDir+stat per tool call in home mode.
 	DetectMu   stdsync.Mutex
 	DetectDone bool
@@ -76,12 +81,21 @@ func RunDirect(cfg config.Config) error {
 	defer cleanup()
 
 	srv := NewMCPServer(s)
+	// PPID watchdog (B3): cancel the session context so srv.Run returns and
+	// the deferred cleanup runs (WAL checkpoint stop, connection close) —
+	// no os.Exit, so defers are honored.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	stopWD := daemon.StartPPIDWatchdog(daemon.PPIDPollInterval(), func() {
-		os.Exit(0)
+		cancel()
 	})
 	defer stopWD()
 
-	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// Parent died — graceful shutdown, not a server error.
+			return nil
+		}
 		return fmt.Errorf("server exited: %w", err)
 	}
 	return nil
@@ -206,47 +220,54 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 	var err error
 	rebuild, oldVer, rebuildErr := database.NeedsRebuild()
 	if rebuildErr != nil {
-		slog.Warn("schema revision check", "error", rebuildErr)
-	}
-	if rebuild {
-		slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
-
-		select {
-		case <-s.BgDone:
-			return
-		default:
-		}
-		files, nodes, err = orch.RebuildAll()
+		// B2 (Critical#2 server side): schema state is unknown — e.g. the DB
+		// is locked by another process or the meta table is unreadable.
+		// Rebuilding or indexing now could double-write or corrupt the
+		// index, so log the error and skip this round entirely: no
+		// RebuildAll, no IndexAll, no SetSchemaRevision. The watcher below
+		// still re-syncs on later changes.
+		slog.Error("schema revision check failed; skipping index round", "error", rebuildErr)
 	} else {
-		slog.Info("indexing project in background...")
+		if rebuild {
+			slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
 
-		select {
-		case <-s.BgDone:
-			return
-		default:
-		}
-		files, nodes, err = orch.IndexAll()
-		if err == nil {
-			_ = database.SetSchemaRevision()
-		}
-	}
-	if err != nil {
-		slog.Warn("index warning", "error", err)
-	}
-	slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
+			select {
+			case <-s.BgDone:
+				return
+			default:
+			}
+			files, nodes, err = orch.RebuildAll()
+		} else {
+			slog.Info("indexing project in background...")
 
-	// Optional git-status assist: catch edits missed while nothing was watching.
-	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
-		select {
-		case <-s.BgDone:
-			return
-		default:
+			select {
+			case <-s.BgDone:
+				return
+			default:
+			}
+			files, nodes, err = orch.IndexAll()
+			if err == nil {
+				_ = database.SetSchemaRevision()
+			}
 		}
-		c, n, gerr := orch.IndexChanges(dirty)
-		if gerr != nil {
-			slog.Warn("git-assist sync", "error", gerr)
-		} else if c > 0 {
-			slog.Info("git-assist sync", "files", c, "nodes", n)
+		if err != nil {
+			slog.Warn("index warning", "error", err)
+		}
+		slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
+
+		// Optional git-status assist: catch edits missed while nothing was watching.
+		if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
+			select {
+			case <-s.BgDone:
+				return
+			default:
+			}
+			c, n, gerr := orch.IndexChanges(dirty)
+			if gerr != nil {
+				slog.Warn("git-assist sync", "error", gerr)
+			} else if c > 0 {
+				slog.Info("git-assist sync", "files", c, "nodes", n)
+			}
 		}
 	}
 

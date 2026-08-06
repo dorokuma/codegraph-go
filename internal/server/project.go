@@ -115,6 +115,12 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 			abs,
 		)
 	}
+	// B7/W9: the located project root must live inside a configured workdir
+	// (symlink-resolved on both sides); otherwise a projectPath can point the
+	// server at any indexed directory on disk.
+	if !s.projectRootAllowed(resolved) {
+		return "", nil, fmt.Errorf("project %q outside configured workdirs %v", projectPath, s.Workdirs)
+	}
 	if resolved == s.Workdir {
 		return s.Workdir, s.Database, nil
 	}
@@ -176,6 +182,22 @@ func (s *Server) touchProjectLRU(root string) {
 			return
 		}
 	}
+}
+
+// projectRootAllowed reports whether the resolved project root lies within one
+// of the configured workdirs. Both sides are symlink-resolved so a link cannot
+// smuggle a project root outside the configured roots (B7/W9).
+func (s *Server) projectRootAllowed(root string) bool {
+	real, err := filepath.EvalSymlinks(root)
+	if err != nil || real == "" {
+		real = filepath.Clean(root)
+	}
+	for _, wd := range s.Workdirs {
+		if pathWithinRealRoot(s.realRoot(wd), real) {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseProject decrements the refcount on a cross-project DB and closes

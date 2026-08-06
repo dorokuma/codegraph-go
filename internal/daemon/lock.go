@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -100,6 +101,53 @@ func ClearStaleLock(pidPath string, expectedDeadPID int) bool {
 		return false
 	}
 	return true
+}
+
+// KillStaleDaemon terminates a live daemon whose version no longer matches
+// (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
+// pidfile, SIGTERMs the process when alive, polls up to 5s for exit, then
+// clears the stale pidfile. ClearStaleLock's expectedDeadPID guard ensures we
+// never remove a pidfile that was rewritten to name a different process.
+func KillStaleDaemon(projectRoot string) error {
+	pidPath := PidPath(projectRoot)
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	info := DecodeLock(raw)
+	if info == nil || info.PID <= 0 {
+		// Corrupt/empty pidfile — nothing to signal; clear if stale.
+		ClearStaleLock(pidPath, 0)
+		return nil
+	}
+	if IsProcessAlive(info.PID) {
+		proc, ferr := os.FindProcess(info.PID)
+		if ferr != nil {
+			return ferr
+		}
+		log.Printf("killing stale daemon pid=%d (version mismatch; upgrade cleanup)", info.PID)
+		if serr := proc.Signal(syscall.SIGTERM); serr != nil {
+			// The process may have died between the probe and the signal.
+			if !IsProcessAlive(info.PID) {
+				ClearStaleLock(pidPath, info.PID)
+				return nil
+			}
+			return serr
+		}
+		// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			if !IsProcessAlive(info.PID) {
+				break
+			}
+		}
+	}
+	ClearStaleLock(pidPath, info.PID)
+	return nil
 }
 
 // IsProcessAlive probes pid with signal 0. EPERM counts as alive.

@@ -322,6 +322,9 @@ func RunAsDaemon(root string, handler SessionHandler, onReady func() error) erro
 		// Taken.
 		existing := res.Existing
 		if existing != nil && existing.PID > 0 && IsProcessAlive(existing.PID) {
+			// Clean exit path (B3): we never acquired the lock and hold no
+			// socket/goroutines, so nothing needs cleanup — a plain return
+			// (not os.Exit) lets caller defers run.
 			log.Printf("another daemon (pid %d) holds the lock; exiting", existing.PID)
 			return nil
 		}

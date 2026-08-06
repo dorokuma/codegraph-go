@@ -39,14 +39,28 @@ var testPatterns = map[string][]string{
 	"csharp":     {"*Test.cs", "*Tests.cs"},
 }
 
+// Default and max affected depth (aligned with the graph impact depth cap).
+const (
+	defaultAffectedDepth = 5
+	maxAffectedDepth     = 10
+)
+
+// clampedDepth validates the affected Depth argument (B4/W5): values in
+// [1, maxAffectedDepth] are kept; invalid values (<=0 or over the cap) fall
+// back to the default depth.
+func clampedDepth(depth int) int {
+	if depth < 1 || depth > maxAffectedDepth {
+		return defaultAffectedDepth
+	}
+	return depth
+}
+
 // ToolAffected finds test files affected by changes.
 // DB reads now accept context via Context variants; cancellation is supported.
 // Stdin is for offline/CLI helpers only. MCP must pass files= and never set Stdin
 // (server layer rejects stdin — process stdio is the MCP protocol stream).
 func ToolAffected(ctx context.Context, database *db.DB, workdir string, args AffectedArgs) (*AffectedResult, error) {
-	if args.Depth == 0 {
-		args.Depth = 5
-	}
+	args.Depth = clampedDepth(args.Depth)
 
 	files := args.Files
 	if args.Stdin {

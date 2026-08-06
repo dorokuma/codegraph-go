@@ -21,7 +21,7 @@ var callRe = regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 
 // toolCalleesBodyFallback is the legacy rg + brace-matching path used when
 // the call graph has no edges for the symbol yet.
-func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, args nameArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, database *db.DB, args nameArgs) (*mcp.CallToolResult, any, error) {
 	// Guard against rg hanging on large trees or named pipes.
 	rgCtx, rgCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer rgCancel()
@@ -290,9 +290,44 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 		}, nil, nil
 	}
 
+	// B5/W6: output one entry per callee with the callee name, and prefer the
+	// callee's definition position from the index (same-file/scope node first,
+	// then any node with that name). Only when no definition exists do we emit
+	// the call-site position, explicitly labeled as fallback/call-site
+	// semantics so it cannot be confused with graph-path results. The leading
+	// file:line token stays shape-compatible with the graph path.
+	type defLoc struct {
+		file string
+		line int
+	}
+	// Cache resolution per (callee, def file) — the same-file preference
+	// depends on which definition body the call was found in.
+	defCache := make(map[string]defLoc)
+	notFound := make(map[string]bool)
+	resolveDef := func(callee, defFile string) (defLoc, bool) {
+		key := callee + "|" + defFile
+		if loc, ok := defCache[key]; ok {
+			return loc, true
+		}
+		if notFound[key] {
+			return defLoc{}, false
+		}
+		file, line, ok := s.calleeDefLocation(ctx, database, root, callee, defFile)
+		if ok {
+			defCache[key] = defLoc{file: file, line: line}
+		} else {
+			notFound[key] = true
+		}
+		return defLoc{file: file, line: line}, ok
+	}
+
 	var b strings.Builder
 	for _, c := range allCalls {
-		fmt.Fprintf(&b, "%s:%d\n", db.RelPath(root, c.file), c.line)
+		if loc, ok := resolveDef(c.callee, c.file); ok {
+			fmt.Fprintf(&b, "%s:%d  %s\n", db.RelPath(root, loc.file), loc.line, c.callee)
+		} else {
+			fmt.Fprintf(&b, "%s:%d  %s  (call site, fallback)\n", db.RelPath(root, c.file), c.line, c.callee)
+		}
 	}
 	if len(allCalls) >= args.MaxResults {
 		fmt.Fprintf(&b, "... (max %d)\n", args.MaxResults)
@@ -302,4 +337,34 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, args 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(out, defaultOutputChars)}},
 	}, nil, nil
+}
+
+// calleeDefLocation resolves a callee name to a definition node in the index
+// (B5). Prefers a node in the same file as the caller's definition (target
+// file/scope); falls back to any indexed node with that name. Returns the
+// node's storage path + line, or ok=false when the index has no definition.
+func (s *Server) calleeDefLocation(ctx context.Context, database *db.DB, root, name, defFile string) (file string, line int, ok bool) {
+	nodes, err := database.GetNodeByNameContext(ctx, name)
+	if err != nil || len(nodes) == 0 {
+		return "", 0, false
+	}
+	sameFileKey := db.StoragePath(root, defFile)
+	var anyFile string
+	var anyLine int
+	for i := range nodes {
+		n := &nodes[i]
+		if n.Kind == db.KindFile || n.Kind == "module" || n.File == "" {
+			continue
+		}
+		if anyFile == "" {
+			anyFile, anyLine = n.File, n.Line
+		}
+		if n.File == sameFileKey {
+			return n.File, n.Line, true
+		}
+	}
+	if anyFile != "" {
+		return anyFile, anyLine, true
+	}
+	return "", 0, false
 }
