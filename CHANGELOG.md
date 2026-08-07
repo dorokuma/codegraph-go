@@ -3,6 +3,20 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.5] - 2026-08-07
+
+### Fixed
+- Config `workdirs` are now enforced as the authority allowlist: a workdir
+  outside the declared roots (or not a descendant of one) is refused before
+  any mode is entered — client, daemon and direct alike — with canonical
+  (abs + symlink-resolved) comparison so symlink escapes are rejected. With
+  no usable config the allowlist defaults to `$HOME`, and when `$HOME`
+  itself cannot be resolved validation fails closed (every workdir is
+  refused). `init <root>` enforces the same guard so it is not a side door.
+
+### Changed
+- Display / daemon wire version **0.8.5**.
+
 ## [0.8.4] - 2026-08-06
 
 ### Fixed
