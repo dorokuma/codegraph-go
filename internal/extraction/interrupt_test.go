@@ -178,3 +178,59 @@ func TestRebuildAllInterruptedSkipsSchemaRevision(t *testing.T) {
 		t.Fatal("complete RebuildAll must mark the schema revision (NeedsRebuild=false)")
 	}
 }
+
+// TestRebuildAllSchemaRevisionFailureNotFaked: when SetSchemaRevision fails
+// after a successful wipe+reindex, RebuildAll must NOT return nil (fake
+// success) — the failure must be observable and the schema revision must stay
+// unmarked so the next startup re-runs the rebuild. Uses the
+// setSchemaRevisionFn test seam (injected failure).
+func TestRebuildAllSchemaRevisionFailureNotFaked(t *testing.T) {
+	root := t.TempDir()
+	writeGoFiles(t, root, 5)
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	orch := NewOrchestrator(database, root)
+	injected := errors.New("injected: cannot mark schema revision")
+	orch.setSchemaRevisionFn = func() error { return injected }
+
+	files, nodes, err := orch.RebuildAll()
+	if err == nil {
+		t.Fatalf("RebuildAll must not fake success when SetSchemaRevision fails (files=%d nodes=%d)", files, nodes)
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("expected the injected SetSchemaRevision failure, got: %v", err)
+	}
+	// The reindex itself really happened (observable work) — only the mark
+	// failed.
+	if files < 5 {
+		t.Fatalf("expected the wipe+reindex to run before the mark failure, files=%d", files)
+	}
+	if nodes <= 0 {
+		t.Fatalf("expected nodes after the reindex, got %d", nodes)
+	}
+	// The schema revision must not be marked: NeedsRebuild stays true.
+	rebuild, _, rerr := database.NeedsRebuild()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !rebuild {
+		t.Fatal("NeedsRebuild must remain true after a failed SetSchemaRevision — the index must not be trusted")
+	}
+
+	// Control: without the seam the same orchestrator path succeeds and marks.
+	orch.setSchemaRevisionFn = nil
+	if _, _, err := orch.RebuildAll(); err != nil {
+		t.Fatalf("complete RebuildAll: %v", err)
+	}
+	rebuild, _, rerr = database.NeedsRebuild()
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if rebuild {
+		t.Fatal("complete RebuildAll must mark the schema revision (NeedsRebuild=false)")
+	}
+}

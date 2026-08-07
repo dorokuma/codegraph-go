@@ -220,7 +220,8 @@ func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
 
 // SearchFacts searches facts by content substring (case-insensitive LIKE),
 // optionally filtered by target_file, target_symbol, status, and max rows.
-// status "" returns all statuses.
+// status "" returns all statuses. % and _ in query are matched literally
+// (escaped with ESCAPE '\') so a user search never expands into wildcards.
 func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -231,8 +232,8 @@ func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, e
 	var wheres []string
 	var args []interface{}
 	if query != "" {
-		wheres = append(wheres, `content LIKE ?`)
-		args = append(args, "%"+query+"%")
+		wheres = append(wheres, `content LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLikePattern(query)+"%")
 	}
 	if file != "" {
 		wheres = append(wheres, `target_file = ?`)
@@ -341,6 +342,13 @@ func scanFacts(rows *sql.Rows) ([]Fact, error) {
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// escapeLikePattern escapes LIKE wildcards (_ and %) so they match literally
+// when used inside a LIKE pattern with ESCAPE '\'. Backslashes are escaped
+// first so a literal backslash in the input cannot neutralize the escaping.
+func escapeLikePattern(s string) string {
+	return strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(s)
 }
 
 // statusOrDefault returns "active" when s is empty.
@@ -1310,18 +1318,32 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 	}
 	// Map batch placeholder ids (negative) to the real inserted ids. Values in
 	// the batch-node range -(1..len(nodes)) map to nodes; deeper negatives map
-	// to moduleNodes (F5).
-	realID := func(v int64) int64 {
+	// to moduleNodes (F5). Any placeholder outside both ranges is a malformed
+	// batch: it must fail with a diagnostic error (transaction rolls back)
+	// instead of panicking on an out-of-range slice index.
+	realID := func(v int64) (int64, error) {
 		if v < 0 {
 			idx := -(v + 1)
 			if idx < int64(len(ids)) {
-				return ids[idx]
+				return ids[idx], nil
 			}
-			return moduleIDs[idx-int64(len(ids))]
+			mIdx := idx - int64(len(ids))
+			if mIdx >= int64(len(moduleIDs)) {
+				return 0, fmt.Errorf("placeholder id %d out of range: %d batch nodes, %d module nodes", v, len(ids), len(moduleIDs))
+			}
+			return moduleIDs[mIdx], nil
 		}
-		return v
+		return v, nil
 	}
 	for _, e := range edges {
+		sid, err := realID(e.SourceID)
+		if err != nil {
+			return nil, fmt.Errorf("replace file edge source: %w", err)
+		}
+		tid, err := realID(e.TargetID)
+		if err != nil {
+			return nil, fmt.Errorf("replace file edge target: %w", err)
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO edges (source_id, target_id, kind, file, line, col, provenance, metadata)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1330,7 +1352,7 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 				file = excluded.file,
 				provenance = excluded.provenance,
 				metadata = excluded.metadata
-		`, realID(e.SourceID), realID(e.TargetID), e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata); err != nil {
+		`, sid, tid, e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata); err != nil {
 			return nil, fmt.Errorf("replace file insert edge: %w", err)
 		}
 	}
@@ -1338,6 +1360,10 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 		status := r.Status
 		if status == "" {
 			status = "pending"
+		}
+		fid, err := realID(r.FromNode)
+		if err != nil {
+			return nil, fmt.Errorf("replace file unresolved_ref from_node: %w", err)
 		}
 		if _, err := tx.Exec(`
 			INSERT INTO unresolved_refs (
@@ -1350,7 +1376,7 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 				status = excluded.status,
 				name_tail = excluded.name_tail,
 				candidates = excluded.candidates
-		`, realID(r.FromNode), r.ReferenceName, r.ReferenceKind, r.Line, r.Col,
+		`, fid, r.ReferenceName, r.ReferenceKind, r.Line, r.Col,
 			r.FilePath, r.Language, status, r.NameTail, r.Candidates); err != nil {
 			return nil, fmt.Errorf("replace file insert unresolved_ref: %w", err)
 		}
@@ -1491,7 +1517,7 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 	}
 
 	// Escape LIKE special chars in dir so _ and % are matched literally.
-	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(dir)
+	escaped := escapeLikePattern(dir)
 	pattern := escaped + "/%"
 
 	rows, err := d.conn.QueryContext(ctx,
@@ -1533,7 +1559,7 @@ func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, er
 	}
 
 	// Escape LIKE wildcards so path segments with _ or % match literally.
-	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(prefix)
+	escaped := escapeLikePattern(prefix)
 	var count int
 	err := d.conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM files WHERE path = ? OR path LIKE ? ESCAPE '\'`,
@@ -1626,7 +1652,7 @@ func (d *DB) FindImportersContext(ctx context.Context, targetPkg string) ([]stri
 	defer d.mu.RUnlock()
 
 	// Escape _ and % for LIKE; also escape the escape char itself.
-	escaped := strings.NewReplacer("\\", "\\\\", "_", "\\_", "%", "\\%").Replace(targetPkg)
+	escaped := escapeLikePattern(targetPkg)
 	rows, err := d.conn.QueryContext(ctx, `
 		SELECT DISTINCT e.file
 		FROM edges e

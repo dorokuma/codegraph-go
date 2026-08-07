@@ -55,6 +55,12 @@ func (s *Server) detectProject(queries ...string) string {
 		}
 		s.DetectDone = true
 	}
+	// Snapshot the cache under the lock: resetDetect (triggered concurrently
+	// by projectPath lookup failures) may clear or replace DetectDirs at any
+	// time, so the match loops below must never iterate the live slice
+	// (race). Iterating a copy keeps the cache semantics unchanged.
+	dirs := make([]string, len(s.DetectDirs))
+	copy(dirs, s.DetectDirs)
 	s.DetectMu.Unlock()
 
 	// Exact match against the base name.
@@ -63,7 +69,7 @@ func (s *Server) detectProject(queries ...string) string {
 		if q == "" {
 			continue
 		}
-		for _, fullPath := range s.DetectDirs {
+		for _, fullPath := range dirs {
 			base := strings.ToLower(filepath.Base(fullPath))
 			if base == q {
 				return fullPath
@@ -77,7 +83,7 @@ func (s *Server) detectProject(queries ...string) string {
 		if q == "" {
 			continue
 		}
-		for _, fullPath := range s.DetectDirs {
+		for _, fullPath := range dirs {
 			base := strings.ToLower(filepath.Base(fullPath))
 			if isWordIn(base, q) {
 				return fullPath

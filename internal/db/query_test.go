@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -1215,5 +1216,146 @@ func TestReplaceFileIndexModuleNodesAtomic(t *testing.T) {
 	}
 	if mods[0].Language != "rust" {
 		t.Fatalf("conflicting module node must refresh language, got %+v", mods)
+	}
+}
+
+// TestReplaceFileIndexPlaceholderOutOfRange: a negative placeholder id that
+// falls outside BOTH the batch-node range and the module-node range used to
+// index out of bounds and panic. It must now return a diagnostic error and
+// roll the transaction back (nothing written).
+func TestReplaceFileIndexPlaceholderOutOfRange(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	fileNode := Node{Kind: KindFile, Name: "oob.go", File: "oob.go", Line: 0, Language: "go"}
+
+	// Panic path A: node-placeholder range overrun with NO module nodes —
+	// with len(nodes)==1, any placeholder <= -3 used to panic on
+	// moduleIDs[idx-len(ids)].
+	_, err := database.ReplaceFileIndex("oob.go", []Node{fileNode}, []Edge{{
+		SourceID: -3, TargetID: -2, Kind: EdgeCalls, File: "oob.go", Line: 1, Provenance: "exact",
+	}}, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for out-of-range node placeholder")
+	}
+	if !strings.Contains(err.Error(), "placeholder") || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected a diagnostic placeholder error, got: %v", err)
+	}
+	// Transaction must have rolled back: no nodes/edges for oob.go.
+	if nodes, _ := database.GetNodesByFile("oob.go"); len(nodes) != 0 {
+		t.Fatalf("failed batch must roll back, got %d nodes for oob.go", len(nodes))
+	}
+
+	// Panic path B: module-placeholder range overrun — with len(nodes)==1
+	// and 1 module node, placeholder -4 (idx=3, mIdx=2) used to panic.
+	_, err = database.ReplaceFileIndex("oob.go", []Node{fileNode}, []Edge{{
+		SourceID: -1, TargetID: -4, Kind: EdgeImports, File: "oob.go", Line: 1, Provenance: "exact",
+	}}, nil, nil, Node{Kind: "module", Name: "mod/oob", File: "mod/oob", Line: 0, Language: "go"})
+	if err == nil {
+		t.Fatal("expected error for out-of-range module placeholder")
+	}
+	if !strings.Contains(err.Error(), "placeholder") || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected a diagnostic placeholder error, got: %v", err)
+	}
+	// Rollback: neither the file node nor the module node may survive.
+	if nodes, _ := database.GetNodesByFile("oob.go"); len(nodes) != 0 {
+		t.Fatalf("failed batch must roll back, got %d nodes for oob.go", len(nodes))
+	}
+	if mods, _ := database.GetNodeByName("mod/oob"); len(mods) != 0 {
+		t.Fatalf("module node must roll back with the failed batch, got %+v", mods)
+	}
+
+	// Unresolved-ref from_node placeholder out of range is caught too.
+	_, err = database.ReplaceFileIndex("oob.go", []Node{fileNode}, nil, []UnresolvedRef{{
+		FromNode: -7, ReferenceName: "x", ReferenceKind: EdgeCalls, Line: 1,
+		FilePath: "oob.go", Language: "go", Status: "pending", NameTail: "x",
+	}}, nil)
+	if err == nil {
+		t.Fatal("expected error for out-of-range unresolved_ref placeholder")
+	}
+	if !strings.Contains(err.Error(), "placeholder") || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected a diagnostic placeholder error, got: %v", err)
+	}
+	if refs, _ := database.ListUnresolvedRefs("oob.go", ""); len(refs) != 0 {
+		t.Fatalf("failed batch must roll back unresolved_refs, got %+v", refs)
+	}
+
+	// Control: an in-range placeholder batch still succeeds after the
+	// failures above.
+	ids, cerr := database.ReplaceFileIndex("ok.go", []Node{{Kind: KindFile, Name: "ok.go", File: "ok.go", Line: 0, Language: "go"}}, []Edge{{
+		SourceID: -1, TargetID: -2, Kind: EdgeImports, File: "ok.go", Line: 1, Provenance: "exact",
+	}}, nil, nil, Node{Kind: "module", Name: "mod/ok2", File: "mod/ok2", Line: 0, Language: "go"})
+	if cerr != nil {
+		t.Fatalf("in-range placeholder batch must succeed, got %v", cerr)
+	}
+	if len(ids) != 1 || ids[0] == 0 {
+		t.Fatalf("unexpected ids: %v", ids)
+	}
+}
+
+// TestSearchFactsLiteralWildcards: % and _ in the search query must be
+// matched literally (ESCAPE '\'), never expanded as LIKE wildcards — a
+// search for "50%" must not match every row containing "50", and "_" must
+// not match every non-empty row.
+func TestSearchFactsLiteralWildcards(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	database.InsertFact(&Fact{TargetFile: "a.go", Content: "50% done with the refactor", ContentHash: "h1", Status: "active"})
+	database.InsertFact(&Fact{TargetFile: "b.go", Content: "rename_to_new_name", ContentHash: "h2", Status: "active"})
+	database.InsertFact(&Fact{TargetFile: "c.go", Content: "plain text content", ContentHash: "h3", Status: "active"})
+
+	// Literal %: only the row that actually contains '%' matches.
+	facts, err := database.SearchFacts("50%", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search 50%%: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Content != "50% done with the refactor" {
+		t.Fatalf("search '50%%' = %+v, want only the literal-%% row", facts)
+	}
+
+	// A bare '%' must match only content containing a literal '%'.
+	facts, err = database.SearchFacts("%", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search %%: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Content != "50% done with the refactor" {
+		t.Fatalf("search '%%' = %+v, want only the literal-%% row", facts)
+	}
+
+	// Literal _: matches only the underscore row — without escaping, '_'
+	// matches ANY single character and would return all three rows.
+	facts, err = database.SearchFacts("rename_to_new_name", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search underscore: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Content != "rename_to_new_name" {
+		t.Fatalf("search 'rename_to_new_name' = %+v, want only the literal-underscore row", facts)
+	}
+	facts, err = database.SearchFacts("_", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search bare underscore: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Content != "rename_to_new_name" {
+		t.Fatalf("search '_' = %+v, want only the literal-underscore row", facts)
+	}
+
+	// No wildcard cross-matching: '50_done' must NOT match '50% done'
+	// (unescaped '_' would match the '%' character).
+	facts, err = database.SearchFacts("50_done", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search 50_done: %v", err)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("search '50_done' = %+v, want no wildcard cross-match", facts)
+	}
+
+	// Control: a normal substring still works.
+	facts, err = database.SearchFacts("plain text", "", "", "all", 20)
+	if err != nil {
+		t.Fatalf("search plain: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Content != "plain text content" {
+		t.Fatalf("control search = %+v", facts)
 	}
 }

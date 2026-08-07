@@ -55,6 +55,12 @@ type Orchestrator struct {
 	// same bytes indexFile indexes (no second read).
 	readFileFn func(path string) ([]byte, error)
 
+	// setSchemaRevisionFn replaces the schema-revision marking at the end of
+	// RebuildAll (test seam for the failure path — a DB that cannot be
+	// marked must never let RebuildAll fake success; production uses
+	// db.SetSchemaRevision).
+	setSchemaRevisionFn func() error
+
 	// partialFails counts files whose extraction failed with the old index
 	// kept (ErrKeepOldIndex) during index passes (M7). Guarded by partialMu;
 	// read via PartialFailures(). Reset at the start of each pass so the
@@ -524,10 +530,24 @@ func (o *Orchestrator) RebuildAll() (int, int, error) {
 		// instead of trusting an empty/half index.
 		return files, nodes, err
 	}
-	if err := o.db.SetSchemaRevision(); err != nil {
-		log.Printf("set schema revision: %v", err)
+	if err := o.markSchemaRevision(); err != nil {
+		// The reindex itself succeeded, but the index cannot be certified as
+		// current: returning nil here would fake success — the caller would
+		// trust an index whose revision was never marked (and a later
+		// NeedsRebuild may or may not catch it). Propagate the failure so the
+		// caller can surface it.
+		return files, nodes, err
 	}
 	return files, nodes, nil
+}
+
+// markSchemaRevision records that the index matches the current extractor
+// semantics, honoring the setSchemaRevisionFn test seam.
+func (o *Orchestrator) markSchemaRevision() error {
+	if o.setSchemaRevisionFn != nil {
+		return o.setSchemaRevisionFn()
+	}
+	return o.db.SetSchemaRevision()
 }
 
 // IndexFile indexes a single file.

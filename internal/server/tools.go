@@ -903,13 +903,36 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	}
 	defer s.releaseProject(root)
 
-	// Normalize absolute path to workdir-relative
-	targetFile := args.TargetFile
-	if filepath.IsAbs(targetFile) {
-		rel, err := filepath.Rel(root, targetFile)
-		if err == nil && !strings.HasPrefix(rel, "..") {
-			targetFile = filepath.ToSlash(rel)
+	// Normalize targetFile and confine it to the project root. The check is
+	// two-layered, mirroring resolvePathIn: a lexical jail (absolute paths
+	// outside the root and relative ../ escapes are rejected — a fact must
+	// never target a file outside the project) and a real-path check (a
+	// symlink inside the project pointing outside is an escape too). Real
+	// path handling follows the deepest existing ancestor, so a not-yet-
+	// created target file (a legal future file) stays allowed as long as its
+	// existing prefix does not escape.
+	targetFile := filepath.Clean(args.TargetFile)
+	if !filepath.IsAbs(targetFile) {
+		targetFile = filepath.Clean(filepath.Join(root, targetFile))
+	}
+	if rel, rerr := filepath.Rel(root, targetFile); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, nil, fmt.Errorf("targetFile %q is outside the project root %q", args.TargetFile, root)
+	}
+	realTarget, rerr := filepath.EvalSymlinks(targetFile)
+	if rerr != nil {
+		realTarget, rerr = resolveExistingAncestor(targetFile)
+		if rerr != nil {
+			return nil, nil, fmt.Errorf("targetFile %q cannot be resolved: %v", args.TargetFile, rerr)
 		}
+	}
+	if !pathWithinRealRoot(s.realRoot(root), realTarget) {
+		return nil, nil, fmt.Errorf("targetFile %q resolves to %q outside the project root %q (symlink escape)", args.TargetFile, realTarget, root)
+	}
+	// Store the workdir-relative key (portable, like the indexer's keys).
+	if rel, rerr := filepath.Rel(root, targetFile); rerr == nil && rel != "." {
+		targetFile = filepath.ToSlash(rel)
+	} else if rerr == nil {
+		targetFile = "."
 	}
 
 	// SHA-256 of content

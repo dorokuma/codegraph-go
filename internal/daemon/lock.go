@@ -124,9 +124,14 @@ var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed 
 // guard), SIGTERMs it when alive, polls up to 5s for exit, then escalates to
 // SIGKILL when the grace expires (a daemon stuck in Stop must not keep the
 // lock, and returning a fake nil here would make the caller spawn a
-// replacement doomed to fail on the still-held lock). If the process survives
-// even SIGKILL, an explicit error is returned and the stale pidfile is left
-// in place (ClearStaleLock never removes a live pidfile).
+// replacement doomed to fail on the still-held lock). Identity is re-verified
+// immediately before the SIGKILL: the grace window is a PID-reuse TOCTOU —
+// the daemon may have exited right after SIGTERM and its pid been recycled by
+// an unrelated process, so signaling without a recheck could kill an innocent
+// process (same pre-signal recheck discipline as terminateViaKill in
+// recovery.go). If the process survives even SIGKILL, an explicit error is
+// returned and the stale pidfile is left in place (ClearStaleLock never
+// removes a live pidfile).
 func KillStaleDaemon(projectRoot string) error {
 	pidPath := PidPath(projectRoot)
 	raw, err := os.ReadFile(pidPath)
@@ -163,12 +168,24 @@ func KillStaleDaemon(projectRoot string) error {
 			return serr
 		}
 		// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
-		if !waitForExit(info.PID, 5*time.Second) {
+		if !waitForExitFn(info.PID, 5*time.Second) {
 			// SIGTERM grace expired: the daemon is stuck (e.g. Stop wedged in
-			// d.wg.Wait() behind a session that never returns). Identity was
-			// verified above, so escalating to SIGKILL cannot hit a recycled
-			// pid. Escalate — a half-dead daemon must not keep holding the
-			// lock.
+			// d.wg.Wait() behind a session that never returns). Before
+			// escalating to SIGKILL, re-verify the target is STILL the daemon
+			// we recorded: during the grace window the daemon may have exited
+			// and its pid been recycled by an unrelated process. Never SIGKILL
+			// a process whose identity cannot be confirmed. On mismatch: if
+			// the pid is dead, the daemon did exit (just not within the grace
+			// window) — clear the stale pidfile and succeed; if the pid is
+			// alive but no longer ours, leave the lock untouched and return
+			// the refusal error (never signal an innocent process).
+			if err := verifyDaemonIdentity(info); err != nil {
+				if !IsProcessAlive(info.PID) {
+					ClearStaleLock(pidPath, info.PID)
+					return nil
+				}
+				return err
+			}
 			log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
 			if serr := syscall.Kill(info.PID, syscall.SIGKILL); serr != nil {
 				// Died between the probe and the signal.
@@ -178,7 +195,7 @@ func KillStaleDaemon(projectRoot string) error {
 				}
 				return serr
 			}
-			if !waitForExit(info.PID, 2*time.Second) {
+			if !waitForExitFn(info.PID, 2*time.Second) {
 				// Still alive after SIGKILL: never report success. The lock
 				// stays (ClearStaleLock below refuses to remove a pidfile
 				// naming a live process); the caller gets an explicit error

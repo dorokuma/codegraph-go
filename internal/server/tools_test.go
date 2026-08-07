@@ -521,6 +521,93 @@ func TestToolStoreFactRequiredFields(t *testing.T) {
 	}
 }
 
+// TestToolStoreFactRejectsEscapes: targetFile must be confined to the project
+// root. Absolute paths outside the root, relative ../ escapes, and symlinks
+// inside the root pointing outside must all be rejected — and no fact may be
+// written by any escape attempt.
+func TestToolStoreFactRejectsEscapes(t *testing.T) {
+	s, dir := setupToolServer(t)
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.go")
+	if err := os.WriteFile(outsideFile, []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(outsideDir, "secret.go")
+	if err := os.WriteFile(secret, []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Absolute path outside the project root.
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: outsideFile, Content: "c1"}); err == nil {
+		t.Fatal("expected error for absolute targetFile outside the project root")
+	}
+	// Relative ../ escape.
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "../outside.go", Content: "c2"}); err == nil {
+		t.Fatal("expected error for relative ../ escape")
+	}
+	// Symlink inside the root pointing outside (existing target file).
+	evil := filepath.Join(dir, "evil")
+	if err := os.Symlink(outsideDir, evil); err == nil {
+		if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "evil/secret.go", Content: "c3"}); err == nil {
+			t.Fatal("expected error for symlink escape (existing target)")
+		}
+		// Missing tail under the escaping symlink (future file) too.
+		if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "evil/notyet.go", Content: "c4"}); err == nil {
+			t.Fatal("expected error for symlink escape (missing tail)")
+		}
+	} else {
+		t.Logf("symlinks not supported on this platform, skipping symlink cases: %v", err)
+	}
+
+	// No fact may have been written by any escape attempt.
+	facts, err := s.Database.SearchFacts("", "", "", "all", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("escape attempts must not write facts, got %d", len(facts))
+	}
+}
+
+// TestToolStoreFactAcceptsLegitPaths: existing files, not-yet-created future
+// files (including in not-yet-existing subdirectories), absolute in-root
+// paths, and dirty relative paths must all be accepted; dirty and absolute
+// inputs are normalized to the workdir-relative storage key.
+func TestToolStoreFactAcceptsLegitPaths(t *testing.T) {
+	s, dir := setupToolServer(t)
+
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "alpha.go", Content: "on alpha"}); err != nil {
+		t.Fatalf("existing relative file rejected: %v", err)
+	}
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "future.go", Content: "on future"}); err != nil {
+		t.Fatalf("future file rejected: %v", err)
+	}
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "newpkg/deep/future.go", Content: "on deep future"}); err != nil {
+		t.Fatalf("future nested file rejected: %v", err)
+	}
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: filepath.Join(dir, "alpha.go"), Content: "on alpha abs"}); err != nil {
+		t.Fatalf("absolute in-root file rejected: %v", err)
+	}
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "./sub/../beta.go", Content: "on beta dirty"}); err != nil {
+		t.Fatalf("dirty relative path rejected: %v", err)
+	}
+
+	// All facts stored under normalized workdir-relative keys.
+	if facts, _ := s.Database.GetFactsByTarget("alpha.go", ""); len(facts) != 2 {
+		t.Fatalf("alpha.go facts = %d, want 2 (relative + absolute inputs)", len(facts))
+	}
+	if facts, _ := s.Database.GetFactsByTarget("future.go", ""); len(facts) != 1 {
+		t.Fatalf("future.go facts = %d, want 1", len(facts))
+	}
+	if facts, _ := s.Database.GetFactsByTarget("newpkg/deep/future.go", ""); len(facts) != 1 {
+		t.Fatalf("newpkg/deep/future.go facts = %d, want 1", len(facts))
+	}
+	if facts, _ := s.Database.GetFactsByTarget("beta.go", ""); len(facts) != 1 {
+		t.Fatalf("beta.go facts = %d, want 1 (normalized from ./sub/../beta.go)", len(facts))
+	}
+}
+
 func TestToolSearchFacts(t *testing.T) {
 	s, _ := setupToolServer(t)
 	// Insert a couple facts via DB directly

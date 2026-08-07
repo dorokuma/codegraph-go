@@ -64,7 +64,13 @@ func (d *DB) SetSchemaRevision() error {
 }
 
 // WipeIndex deletes all nodes/edges/files so a full reindex can repopulate.
-// Schema and meta (except we clear schema revision until SetSchemaRevision) stay.
+// Schema, meta, and the schema-revision key are PRESERVED: WipeIndex clears
+// only symbol data (facts and meta rows survive, see TestFactsSurviveWipeIndex).
+// The revision is updated — by SetSchemaRevision, after a rebuild succeeded —
+// never here: a wiped-but-unrebuilt index still carries its old revision
+// value, so after a schema bump NeedsRebuild keeps reporting true until the
+// rebuild completes and the new revision is recorded (a failed rebuild is
+// detected on the next startup instead of trusting an empty/half index).
 func (d *DB) WipeIndex() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

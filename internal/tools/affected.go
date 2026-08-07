@@ -77,15 +77,40 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	}
 
 	// Resolve all files to absolute paths; reject escapes outside workdir.
+	// The check is two-layered: a lexical jail (relative ../ and absolute
+	// paths outside the workspace are skipped) and a real-path boundary check
+	// (a symlink inside the workspace pointing outside is an escape too —
+	// fileToPackage below would read go.mod/package.json through the link).
+	// Non-existent inputs (deleted files passed by git-assist) keep working:
+	// the real-path check follows the deepest existing ancestor, so only
+	// symlinked prefixes that actually escape are rejected, and a deleted
+	// file inside the workspace is still accepted.
 	var absFiles []string
 	wd := filepath.Clean(workdir)
+	realWd, err := filepath.EvalSymlinks(wd)
+	if err != nil || realWd == "" {
+		realWd = wd
+	}
 	for _, f := range files {
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(wd, f)
 		}
 		f = filepath.Clean(f)
 		if f != wd && !strings.HasPrefix(f, wd+string(filepath.Separator)) {
-			continue // skip paths outside workspace
+			continue // skip paths outside workspace (lexical)
+		}
+		realF, rerr := filepath.EvalSymlinks(f)
+		if rerr != nil {
+			// Leaf missing (deleted input): resolve the deepest existing
+			// ancestor so symlinks in the prefix are still followed and
+			// escapes rejected.
+			realF, rerr = resolveRealAncestor(f)
+			if rerr != nil {
+				continue
+			}
+		}
+		if _, ok := pathWithinRoot(realWd, realF); !ok {
+			continue // skip symlink escapes (path resolves outside workspace)
 		}
 		absFiles = append(absFiles, f)
 	}
@@ -187,6 +212,32 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	return &AffectedResult{
 		Content: []ContentItem{{Type: "text", Text: b.String()}},
 	}, nil
+}
+
+// resolveRealAncestor resolves path to its canonical form, following symlinks
+// in the deepest existing ancestor and re-appending the missing tail. This
+// catches escapes through a symlinked prefix even when the leaf does not exist
+// yet (e.g. a deleted file whose parent directory is a symlink out of the
+// workspace). Mirrors resolveExistingAncestor in internal/server (not
+// importable here: tools must not import server).
+func resolveRealAncestor(path string) (string, error) {
+	tail := ""
+	cur := path
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			if tail == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, tail), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", err
+		}
+		tail = filepath.Join(filepath.Base(cur), tail)
+		cur = parent
+	}
 }
 
 // findImporters finds files that import the given file's package.
