@@ -14,7 +14,7 @@ import (
 )
 
 // PackageVersion is the wire-facing version. Proxy and daemon must match exactly.
-const PackageVersion = "0.8.5"
+const PackageVersion = "0.8.6"
 
 // Soft upper bound for in-project AF_UNIX paths (macOS ~104, Linux ~108).
 const posixSocketPathLimit = 100

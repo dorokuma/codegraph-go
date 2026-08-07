@@ -3,6 +3,20 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.6] - 2026-08-07
+
+### Fixed
+- Pi 适配器改为按需拉起：`session_start` 不再全局 spawn codegraph 客户端，只在
+  会话开头做工作目录决策与工具注册；客户端在首次工具调用时才真正启动，进程
+  异常退出不再定时重启（下一次调用自动拉起）。
+- Pi 适配器在会话开头按 config 授权根判定可用性：`makeWorkdirDecision` 在
+  `resolveWorkdir` 之后对最终 workdir 做路径段级授权范围校验（与二进制
+  `ValidateWorkdirs` 同语义，config 文件优先级一致，无 config 回落 `$HOME`），
+  越界会话不注册工具、注入「本会话 CodeGraph 未启用」并拒绝 execute。
+
+### Changed
+- Display / daemon wire version **0.8.6**。
+
 ## [0.8.5] - 2026-08-07
 
 ### Fixed
