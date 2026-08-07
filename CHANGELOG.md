@@ -3,6 +3,29 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.7] - 2026-08-07
+
+### Fixed
+- Pi 适配器手动 `codegraph-start` 的状态机：`getClient` 优先返回已启动的
+  client 再判会话决策，手动拉起成功后把本次决策写回 `decision`，后续工具
+  调用直接复用已启动客户端，不再出现「已拉起仍报尚未初始化/未启用」的
+  假失败；`codegraph-info` 在会话已有决议时以其为准，展示与实际一致。
+- Pi 适配器 config 解析支持 flow-style workdirs：`workdirs: [/root, /opt]`
+  同行内联列表与 block 列表同样解析（可混排，支持引号与行尾注释），不再
+  回落 $HOME 与 Go 侧 yaml.Unmarshal 分叉。
+- Pi 适配器启动阶段不再二次决议：新增 `startClientAt` 直接使用已决议
+  workdir（决议只发生一次：session_start / 手动 start），启动时不再
+  consult `CODEGRAPH_GO_WORKDIR`，避免已过 allowlist 的决议 workdir 被
+  env 改道且改道结果不再过授权校验。
+- `deploy.sh` 杀进程前做完整谓词复检：新增 `daemon_matches`（argv0 基名
+  ∈ {codegraph, codegraph-go} + `-workdir` 精确匹配 + environ 含
+  `CODEGRAPH_DAEMON_INTERNAL=1`），对每个待杀 pid（含 pidfile 读出的）
+  在 SIGTERM 前与 SIGKILL 升级前各复检一次，杜绝 PID 复用误杀窗口；
+  `scan_daemon_pids` 复用同一函数，消除重复逻辑。
+
+### Changed
+- Display / daemon wire version **0.8.7**。
+
 ## [0.8.6] - 2026-08-07
 
 ### Fixed
