@@ -3,6 +3,42 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.8] - 2026-08-07
+
+### Fixed
+- 信号窗口用 pidfd 收死（m2）：invisible-holder 终止改用
+  `terminateViaPidfd`——`pidfd_open` 把进程固定为文件描述符后再复检
+  `liveInvisibleHolderMatch`，通过后 `pidfd_send_signal` 发 SIGTERM/SIGKILL，
+  信号目标被 pidfd 钉住，pid 死亡+复用不再能劫持信号（recheck→signal 的
+  TOCTOU 窗口关闭）；同一 pidfd 复用于 SIGKILL 升级，进程已死则 ESRCH 安全
+  no-op。pidfd 不可用（非 Linux、ENOSYS、EPERM 等）时优雅回退到原有
+  os.FindProcess+Signal+复检路径，回退逻辑封装为可注入变量（signalFn 风格，
+  供测试）。新增 `golang.org/x/sys/unix` 直接依赖。
+- invisible 分支新生 daemon 宽限（m3）：`killInvisibleHolderProcs` 杀前读
+  `PidPath(root)`，pidfile 存在且 `DecodeLock.StartedAt` 距今 < 3s（且记录
+  进程存活）时跳过杀——给刚 spawn、正在 onReady 的新 daemon 时间完成 bind
+  （届时可 dial）或自行因 flock 失败退出，避免双客户端竞态误杀；楔子场景
+  （pidfile 缺失）不受影响。
+- flock 探测去 O_CREATE（m4）：`invisibleHolderHoldsLock` 改 O_RDWR（不
+  create），无锁文件/目录不存在时一律视为 free，只读探测不再留下空锁文件。
+- SIGKILL 仍存活 → 哨兵错误 + 主程序特判（m5）：
+  `terminateInvisibleHolder`/`killInvisibleHolders` 对「SIGKILL 后仍存活」
+  包装新哨兵 `ErrInvisibleHolderSurvived`（flock 仍被一个杀不死的进程持有，
+  继续 spawn/direct 均不安全），`EnsureAndDial` 原样传播；main 在
+  `ErrStaleDaemonRefused` 路径旁新增并列分支：stderr 打印含 root 与
+  `pgrep -af codegraph-go` 手工清理提示的可操作信息并 exit 1，不落 direct。
+- deploy.sh 的 /tmp sock 清理收窄到本项目（m6）：不再全局
+  `rm -f /tmp/codegraph-go-*.sock`，只删本项目 workdir 的 tmp socket
+  （`TMP_SOCK` 与 Go 侧 projectHash sha256(Clean(root))[:16] 对齐）。
+- deploy.sh 自动 git commit 改 opt-in（nit）：仅当 `DEPLOY_COMMIT=1` 才自动
+  提交，默认打印「改动未提交，如需自动提交设 DEPLOY_COMMIT=1」。
+- 注释修正（m1）：cmd/codegraph-go/main.go 校验调用点注释与实际一致——
+  WorkdirAllowlist 语义是无 config 时回落 $HOME 兜底、始终校验（fail
+  closed），不存在「无 config 跳过校验」模式。
+
+### Changed
+- Display / daemon wire version **0.8.8**。
+
 ## [0.8.7] - 2026-08-07
 
 ### Fixed

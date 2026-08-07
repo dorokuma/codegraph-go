@@ -16,7 +16,7 @@ func TestLockHolderHintSelfReferenceGuard(t *testing.T) {
 	dir := t.TempDir()
 	pidfile := filepath.Join(dir, "daemon.pid")
 
-	if err := os.WriteFile(pidfile, []byte(fmt.Sprintf(`{"pid": %d, "version": "0.8.7"}`, os.Getpid())), 0o600); err != nil {
+	if err := os.WriteFile(pidfile, []byte(fmt.Sprintf(`{"pid": %d, "version": "0.8.8"}`, os.Getpid())), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if hint := lockHolderHint(dir); hint != "" {
