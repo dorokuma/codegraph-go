@@ -38,6 +38,12 @@ func runInit(root string) error {
 	if !st.IsDir() {
 		return fmt.Errorf("not a directory: %s", abs)
 	}
+	// Authority check (same policy as main, no side door): init <root> must
+	// stay inside the allowlist roots — config workdirs, or $HOME when there
+	// is no usable config (fail closed when neither resolves).
+	if err := config.ValidateWorkdirs([]string{root}, config.WorkdirAllowlist("")); err != nil {
+		return fmt.Errorf("%v. Fix: use a root inside an allowed root, or add it to the workdirs list in the config file", err)
+	}
 	database, err := db.Open(abs)
 	if err != nil {
 		return err
@@ -132,6 +138,23 @@ func main() {
 	cfg.Workdirs = unique
 	// Primary workdir for backward compat (cfg.Workdir = workdirs[0]).
 	cfg.Workdir = cfg.Workdirs[0]
+
+	// Authority check: the config file's workdirs are the allowlist — any
+	// workdir outside those roots (or not a descendant of one) is refused
+	// before any mode is entered. This single call point covers client,
+	// daemon (CODEGRAPH_DAEMON_INTERNAL) and direct (CODEGRAPH_NO_DAEMON)
+	// paths alike, since all of them run through main. No config file means
+	// no lock: validation is skipped and any workdir is accepted.
+	configFile := cfg.ConfigFile
+	if configFile == "" {
+		configFile = config.ConfigPath()
+	}
+	if err := config.ValidateWorkdirs(cfg.Workdirs, config.WorkdirAllowlist(configFile)); err != nil {
+		msg := fmt.Sprintf("codegraph-go: %v. Fix: use a workdir inside an allowed root, or add it to the workdirs list in the config file (%s)", err, configFile)
+		fmt.Fprintln(os.Stderr, msg)
+		slog.Error("workdir outside authority roots", "error", err, "config", configFile)
+		os.Exit(1)
+	}
 	slog.Info("starting", "workdir", cfg.Workdir, "workdirs", cfg.Workdirs)
 
 	// Decision order (official #411):
