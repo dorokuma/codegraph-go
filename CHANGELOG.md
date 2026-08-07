@@ -3,6 +3,23 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.9] - 2026-08-07
+
+### Fixed
+- pidfd 泄漏（0.8.9）：`IsProcessAlive` 改用 `kill(2)` signal 0 探测
+  （`syscall.Kill(pid, 0)`），不再经 `os.FindProcess`——Go 1.24+ 工具链在
+  Linux 上每次 `FindProcess` 打开一个 pidfd 且不释放，PPID watchdog（默认
+  每 5s 一次探测）令每个进程无界泄漏（实测 96→99/15s）。kill(2) 零 fd
+  分配；语义不变：nil → 活，ESRCH → 死，EPERM → 活（非我们的进程），其余
+  错误保守按活。`KillStaleDaemon` 与 invisible-holder 回退路径
+  （`terminateViaFindProcess` → `terminateViaKill`）同步改 `syscall.Kill`，
+  保持先复检再发信号纪律；`terminateViaPidfd` 主路径保留。新增回归测试
+  `TestIsProcessAliveNoFdLeak`（对活 pid 连续 200 次探测，断言
+  `/proc/self/fd` 不随调用增长；修复前 7→207 红，修复后绿）。
+
+### Changed
+- Display / daemon wire version **0.8.9**。
+
 ## [0.8.8] - 2026-08-07
 
 ### Fixed
