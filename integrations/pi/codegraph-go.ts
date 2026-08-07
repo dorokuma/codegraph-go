@@ -7,6 +7,8 @@
 // 3) 超长结果做温和压缩（保头尾），正常体量原样返回
 // 4) 用户说需求即可，不必写 path/命令；由模型自己补技术参数。插件不猜口令、不钩消息。
 //    （「人话」= 怎么说；「需求」= 说什么。两码事，别混。）
+// 5) 客户端按需拉起：session_start 只做可用性判定与工具注册，首次工具调用才 spawn；
+//    越界会话（config 授权根之外）不注册工具、execute 返回不可用原因。
 //
 // Requires: codegraph-go on PATH
 
@@ -20,7 +22,7 @@ import path from "node:path"
 
 const START_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_START_TIMEOUT_MS || 30000)
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_REQUEST_TIMEOUT_MS || 120000)
-// 非 DEBUG 时保留最近多少行 stderr，进程退出/重启时打出来排查（仍照常 drain 防管道阻塞）。
+// 非 DEBUG 时保留最近多少行 stderr，进程退出时打出来排查（仍照常 drain 防管道阻塞）。
 const STDERR_KEEP_LINES = 20
 
 // ---- Output budget ---------------------------------------------------------
@@ -193,6 +195,121 @@ export function resolveWorkdir(cwd: string): WorkdirDecision {
 	}
 
 	return { ok: true, workdir: candidate, note }
+}
+
+// ---- 授权范围判定（与二进制 config 语义一致） ---------------------------------
+// 二进制侧（internal/config）：config 文件 workdirs 是权威 allowlist；无 config /
+// 解析失败 / 空列表时回落 $HOME；$HOME 不可解析 → 空列表（fail closed）。
+// config 文件优先级：$CODEGRAPH_CONFIG > ./codegraph-config.yaml >
+// ~/.config/codegraph/config.yaml。TS 侧用轻量行解析，不引入 YAML 依赖。
+
+/** config 文件查找（与二进制 ConfigPath 同一优先级）。找不到返回 null。 */
+function configFilePath(): string | null {
+	const env = process.env.CODEGRAPH_CONFIG
+	if (env) return env
+	const local = path.resolve("./codegraph-config.yaml")
+	if (fs.existsSync(local)) return local
+	const home = os.homedir()
+	if (home) {
+		const p = path.join(home, ".config", "codegraph", "config.yaml")
+		if (fs.existsSync(p)) return p
+	}
+	return null
+}
+
+/**
+ * 轻量解析 config 的 workdirs 段。格式固定：`workdirs:` 键之后的
+ * `- <path>` 列表项（可带缩进与行尾注释），下一个顶格非列表项键结束该段。
+ * 不做完整 YAML；读不到文件或格式异常 → 空列表（= 无 config，回落 $HOME）。
+ */
+function parseConfigWorkdirs(filePath: string): string[] {
+	try {
+		const data = fs.readFileSync(filePath, "utf8")
+		const roots: string[] = []
+		let inWorkdirs = false
+		for (const raw of data.split("\n")) {
+			const line = raw.trimEnd()
+			if (!inWorkdirs) {
+				if (/^workdirs\s*:/.test(line)) inWorkdirs = true
+				continue
+			}
+			// 顶格且不是列表项 → 下一个顶层键，workdirs 段结束
+			if (/^\S/.test(line) && !/^-\s/.test(line)) {
+				inWorkdirs = false
+				continue
+			}
+			const m = line.match(/^\s*-\s+(.+)$/)
+			if (m) {
+				const p = m[1].trim().replace(/^["']|["']$/g, "").replace(/\s+#.*$/, "")
+				if (p) roots.push(p)
+			}
+		}
+		return roots
+	} catch {
+		return []
+	}
+}
+
+/**
+ * 授权根列表：config 文件 workdirs（canonical、去重）；无 config / 解析失败 /
+ * 空列表时回落 $HOME（canonical）。$HOME 不可解析 → 空列表（fail closed，
+ * 与二进制 ValidateWorkdirs 语义一致）。
+ */
+export function allowedRoots(): string[] {
+	const cfg = configFilePath()
+	if (cfg) {
+		const parsed = parseConfigWorkdirs(cfg)
+		if (parsed.length > 0) {
+			const roots: string[] = []
+			const seen = new Set<string>()
+			for (const r of parsed) {
+				const c = normPath(r)
+				if (c && !seen.has(c)) {
+					seen.add(c)
+					roots.push(c)
+				}
+			}
+			return roots
+		}
+	}
+	const home = normPath(os.homedir())
+	return home ? [home] : []
+}
+
+/**
+ * 路径段级包含判定（filepath.Rel 语义）：cand 等于某 root 或在其子树内为
+ * true；兄弟前缀（/root-other vs /root）拒绝。两侧都 canonical。
+ */
+export function isWithinAllowlist(cand: string, roots: string[]): boolean {
+	const c = normPath(cand)
+	for (const r of roots) {
+		const root = normPath(r)
+		const rel = path.relative(root, c)
+		if (rel === "") return true
+		if (rel === ".." || rel.startsWith(".." + path.sep)) continue
+		if (path.isAbsolute(rel)) continue // 不同盘/根（Windows 等）
+		return true
+	}
+	return false
+}
+
+/**
+ * 会话工作目录决策：resolveWorkdir 之后对最终 workdir 做授权范围校验。
+ * 越界（config 授权根之外）→ { ok:false, reason }。resolveWorkdir 原有逻辑
+ * （git 根/项目标记/家目录模式/系统根拒绝/ALLOW_BROAD）全部保留。
+ */
+export function makeWorkdirDecision(cwd: string): WorkdirDecision {
+	const base = resolveWorkdir(cwd)
+	if (!base.ok) return base
+	const roots = allowedRoots()
+	if (!isWithinAllowlist(base.workdir, roots)) {
+		const declared = roots.length > 0 ? roots.join(", ") : "无"
+		return {
+			ok: false,
+			reason: `workdir ${base.workdir} 不在 codegraph 授权根内（config 声明：${declared}）`,
+		}
+	}
+	return base
 }
 
 /**
@@ -378,10 +495,7 @@ class CodeGraphClient {
 	/** Server-provided instructions from the MCP initialize handshake (may be null). */
 	private serverInstructions: string | null = null
 	private starting: Promise<void> | null = null
-	private stopped = false
-	private restartAttempts = 0
-	private restartTimer: ReturnType<typeof setTimeout> | null = null
-	/** 最近 N 行 stderr（固定容量缓冲），进程退出重启时用于排查。 */
+	/** 最近 N 行 stderr（固定容量缓冲），进程退出时用于排查。 */
 	private stderrBuffer: string[] = []
 	/** 未以换行结尾的半行，等下一 chunk 拼上（chunk 边界可能切断一行）。 */
 	private stderrCarry = ""
@@ -396,7 +510,6 @@ class CodeGraphClient {
 	async start(): Promise<void> {
 		if (this.proc && this.initialized) return
 		if (this.starting) return this.starting
-		this.stopped = false
 		this.starting = this.doStart().finally(() => {
 			this.starting = null
 		})
@@ -418,20 +531,22 @@ class CodeGraphClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		})
 
+		// 按需模型：异常退出不做定时重启，只打印 stderr + cleanup；
+		// 下一次工具调用由 callTool 的「未初始化则 start()」自动拉起。
 		this.proc.on("error", (err) => {
 			console.error(`[codegraph-go] process error: ${err.message}`)
+			this.dumpStderrBuffer()
 			this.cleanup()
-			this.scheduleRestart()
 		})
 
 		this.proc.on("exit", (code) => {
 			console.error(`[codegraph-go] process exited with code ${code}`)
+			this.dumpStderrBuffer()
 			this.cleanup()
-			this.scheduleRestart()
 		})
 
 		// Drain stderr so the child never blocks on a full pipe.
-		// DEBUG 模式直接透传；否则保留最近 N 行，进程退出重启时打印排查。
+		// DEBUG 模式直接透传；否则保留最近 N 行，进程退出时打印排查。
 		if (this.proc.stderr) {
 			this.proc.stderr.on("data", (chunk: Buffer | string) => {
 				const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
@@ -527,7 +642,6 @@ class CodeGraphClient {
 		try {
 			const result = await this.sendRequest("tools/call", { name, arguments: bounded })
 			const text = result.content?.map((c) => c.text).join("\n") || "no result"
-			this.restartAttempts = 0
 			return formatCleanText(compressToolText(text))
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err)
@@ -550,7 +664,7 @@ class CodeGraphClient {
 		return this.serverInstructions
 	}
 
-	/** 打印最近 stderr（若有）并清空缓冲；每次异常退出只打一次（error+exit 双触发不重复）。 */
+	/** 打印最近 stderr（若有）并清空缓冲；error+exit 双触发不重复打印。 */
 	private dumpStderrBuffer(): void {
 		const tail = this.stderrCarry.trimEnd()
 		if (tail) {
@@ -562,34 +676,11 @@ class CodeGraphClient {
 		this.stderrCarry = ""
 		if (this.stderrBuffer.length === 0) return
 		const lines = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
-		console.warn(`[codegraph-go] last stderr before restart (${lines.length} lines):`)
+		console.warn(`[codegraph-go] last stderr before exit (${lines.length} lines):`)
 		for (const line of lines) {
 			console.warn(`[codegraph-go]   ${line}`)
 		}
 		this.stderrBuffer = []
-	}
-
-	/** Exponential backoff restart after unexpected exit (max ~5 tries). */
-	private scheduleRestart() {
-		if (this.stopped) return
-		// 每次异常退出都先打印最近 stderr，再决定是否/如何重启。
-		this.dumpStderrBuffer()
-		if (this.restartAttempts >= 5) {
-			console.error("[codegraph-go] gave up auto-restart after 5 attempts")
-			return
-		}
-		if (this.restartTimer) return
-		const delay = Math.min(1000 * 2 ** this.restartAttempts, 15000)
-		this.restartAttempts++
-		console.error(`[codegraph-go] auto-restart in ${delay}ms (attempt ${this.restartAttempts})`)
-		this.restartTimer = setTimeout(() => {
-			this.restartTimer = null
-			if (this.stopped) return
-			this.start().catch((err) => {
-				console.error(`[codegraph-go] auto-restart failed: ${err}`)
-				this.scheduleRestart()
-			})
-		}, delay)
 	}
 
 	cleanup() {
@@ -603,11 +694,6 @@ class CodeGraphClient {
 	}
 
 	stop() {
-		this.stopped = true
-		if (this.restartTimer) {
-			clearTimeout(this.restartTimer)
-			this.restartTimer = null
-		}
 		if (this.proc) {
 			this.proc.stdin?.end()
 			this.proc.kill()
@@ -653,62 +739,78 @@ function listProjects(workdir: string): string[] {
 
 export default function (pi: ExtensionAPI) {
 	let client: CodeGraphClient | null = null
-	let lastRefuseReason: string | null = null
+	/** 本会话工作目录决策（session_start 时刷新；execute 按它惰性判定）。 */
+	let decision: WorkdirDecision | null = null
 	let toolsRegistered = false
+	/** 按需启动互斥：并发首次调用只 spawn 一次。 */
+	let lazyStartPromise: Promise<CodeGraphClient> | null = null
+
+	/**
+	 * 惰性取客户端：decision 不可用返回不可用原因；无客户端且 decision.ok 时
+	 * 首次调用才 spawn（复用 tryStartClient，工作目录用 decision.workdir）。
+	 * 启动失败返回错误串，下一次调用重试。
+	 */
+	async function getClient(): Promise<CodeGraphClient | string> {
+		const d = decision
+		if (!d) return "codegraph-go 尚未初始化（尚无会话决策）"
+		if (!d.ok) return d.reason
+		if (client) return client
+		if (!lazyStartPromise) {
+			lazyStartPromise = (async () => {
+				const result = await tryStartClient(d.workdir)
+				if ("client" in result) return result.client
+				throw new Error(result.error)
+			})()
+		}
+		try {
+			const c = await lazyStartPromise
+			client = c
+			return c
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err)
+			console.error(`[codegraph-go] on-demand start failed: ${msg}`)
+			return `codegraph-go 启动失败: ${msg}`
+		} finally {
+			lazyStartPromise = null
+		}
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		const result = await tryStartClient(ctx.cwd)
-		if ("client" in result) {
-			client = result.client
-			lastRefuseReason = null
+		// 只做决策 + 注册，不 spawn。客户端由首次工具调用按需拉起。
+		decision = makeWorkdirDecision(ctx.cwd)
+		if (decision.ok) {
+			// 工作目录变了：停掉旧客户端，下次调用按新 decision 惰性重启
+			if (client && client.workdir !== decision.workdir) {
+				client.stop()
+				client = null
+			}
 			if (!toolsRegistered) {
-				registerTools(pi, () => client)
+				registerTools(pi, getClient)
 				toolsRegistered = true
 			}
-			const projects = isHomeDir(client.workdir) ? listProjects(client.workdir) : []
+			const projects = isHomeDir(decision.workdir) ? listProjects(decision.workdir) : []
 			const hint =
 				projects.length > 0
 					? ` | 项目: ${projects.slice(0, 10).join(", ")}${projects.length > 10 ? "…" : ""}`
 					: ""
-			ctx.ui.notify(`codegraph-go: ${client.workdir}（${client.workdirNote}）${hint}`, "info")
+			ctx.ui.notify(
+				`codegraph-go 可用（按需）：${decision.workdir}（${decision.note}）${hint}`,
+				"info",
+			)
 		} else {
-			client = null
-			lastRefuseReason = result.error
-			ctx.ui.notify(`codegraph-go 未启动: ${result.error}`, "warning")
+			// 越界/不可用会话：停掉可能残留的客户端（本会话用不上），不注册工具
+			if (client) {
+				client.stop()
+				client = null
+			}
+			ctx.ui.notify(`codegraph-go 不可用: ${decision.reason}`, "warning")
 		}
 	})
 
 	pi.on("before_agent_start", async (event, _ctx) => {
 		// 只追加说明，不解析用户口令、不改焦点、不拦截消息。
-		if (client) {
-			const home = isHomeDir(client.workdir)
-			const projects = home ? listProjects(client.workdir) : []
-			const projectLine = home
-				? `家目录模式已开：索引里只有像项目的一级目录${projects.length ? `（${projects.join(", ")}）` : ""}。用户点名项目时代理自动补 path=，不依赖用户传。`
-				: `当前索引根就是单个项目目录，一般不必再加 path。`
-
-			let prompt = event.systemPrompt
-			const serverInstructions = client.getServerInstructions()
-			if (serverInstructions) {
-				prompt +=
-					`
-
-## CodeGraph server instructions
-
-${serverInstructions}`
-			}
-			prompt +=
-				`
-
-## CodeGraph Tools
-
-索引根: \`${client.workdir}\`（${client.workdirNote}）
-${projectLine}
-单次结果预算约 ${OUTPUT_CHAR_CAP} 字 / ${OUTPUT_LINE_CAP} 行（过大才压缩；正常体量不砍）。`
-
-			return { systemPrompt: prompt }
-		}
-		if (lastRefuseReason) {
+		if (!decision) return
+		if (!decision.ok) {
 			return {
 				systemPrompt:
 					event.systemPrompt +
@@ -716,10 +818,38 @@ ${projectLine}
 
 ## CodeGraph Tools
 
-本会话 CodeGraph 未启用: ${lastRefuseReason}
+本会话 CodeGraph 未启用: ${decision.reason}
 请用普通文件工具，或设置 CODEGRAPH_GO_WORKDIR。`,
 			}
 		}
+
+		const home = isHomeDir(decision.workdir)
+		const projects = home ? listProjects(decision.workdir) : []
+		const projectLine = home
+			? `家目录模式已开：索引里只有像项目的一级目录${projects.length ? `（${projects.join(", ")}）` : ""}。用户点名项目时代理自动补 path=，不依赖用户传。`
+			: `当前索引根就是单个项目目录，一般不必再加 path。`
+
+		let prompt = event.systemPrompt
+		// client 已连接时若有 serverInstructions 仍可附加；按需未启动则省略该段。
+		const serverInstructions = client ? client.getServerInstructions() : null
+		if (serverInstructions) {
+			prompt +=
+				`
+
+## CodeGraph server instructions
+
+${serverInstructions}`
+		}
+		prompt +=
+			`
+
+## CodeGraph Tools
+
+索引根: \`${decision.workdir}\`（${decision.note}）
+${projectLine}
+单次结果预算约 ${OUTPUT_CHAR_CAP} 字 / ${OUTPUT_LINE_CAP} 行（过大才压缩；正常体量不砍）。`
+
+		return { systemPrompt: prompt }
 	})
 
 	pi.on("session_shutdown", async () => {
@@ -736,12 +866,17 @@ ${projectLine}
 				ctx.ui.notify(`已在运行: ${client.workdir}（${client.workdirNote}）`, "info")
 				return
 			}
-			const result = await tryStartClient(ctx.cwd)
+			// 显式手动启动：立即 spawn（仍先过决策与授权范围校验）
+			const d = makeWorkdirDecision(ctx.cwd)
+			if (!d.ok) {
+				ctx.ui.notify(`启动失败: ${d.reason}`, "error")
+				return
+			}
+			const result = await tryStartClient(d.workdir)
 			if ("client" in result) {
 				client = result.client
-				lastRefuseReason = null
 				if (!toolsRegistered) {
-					registerTools(pi, () => client)
+					registerTools(pi, getClient)
 					toolsRegistered = true
 				}
 				ctx.ui.notify(
@@ -749,7 +884,6 @@ ${projectLine}
 					"info",
 				)
 			} else {
-				lastRefuseReason = result.error
 				ctx.ui.notify(`启动失败: ${result.error}`, "error")
 			}
 		},
@@ -771,12 +905,13 @@ ${projectLine}
 	pi.registerCommand("codegraph-info", {
 		description: "查看 codegraph 工作目录与上限",
 		handler: async (_args, ctx) => {
-			const decision = resolveWorkdir(ctx.cwd)
+			const d = makeWorkdirDecision(ctx.cwd)
 			const projects =
-				decision.ok && isHomeDir(decision.workdir) ? listProjects(decision.workdir) : []
+				d.ok && isHomeDir(d.workdir) ? listProjects(d.workdir) : []
 			const lines = [
 				`cwd: ${ctx.cwd}`,
-				`解析: ${decision.ok ? `${decision.workdir}（${decision.note}）` : `拒绝 — ${decision.reason}`}`,
+				`解析: ${d.ok ? `${d.workdir}（${d.note}）` : `拒绝 — ${d.reason}`}`,
+				`授权根: ${allowedRoots().join(", ") || "（无）"}`,
 				`运行中: ${client ? `${client.workdir}（${client.workdirNote}）` : "否"}`,
 				`输出上限: ${OUTPUT_CHAR_CAP} 字 / ${OUTPUT_LINE_CAP} 行（仅超限才裁）`,
 				`搜索默认/上限: ${DEFAULT_SEARCH_MAX}/${HARD_SEARCH_MAX}`,
@@ -790,17 +925,18 @@ ${projectLine}
 	})
 }
 
-function registerTools(pi: ExtensionAPI, getClient: () => CodeGraphClient | null) {
+function registerTools(pi: ExtensionAPI, getClient: () => Promise<CodeGraphClient | string>) {
 	// MCP v0.8+ exposes a single tool "codegraph" (action=…). Pi uses the same name;
 	// the adapter only bridges stdio + budgets — no per-action MCP fan-out.
 	const run = async (params: Record<string, unknown>) => {
-		const c = getClient()
-		if (!c) {
+		const c = await getClient()
+		if (typeof c === "string") {
+			// decision 不可用 / 启动失败 / 未初始化：把原因直接给模型
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: "codegraph-go 未运行。可用 /codegraph-info 查看原因。",
+						text: c,
 					},
 				],
 				details: {},
