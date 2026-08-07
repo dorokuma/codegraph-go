@@ -10,6 +10,7 @@ require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+	golang.org/x/sys v0.46.0
 	gonum.org/v1/gonum v0.17.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.54.0
@@ -26,7 +27,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

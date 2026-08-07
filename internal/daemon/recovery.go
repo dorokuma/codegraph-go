@@ -12,6 +12,22 @@ import (
 	"time"
 )
 
+// ErrInvisibleHolderSurvived is wrapped by every invisible-holder cleanup
+// error in which a holder is still ALIVE after SIGTERM+SIGKILL. Meaning: the
+// flock is still owned by a process that cannot be killed (e.g. stuck in an
+// uninterruptible D state). Neither spawning a replacement daemon nor
+// falling back to direct mode is safe while it lives (double-write risk), so
+// callers must surface it as a fatal error (main exits non-zero with an
+// actionable message) instead of retrying. It is distinct from
+// ErrStaleDaemonRefused: there the identity could not be confirmed (do not
+// signal); here the identity WAS confirmed and the kill simply did not work.
+var ErrInvisibleHolderSurvived = errors.New("invisible flock holder survived SIGTERM+SIGKILL")
+
+// waitForExitFn polls IsProcessAlive(pid) until dead or timeout (see
+// waitForExit in lock.go). Injectable so tests can simulate a process that
+// survives SIGKILL without waiting out the real 5s+2s grace windows.
+var waitForExitFn = waitForExit
+
 // procSnapshot is everything killInvisibleHolders needs to know about one
 // process: its NUL-joined argv and environ as read from /proc.
 type procSnapshot struct {
@@ -103,6 +119,34 @@ func killInvisibleHolders(root string) (int, error) {
 	return killInvisibleHolderProcs(root, procs)
 }
 
+// newbornDaemonInStartupGrace reports whether root's pidfile names a LIVE
+// process whose pidfile was written less than halfDeadStartupGrace ago. That
+// is a daemon spawned moments ago that is still binding its socket (the
+// pidfile is written by TryAcquireLock BEFORE the socket bind): it matches
+// the invisible-holder profile (pidfile + CODEGRAPH_DAEMON_INTERNAL=1) but
+// killing it would SIGTERM a HEALTHY daemon mid-startup — the exact race the
+// startup grace in halfDeadDaemonHoldsLock already protects for the
+// half-dead branch. The recorded process must be alive: a pidfile naming a
+// DEAD process is the failed spawn's own leftover (it died on the still-held
+// flock) and must NOT block the cleanup. A missing pidfile is the classic
+// wedge (deploy race removed it) — also no grace. Legacy pidfiles without
+// startedAt cannot be age-gated: no grace (same conservative choice as
+// halfDeadDaemonHoldsLock, which refuses to classify them as half-dead).
+func newbornDaemonInStartupGrace(root string) bool {
+	raw, err := os.ReadFile(PidPath(root))
+	if err != nil {
+		return false
+	}
+	info := DecodeLock(raw)
+	if info == nil || info.PID <= 0 || info.StartedAt <= 0 {
+		return false
+	}
+	if !IsProcessAlive(info.PID) {
+		return false
+	}
+	return time.Since(time.UnixMilli(info.StartedAt)) < halfDeadStartupGrace
+}
+
 // killInvisibleHolderProcs applies the invisible-holder predicate to a
 // process snapshot and terminates every match, stopping at the first
 // failure (a holder that survives SIGTERM+SIGKILL keeps the flock —
@@ -121,6 +165,18 @@ func killInvisibleHolders(root string) (int, error) {
 // skipped — not signaled, not counted as killed — and the remaining
 // candidates are still processed.
 func killInvisibleHolderProcs(root string, procs []procSnapshot) (int, error) {
+	// Newborn-daemon grace (m3): a pidfile written less than
+	// halfDeadStartupGrace ago names a daemon that was just spawned and is
+	// still in onReady — it also carries pidfile + CODEGRAPH_DAEMON_INTERNAL,
+	// so a two-client race could otherwise kill it while it is healthy.
+	// Skip the whole kill pass for root: the newborn gets time to finish
+	// binding (then it is dialable and the caller's dial loop connects) or to
+	// exit on its own (flock failure releases everything). The wedge scenario
+	// (pidfile missing) is unaffected.
+	newborn := newbornDaemonInStartupGrace(root)
+	if newborn {
+		log.Printf("invisible-holder cleanup for %s: pidfile names a newborn daemon in startup grace (< %s); skipping kill pass", root, halfDeadStartupGrace)
+	}
 	killed := 0
 	for _, p := range procs {
 		if p.pid == os.Getpid() {
@@ -129,6 +185,10 @@ func killInvisibleHolderProcs(root string, procs []procSnapshot) (int, error) {
 			continue
 		}
 		if !isInvisibleHolder(root, p) {
+			continue
+		}
+		if newborn {
+			log.Printf("invisible holder candidate pid %d (workdir %s) skipped: newborn daemon in startup grace", p.pid, root)
 			continue
 		}
 		log.Printf("invisible flock holder: pid %d (workdir %s) — terminating", p.pid, root)
@@ -205,11 +265,40 @@ func liveInvisibleHolderMatch(root string, pid int) bool {
 // /proc immediately before EVERY signal — closing the snapshot→signal
 // window described on killInvisibleHolderProcs, and the SIGTERM-grace →
 // SIGKILL window as well (the holder may have exited in the grace period
-// and its pid been recycled). On recheck mismatch the pid is skipped:
-// (false, nil), never counted as killed, no error. Returns (true, nil) when
-// the process exited; an error only when the process survives even SIGKILL
-// (the flock is still held — the caller must not proceed).
+// and its pid been recycled).
+//
+// Primary path: terminateViaPidfd pins the process with a pidfd so the
+// recheck→signal window is closed even across pid reuse (see pidfd.go).
+// When the platform/kernel cannot provide a pidfd (ErrPidfdNotSupported),
+// it falls back to terminateViaFindProcess, which keeps the historical
+// os.FindProcess + Signal + live-recheck semantics (the rechecks carry the
+// identity guarantee there; only the last microseconds before each signal
+// remain unclosable). On recheck mismatch the pid is skipped: (false, nil),
+// never counted as killed, no error. Returns (true, nil) when the process
+// exited; an error only when the process survives even SIGKILL — wrapped
+// with ErrInvisibleHolderSurvived (the flock is still held — the caller
+// must not proceed).
 func terminateInvisibleHolder(root string, pid int) (bool, error) {
+	if !liveInvisibleHolderMatch(root, pid) {
+		log.Printf("pid %d no longer matches the invisible-holder profile (died/recycled since scan); skipping", pid)
+		return false, nil
+	}
+	ok, err := terminateViaPidfd(root, pid)
+	if err != nil && errors.Is(err, ErrPidfdNotSupported) {
+		// pidfd_open unavailable or failed (non-Linux, ENOSYS, EPERM, ...):
+		// graceful fallback to the classic path — the rechecks still make it
+		// safe, only the pid-reuse-free guarantee is lost.
+		log.Printf("pidfd path unavailable for pid %d (%v); falling back to FindProcess+Signal", pid, err)
+		return terminateViaFindProcess(root, pid)
+	}
+	return ok, err
+}
+
+// terminateViaFindProcess is the classic fallback: SIGTERM → 5s wait →
+// SIGKILL → 2s wait via os.FindProcess + Signal, with a live /proc identity
+// recheck before EVERY signal (PID-reuse guard). Kept for platforms and
+// kernels without pidfd support; see terminateInvisibleHolder.
+func terminateViaFindProcess(root string, pid int) (bool, error) {
 	if !liveInvisibleHolderMatch(root, pid) {
 		log.Printf("pid %d no longer matches the invisible-holder profile (died/recycled since scan); skipping", pid)
 		return false, nil
@@ -224,7 +313,7 @@ func terminateInvisibleHolder(root string, pid int) (bool, error) {
 		}
 		return false, err
 	}
-	if waitForExit(pid, 5*time.Second) {
+	if waitForExitFn(pid, 5*time.Second) {
 		return true, nil
 	}
 	log.Printf("invisible holder pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", pid)
@@ -238,8 +327,8 @@ func terminateInvisibleHolder(root string, pid int) (bool, error) {
 		}
 		return false, err
 	}
-	if !waitForExit(pid, 2*time.Second) {
-		return false, fmt.Errorf("invisible holder pid=%d still alive after SIGTERM+SIGKILL; flock not released", pid)
+	if !waitForExitFn(pid, 2*time.Second) {
+		return false, fmt.Errorf("%w: pid %d still alive after SIGTERM+SIGKILL; flock not released", ErrInvisibleHolderSurvived, pid)
 	}
 	return true, nil
 }
@@ -256,15 +345,18 @@ func terminateInvisibleHolder(root string, pid int) (bool, error) {
 // Semantics: LOCK_EX|LOCK_NB failing with EWOULDBLOCK/EAGAIN means another
 // process holds the lock → true (held). A successful acquisition is
 // released immediately and means free → false. An open failure (e.g. the
-// .codegraph directory does not exist — no daemon could hold a lock that
-// does not exist) is free, not held; any other flock error is also free:
-// conservative in the kill direction — never kill based on a probe we
-// cannot trust.
+// .codegraph directory or the lock file does not exist — no daemon could
+// hold a lock that does not exist) is free, not held; any other flock error
+// is also free: conservative in the kill direction — never kill based on a
+// probe we cannot trust. The probe opens WITHOUT O_CREATE on purpose: a
+// read-only probe must not leave an empty lock file behind in a directory
+// where the daemon has not run yet (a lightweight side effect the audit
+// flagged).
 func invisibleHolderHoldsLock(root string) bool {
 	lockPath := filepath.Join(CodeGraphDir(root), "codegraph.lock")
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
 	if err != nil {
-		return false // no lock file → nothing holds it
+		return false // lock file or its directory missing → nothing holds it
 	}
 	defer f.Close()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

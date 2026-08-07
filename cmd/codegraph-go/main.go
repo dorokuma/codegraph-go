@@ -143,8 +143,11 @@ func main() {
 	// workdir outside those roots (or not a descendant of one) is refused
 	// before any mode is entered. This single call point covers client,
 	// daemon (CODEGRAPH_DAEMON_INTERNAL) and direct (CODEGRAPH_NO_DAEMON)
-	// paths alike, since all of them run through main. No config file means
-	// no lock: validation is skipped and any workdir is accepted.
+	// paths alike, since all of them run through main. WorkdirAllowlist
+	// semantics: the config file's workdirs when a usable config exists,
+	// otherwise $HOME as the fallback root — validation ALWAYS runs (it is
+	// never skipped for "no config"; when $HOME itself is unresolvable the
+	// empty allowlist fails closed and every workdir is refused).
 	configFile := cfg.ConfigFile
 	if configFile == "" {
 		configFile = config.ConfigPath()
@@ -233,6 +236,17 @@ func main() {
 		// surface an actionable error and exit non-zero instead.
 		fmt.Fprintf(os.Stderr, "codegraph-go: %v; remove the pidfile manually and retry\n", err)
 		slog.Error("daemon path blocked: unidentified process holds the daemon lock", "error", err)
+		os.Exit(1)
+	}
+	if err != nil && errors.Is(err, daemon.ErrInvisibleHolderSurvived) {
+		// G3: an invisible flock holder survived SIGTERM+SIGKILL — a live
+		// process still owns the DB flock and cannot be killed. Neither
+		// spawning a replacement nor falling back to direct mode is safe
+		// (double-write risk), so surface an actionable message (root + pgrep
+		// hint for manual cleanup) and exit non-zero, parallel to the
+		// ErrStaleDaemonRefused path.
+		fmt.Fprintf(os.Stderr, "codegraph-go: %v; the lock for %s is held by a process that survived SIGTERM+SIGKILL — identify it with: pgrep -af codegraph-go (look for '-workdir %s'), kill it manually, then retry\n", err, root, root)
+		slog.Error("daemon path blocked: invisible flock holder survived SIGTERM+SIGKILL", "error", err, "root", root)
 		os.Exit(1)
 	}
 	slog.Info("mode=direct (daemon unavailable)")

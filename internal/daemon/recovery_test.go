@@ -6,9 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // startSleepHelper spawns a long-lived `sleep` whose argv[0] is spoofed to
@@ -93,6 +96,266 @@ func matchingSnapshot(pid int, root string) procSnapshot {
 		pid:     pid,
 		cmdline: "codegraph-go\x00-workdir\x00" + root,
 		environ: "PATH=/usr/bin\x00CODEGRAPH_DAEMON_INTERNAL=1\x00",
+	}
+}
+
+// writeLockInfo writes a pidfile for root with the given body (used by the
+// newborn-grace tests).
+func writeLockInfo(t *testing.T, root string, info LockInfo) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(PidPath(root)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(PidPath(root), EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPidfdPathSignalsChildOnLinux: the pidfd path is usable on a real
+// Linux kernel — open a pidfd for a live child, SIGTERM it THROUGH the
+// pidfd (pidfd_send_signal), and assert the child exits. Skipped when the
+// kernel predates pidfd_open (ENOSYS).
+func TestPidfdPathSignalsChildOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("pidfd is Linux-only")
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	defer drainHelperKill(cmd.Process, done)
+
+	fd, err := pidfdOpenFn(cmd.Process.Pid)
+	if err != nil {
+		if errors.Is(err, unix.ENOSYS) {
+			t.Skipf("kernel without pidfd_open: %v", err)
+		}
+		t.Fatalf("pidfdOpen: %v", err)
+	}
+	defer pidfdCloseFn(fd) //nolint:errcheck
+
+	if err := pidfdSendSignalFn(fd, syscall.SIGTERM); err != nil {
+		t.Fatalf("pidfdSendSignal(SIGTERM): %v", err)
+	}
+	select {
+	case <-done:
+		// exited via the pidfd signal
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not exit after pidfd SIGTERM")
+	}
+}
+
+// TestKillInvisibleHoldersFallsBackWhenPidfdUnsupported: when pidfd_open is
+// unavailable (non-Linux, ENOSYS, EPERM, ...), terminateInvisibleHolder must
+// gracefully fall back to the classic os.FindProcess+Signal+recheck path
+// and still terminate the holder. This pins the fallback coverage the audit
+// asked for: the pidfd path is an optimization, never a requirement.
+func TestKillInvisibleHoldersFallsBackWhenPidfdUnsupported(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+
+	origOpen := pidfdOpenFn
+	pidfdOpenFn = func(int) (int, error) { return -1, ErrPidfdNotSupported }
+	t.Cleanup(func() { pidfdOpenFn = origOpen })
+
+	n, err := killInvisibleHolders(root)
+	if err != nil {
+		t.Fatalf("killInvisibleHolders via fallback: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("killed = %d, want 1 (FindProcess fallback must terminate the holder)", n)
+	}
+	assertHelperDead(t, done, cmd)
+}
+
+// TestKillInvisibleHoldersNewbornGrace (m3): root's pidfile names a LIVE
+// process started less than halfDeadStartupGrace ago — a daemon spawned
+// moments ago that is still binding its socket. The invisible-holder
+// cleanup must SKIP the kill so the newborn gets time to finish binding
+// (then the caller's dial loop connects) or to exit on its own (flock
+// failure).
+func TestKillInvisibleHoldersNewbornGrace(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+	// Fresh pidfile naming the LIVE helper, StartedAt = now → in grace.
+	writeLockInfo(t, root, LockInfo{PID: cmd.Process.Pid, Version: PackageVersion, StartedAt: time.Now().UnixMilli()})
+
+	n, err := killInvisibleHolders(root)
+	if err != nil {
+		t.Fatalf("killInvisibleHolders: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("killed = %d, want 0 (newborn daemon in startup grace must be skipped)", n)
+	}
+	select {
+	case <-done:
+		t.Fatal("newborn daemon was killed during startup grace")
+	default:
+	}
+}
+
+// TestKillInvisibleHoldersOldPidfileKills (m3): a pidfile whose StartedAt is
+// older than halfDeadStartupGrace does NOT protect the holder — the cleanup
+// proceeds and terminates it.
+func TestKillInvisibleHoldersOldPidfileKills(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+	writeLockInfo(t, root, LockInfo{PID: cmd.Process.Pid, Version: PackageVersion, StartedAt: time.Now().Add(-10 * time.Second).UnixMilli()})
+
+	n, err := killInvisibleHolders(root)
+	if err != nil {
+		t.Fatalf("killInvisibleHolders: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("killed = %d, want 1 (old pidfile must not protect the holder)", n)
+	}
+	assertHelperDead(t, done, cmd)
+}
+
+// TestKillInvisibleHoldersLegacyPidfileKills (m3): a legacy pidfile without
+// startedAt cannot be age-gated — no grace (same conservative choice as
+// halfDeadDaemonHoldsLock), the holder is terminated.
+func TestKillInvisibleHoldersLegacyPidfileKills(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+	writeLockInfo(t, root, LockInfo{PID: cmd.Process.Pid, Version: PackageVersion}) // StartedAt = 0
+
+	n, err := killInvisibleHolders(root)
+	if err != nil {
+		t.Fatalf("killInvisibleHolders: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("killed = %d, want 1 (legacy pidfile without startedAt must not protect the holder)", n)
+	}
+	assertHelperDead(t, done, cmd)
+}
+
+// TestKillInvisibleHoldersNoPidfileKills (m3): the classic wedge — no
+// pidfile at all (deploy race removed it) — must be unaffected by the
+// grace: the cleanup proceeds and terminates the holder.
+func TestKillInvisibleHoldersNoPidfileKills(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+
+	n, err := killInvisibleHolders(root)
+	if err != nil {
+		t.Fatalf("killInvisibleHolders: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("killed = %d, want 1 (no pidfile → wedge scenario, no grace)", n)
+	}
+	assertHelperDead(t, done, cmd)
+}
+
+// TestKillInvisibleHoldersSurvivorWrapsSentinel (m5): a holder that is
+// still alive after SIGTERM+SIGKILL (simulated: pidfd signals are injected
+// as no-ops and waitForExitFn reports still-alive) must produce an error
+// wrapping ErrInvisibleHolderSurvived, and the holder must NOT be counted
+// as killed.
+func TestKillInvisibleHoldersSurvivorWrapsSentinel(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj")
+	cmd, done := startSleepHelper(t)
+	defer drainHelperKill(cmd.Process, done)
+
+	snap := matchingSnapshot(cmd.Process.Pid, root)
+	withFakeProcs(t, []procSnapshot{snap})
+	withRecheckData(t, snap)
+
+	origOpen, origSend, origWait := pidfdOpenFn, pidfdSendSignalFn, waitForExitFn
+	pidfdOpenFn = func(int) (int, error) { return 7777, nil }
+	pidfdSendSignalFn = func(fd int, sig syscall.Signal) error { return nil } // never actually signals
+	waitForExitFn = func(pid int, d time.Duration) bool { return false }      // never exits
+	t.Cleanup(func() { pidfdOpenFn, pidfdSendSignalFn, waitForExitFn = origOpen, origSend, origWait })
+
+	n, err := killInvisibleHolders(root)
+	if n != 0 {
+		t.Fatalf("killed = %d, want 0 (survivor must not count as killed)", n)
+	}
+	if err == nil || !errors.Is(err, ErrInvisibleHolderSurvived) {
+		t.Fatalf("want error wrapping ErrInvisibleHolderSurvived, got %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("helper died although signals were injected as no-ops")
+	default:
+	}
+}
+
+// TestEnsureAndDialPropagatesSurvivorSentinel (m5): when the invisible-
+// holder cleanup reports a survivor (SIGTERM+SIGKILL ineffective),
+// EnsureAndDial must propagate the error as-is (wrapping
+// ErrInvisibleHolderSurvived) instead of respawning or falling back — main
+// turns it into an actionable exit.
+func TestEnsureAndDialPropagatesSurvivorSentinel(t *testing.T) {
+	root := t.TempDir()
+
+	// Hold the flock so EnsureAndDial enters the invisible-holder branch.
+	lockPath := filepath.Join(CodeGraphDir(root), "codegraph.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	// Fake /proc: a matching invisible holder (pid 424242 does not exist;
+	// the injected recheck makes it look alive and matching).
+	withFakeProcs(t, []procSnapshot{matchingSnapshot(424242, root)})
+	withRecheckData(t, matchingSnapshot(424242, root))
+
+	// Survivor simulation: pidfd opens, signals are no-ops, never exits.
+	origOpen, origSend, origWait := pidfdOpenFn, pidfdSendSignalFn, waitForExitFn
+	pidfdOpenFn = func(int) (int, error) { return 7777, nil }
+	pidfdSendSignalFn = func(fd int, sig syscall.Signal) error { return nil }
+	waitForExitFn = func(pid int, d time.Duration) bool { return false }
+	t.Cleanup(func() { pidfdOpenFn, pidfdSendSignalFn, waitForExitFn = origOpen, origSend, origWait })
+
+	origSpawn := spawnDetachedFn
+	spawnDetachedFn = func(string, *SpawnOpts) error { return nil }
+	t.Cleanup(func() { spawnDetachedFn = origSpawn })
+
+	conn, br, hello, ok, err := EnsureAndDial(root, 200*time.Millisecond, 10*time.Millisecond, nil)
+	if ok {
+		t.Fatal("EnsureAndDial succeeded although the flock stayed held by a survivor")
+	}
+	if err == nil || !errors.Is(err, ErrInvisibleHolderSurvived) {
+		t.Fatalf("EnsureAndDial must propagate ErrInvisibleHolderSurvived, got ok=%v err=%v", ok, err)
+	}
+	if conn != nil || br != nil || hello.PID != 0 {
+		t.Fatalf("unexpected outputs on survivor error: conn=%v br=%v hello=%+v", conn, br, hello)
 	}
 }
 
@@ -368,15 +631,20 @@ func TestKillInvisibleHoldersRecheckMatchKills(t *testing.T) {
 
 // TestInvisibleHolderHoldsLock: the lightweight flock probe reports true
 // when another process holds the DB flock, and false when it is free or
-// when the lock file cannot be opened (directory missing).
+// when the lock file cannot be opened (directory missing). The probe never
+// CREATES the lock file (no O_CREATE): a free probe on a pristine project
+// must leave no file behind.
 func TestInvisibleHolderHoldsLock(t *testing.T) {
 	root := t.TempDir()
 	lockPath := filepath.Join(CodeGraphDir(root), "codegraph.lock")
 
-	// Free: the probe opens the lock file, acquires and immediately
-	// releases the flock, reporting false.
+	// Free: no lock file exists yet — the probe must report free and must
+	// NOT create the file (read-only probe, no side effects).
 	if invisibleHolderHoldsLock(root) {
 		t.Fatal("free flock reported as held")
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("probe left a lock file behind (stat err=%v); it must not create files", err)
 	}
 
 	// Held: the test process itself takes the flock (killInvisibleHolders is

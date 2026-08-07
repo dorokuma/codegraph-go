@@ -32,6 +32,13 @@ for cand in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
 done
 [ -n "$WORKDIR" ] || WORKDIR="$ROOT"
 
+# Project-scoped tmp socket for the resolved WORKDIR: mirrors the Go-side
+# projectHash (sha256(filepath.Clean(root))[:16]) so only THIS project's
+# tmp-fallback socket is removed — never other projects' sockets. WORKDIR is
+# normalized by cd&&pwd, which matches filepath.Clean for the paths that
+# occur here (absolute, no symlinks).
+TMP_SOCK="/tmp/codegraph-go-$(printf '%s' "$WORKDIR" | sha256sum | cut -c1-16).sock"
+
 # Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
 # pidfile, then a short window for it to exit. The pid is verified against
 # the FULL daemon predicate (daemon_matches) with the workdir implied by
@@ -214,11 +221,10 @@ if [ -z "$REMAINING" ]; then
   fi
   rm -f "$ROOT/.codegraph/daemon.pid" "$ROOT/.codegraph/daemon.sock" \
         "$CODEGRAPH_HOME/daemon.pid" "$CODEGRAPH_HOME/daemon.sock" 2>/dev/null || true
-  # Note: this glob is not project-scoped — it also removes the tmp-fallback
-  # sockets of OTHER projects on this machine. Their daemons are unaffected
-  # (the pidfiles still hold the locks); the only cost is one extra spawn
-  # probe on their next dial. Accepted for a deploy script.
-  rm -f /tmp/codegraph-go-*.sock 2>/dev/null || true
+  # Project-scoped tmp socket cleanup: only THIS project's tmp-fallback
+  # socket is removed (TMP_SOCK mirrors the Go-side projectHash for WORKDIR,
+  # sha256(Clean(root))[:16]). Other projects' tmp sockets are left intact.
+  rm -f "$TMP_SOCK" 2>/dev/null || true
 else
   echo "WARN: daemon processes still present for $WORKDIR ($REMAINING) — keeping pidfile/socket so client-side stale-daemon cleanup handles them"
 fi
@@ -278,17 +284,24 @@ echo "=== 验证 ==="
 test -x "$BINARY" && echo "binary deployed: $BINARY ($(stat -c %s "$BINARY") bytes)" || { echo "DEPLOY FAILED: binary not executable"; exit 1; }
 
 echo "=== 提交 ==="
-git add deploy.sh internal/daemon/paths.go
-if git diff --cached --quiet; then
-  echo "无改动，跳过提交"
-else
-  VERSION=$(grep 'PackageVersion' internal/daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
-  if [ -z "$VERSION" ]; then
-    VERSION="unknown"
-    echo "warning: VERSION is empty, using 'unknown'"
+# Automatic commit is OPT-IN (DEPLOY_COMMIT=1) — a deploy must never
+# surprise-commit the working tree. Default: report that changes are
+# uncommitted and let the operator commit/push explicitly.
+if [ "${DEPLOY_COMMIT:-0}" = "1" ]; then
+  git add deploy.sh internal/daemon/paths.go
+  if git diff --cached --quiet; then
+    echo "无改动，跳过提交"
+  else
+    VERSION=$(grep 'PackageVersion' internal/daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
+    if [ -z "$VERSION" ]; then
+      VERSION="unknown"
+      echo "warning: VERSION is empty, using 'unknown'"
+    fi
+    git commit -m "v${VERSION}" 2>&1 || { echo "commit failed (non-fatal)"; }
+    echo "COMMITTED v${VERSION} — push manually with: git push"
   fi
-  git commit -m "v${VERSION}" 2>&1 || { echo "commit failed (non-fatal)"; }
-  echo "COMMITTED v${VERSION} — push manually with: git push"
+else
+  echo "改动未提交，如需自动提交设 DEPLOY_COMMIT=1"
 fi
 
 echo "=== 完成 ==="
