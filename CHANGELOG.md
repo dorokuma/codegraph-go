@@ -3,6 +3,40 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.10] - 2026-08-07
+
+### Fixed
+- KillStaleDaemon SIGKILL 前 PID 复用复检（daemon）：SIGTERM 宽限期后升级
+  SIGKILL 前重新核对进程身份（`verifyDaemonIdentity`，与 terminateViaKill
+  同一先复检再发信号纪律）——宽限窗口内 daemon 可能已退出、pid 被无关进程
+  复用，直接发信号会误杀无辜进程；身份不符时若 pid 已死则清 pidfile 并成功
+  返回，若 pid 活着但已非本 daemon 则拒绝并保留锁，绝不 SIGKILL 身份无法
+  确认的进程。
+- detectProject 并发快照（server）：匹配循环改为遍历锁内拷贝的
+  DetectDirs 快照——resetDetect 可并发清空/替换该切片，原实现遍历活切片
+  存在数据竞争；快照保持缓存语义不变。
+- ReplaceFileIndex placeholder 越界改报错回滚（db）：realID 对超出
+  batch/module 两段范围的负 placeholder 返回带诊断信息的错误，事务整体
+  回滚，不再越界 panic。
+- SearchFacts LIKE 通配符按字面匹配（db）：查询串中的 `%` 与 `_` 经
+  escapeLikePattern 转义并配 `ESCAPE '\'`，用户搜索不再被通配符展开。
+- ToolAffected symlink/路径逃逸封堵（tools）：词法围栏（`../` 与 workdir
+  外绝对路径跳过）之上新增 real-path 边界检查，workdir 内指向外部的
+  symlink 视为逃逸拒绝；已删除文件按最深现存祖先解析，仍正常接受。
+- store_fact 路径逃逸封堵（server）：targetFile 双层检查（词法围栏 +
+  EvalSymlinks 真实路径，同 resolvePathIn），拒绝 root 外绝对路径、`../`
+  逃逸与 symlink 逃逸；未创建的目标文件按最深现存祖先判定，合法未来文件
+  仍允许。
+- RebuildAll schema revision 失败不再假成功（extraction）：
+  SetSchemaRevision 失败时把错误传播给调用方，不再仅打日志后返回 nil——
+  reindex 成功但索引未被认证为最新时不得伪装成功。
+- WipeIndex 文档修正（db）：注释更正为 schema/meta/schema-revision 全部
+  保留，revision 只由重建成功后的 SetSchemaRevision 更新，清空未重建的
+  索引继续被 NeedsRebuild 判真。
+
+### Changed
+- Display / daemon wire version **0.8.10**。
+
 ## [0.8.9] - 2026-08-07
 
 ### Fixed
