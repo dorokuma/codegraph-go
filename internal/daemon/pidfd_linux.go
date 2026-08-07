@@ -11,7 +11,7 @@ import (
 // pidfdOpen pins pid with pidfd_open(2) (Linux 5.3+). The raw error is
 // returned untouched so terminateViaPidfd can classify it: ENOSYS (kernel
 // without the syscall), EPERM (ptrace/seccomp restrictions), ESRCH (dead
-// pid) all become ErrPidfdNotSupported → FindProcess fallback.
+// pid) all become ErrPidfdNotSupported → kill(2)+recheck fallback.
 func pidfdOpen(pid int) (int, error) {
 	return unix.PidfdOpen(pid, 0)
 }

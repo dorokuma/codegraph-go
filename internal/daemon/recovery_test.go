@@ -149,7 +149,7 @@ func TestPidfdPathSignalsChildOnLinux(t *testing.T) {
 
 // TestKillInvisibleHoldersFallsBackWhenPidfdUnsupported: when pidfd_open is
 // unavailable (non-Linux, ENOSYS, EPERM, ...), terminateInvisibleHolder must
-// gracefully fall back to the classic os.FindProcess+Signal+recheck path
+// gracefully fall back to the classic kill(2)+Signal+recheck path
 // and still terminate the holder. This pins the fallback coverage the audit
 // asked for: the pidfd path is an optimization, never a requirement.
 func TestKillInvisibleHoldersFallsBackWhenPidfdUnsupported(t *testing.T) {
@@ -170,7 +170,7 @@ func TestKillInvisibleHoldersFallsBackWhenPidfdUnsupported(t *testing.T) {
 		t.Fatalf("killInvisibleHolders via fallback: %v", err)
 	}
 	if n != 1 {
-		t.Fatalf("killed = %d, want 1 (FindProcess fallback must terminate the holder)", n)
+		t.Fatalf("killed = %d, want 1 (kill(2) fallback must terminate the holder)", n)
 	}
 	assertHelperDead(t, done, cmd)
 }

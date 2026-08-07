@@ -270,10 +270,10 @@ func liveInvisibleHolderMatch(root string, pid int) bool {
 // Primary path: terminateViaPidfd pins the process with a pidfd so the
 // recheck→signal window is closed even across pid reuse (see pidfd.go).
 // When the platform/kernel cannot provide a pidfd (ErrPidfdNotSupported),
-// it falls back to terminateViaFindProcess, which keeps the historical
-// os.FindProcess + Signal + live-recheck semantics (the rechecks carry the
-// identity guarantee there; only the last microseconds before each signal
-// remain unclosable). On recheck mismatch the pid is skipped: (false, nil),
+// it falls back to terminateViaKill, which keeps the historical
+// kill(2) + live-recheck semantics (the rechecks carry the identity
+// guarantee there; only the last microseconds before each signal remain
+// unclosable). On recheck mismatch the pid is skipped: (false, nil),
 // never counted as killed, no error. Returns (true, nil) when the process
 // exited; an error only when the process survives even SIGKILL — wrapped
 // with ErrInvisibleHolderSurvived (the flock is still held — the caller
@@ -287,27 +287,25 @@ func terminateInvisibleHolder(root string, pid int) (bool, error) {
 	if err != nil && errors.Is(err, ErrPidfdNotSupported) {
 		// pidfd_open unavailable or failed (non-Linux, ENOSYS, EPERM, ...):
 		// graceful fallback to the classic path — the rechecks still make it
-		// safe, only the pid-reuse-free guarantee is lost.
-		log.Printf("pidfd path unavailable for pid %d (%v); falling back to FindProcess+Signal", pid, err)
-		return terminateViaFindProcess(root, pid)
+		// safe, only the pid-reuse-free guarantee is lost. kill(2) allocates
+		// no pidfd, so the fallback leaks nothing either.
+		log.Printf("pidfd path unavailable for pid %d (%v); falling back to kill(2)+recheck", pid, err)
+		return terminateViaKill(root, pid)
 	}
 	return ok, err
 }
 
-// terminateViaFindProcess is the classic fallback: SIGTERM → 5s wait →
-// SIGKILL → 2s wait via os.FindProcess + Signal, with a live /proc identity
-// recheck before EVERY signal (PID-reuse guard). Kept for platforms and
-// kernels without pidfd support; see terminateInvisibleHolder.
-func terminateViaFindProcess(root string, pid int) (bool, error) {
+// terminateViaKill is the classic fallback: SIGTERM → 5s wait → SIGKILL →
+// 2s wait via syscall.Kill, with a live /proc identity recheck before EVERY
+// signal (PID-reuse guard). Unlike os.FindProcess + Signal, kill(2) allocates
+// no pidfd, so this path leaks nothing on Go 1.24+ Linux either. Kept for
+// platforms and kernels without pidfd support; see terminateInvisibleHolder.
+func terminateViaKill(root string, pid int) (bool, error) {
 	if !liveInvisibleHolderMatch(root, pid) {
 		log.Printf("pid %d no longer matches the invisible-holder profile (died/recycled since scan); skipping", pid)
 		return false, nil
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false, err
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		if !IsProcessAlive(pid) {
 			return false, nil // died between recheck and signal
 		}
@@ -321,7 +319,7 @@ func terminateViaFindProcess(root string, pid int) (bool, error) {
 		log.Printf("pid %d no longer matches the invisible-holder profile after SIGTERM grace; skipping SIGKILL", pid)
 		return false, nil
 	}
-	if err := proc.Signal(syscall.SIGKILL); err != nil {
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
 		if !IsProcessAlive(pid) {
 			return false, nil
 		}

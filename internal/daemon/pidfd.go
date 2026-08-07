@@ -13,8 +13,8 @@ import (
 // missing (ENOSYS on kernels < 5.3), or an open failure for another reason
 // (EPERM under ptrace/seccomp restrictions, ESRCH for a dead pid, ...). The
 // caller (terminateInvisibleHolder) must fall back to the classic
-// os.FindProcess + Signal + live-recheck path: the pidfd path closes the
-// pid-reuse signal window, it is not a correctness requirement.
+// kill(2) + live-recheck path: the pidfd path closes the pid-reuse signal
+// window, it is not a correctness requirement.
 var ErrPidfdNotSupported = errors.New("pidfd not supported")
 
 // pidfdOpenFn / pidfdSendSignalFn / pidfdCloseFn are the pidfd primitives

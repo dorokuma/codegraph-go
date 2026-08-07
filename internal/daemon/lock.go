@@ -150,12 +150,11 @@ func KillStaleDaemon(projectRoot string) error {
 		if err := verifyDaemonIdentity(info); err != nil {
 			return err
 		}
-		proc, ferr := os.FindProcess(info.PID)
-		if ferr != nil {
-			return ferr
-		}
 		log.Printf("killing stale daemon pid=%d (version mismatch; upgrade cleanup)", info.PID)
-		if serr := proc.Signal(syscall.SIGTERM); serr != nil {
+		// kill(2) directly — same recheck discipline as before, but without
+		// os.FindProcess, which would allocate an unreleased pidfd per call
+		// on Go 1.24+ Linux.
+		if serr := syscall.Kill(info.PID, syscall.SIGTERM); serr != nil {
 			// The process may have died between the probe and the signal.
 			if !IsProcessAlive(info.PID) {
 				ClearStaleLock(pidPath, info.PID)
@@ -171,7 +170,7 @@ func KillStaleDaemon(projectRoot string) error {
 			// pid. Escalate — a half-dead daemon must not keep holding the
 			// lock.
 			log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
-			if serr := proc.Signal(syscall.SIGKILL); serr != nil {
+			if serr := syscall.Kill(info.PID, syscall.SIGKILL); serr != nil {
 				// Died between the probe and the signal.
 				if !IsProcessAlive(info.PID) {
 					ClearStaleLock(pidPath, info.PID)
@@ -316,21 +315,20 @@ func procCmdline(pid int) string {
 	return string(raw)
 }
 
-// IsProcessAlive probes pid with signal 0. EPERM counts as alive.
+// IsProcessAlive probes pid with kill(2) signal 0 — zero fd allocation;
+// avoids Go 1.24+ os.FindProcess, which opens a pidfd per call on Linux and
+// never releases it here, so the PPID watchdog (one probe per tick, default
+// 5s) leaked one fd per tick per process (unbounded). Semantics: nil →
+// alive; ESRCH → dead; EPERM → alive (a process we may not signal, e.g. not
+// ours); any other error is treated conservatively as alive so a lock is
+// never stolen on uncertainty.
 func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = proc.Signal(syscall.Signal(0))
+	err := syscall.Kill(pid, syscall.Signal(0))
 	if err == nil {
 		return true
-	}
-	if errors.Is(err, os.ErrProcessDone) {
-		return false
 	}
 	// ESRCH → dead; EPERM → alive but not ours
 	var errno syscall.Errno
@@ -341,10 +339,6 @@ func IsProcessAlive(pid int) bool {
 		if errno == syscall.EPERM {
 			return true
 		}
-	}
-	// Go on Linux often wraps as "os: process already finished"
-	if err.Error() == "os: process already finished" {
-		return false
 	}
 	// Unknown error: be conservative (treat as alive) so we never steal a lock.
 	return true
