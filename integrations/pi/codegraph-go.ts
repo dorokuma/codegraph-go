@@ -218,8 +218,11 @@ function configFilePath(): string | null {
 }
 
 /**
- * 轻量解析 config 的 workdirs 段。格式固定：`workdirs:` 键之后的
- * `- <path>` 列表项（可带缩进与行尾注释），下一个顶格非列表项键结束该段。
+ * 轻量解析 config 的 workdirs 段。支持两种形态（YAML 允许混排）：
+ * - block：`workdirs:` 键之后的 `- <path>` 列表项（可带缩进与行尾注释）
+ * - flow：键行内联列表 `workdirs: [/root, /opt]`（逗号分隔，项可带引号
+ *   与行尾注释，`]` 后可带行尾注释）
+ * 下一个顶格非列表项键结束该段（flow 键行后若还有 `- <path>` 行继续收）。
  * 不做完整 YAML；读不到文件或格式异常 → 空列表（= 无 config，回落 $HOME）。
  */
 function parseConfigWorkdirs(filePath: string): string[] {
@@ -230,6 +233,16 @@ function parseConfigWorkdirs(filePath: string): string[] {
 		for (const raw of data.split("\n")) {
 			const line = raw.trimEnd()
 			if (!inWorkdirs) {
+				// flow 风格键行：`workdirs: [a, b]` 同行解析内联列表
+				const flow = line.match(/^workdirs\s*:\s*\[(.*)\]\s*(?:#.*)?$/)
+				if (flow) {
+					inWorkdirs = true
+					for (const item of flow[1].split(",")) {
+						const p = item.trim().replace(/^["']|["']$/g, "").replace(/\s+#.*$/, "")
+						if (p) roots.push(p)
+					}
+					continue
+				}
 				if (/^workdirs\s*:/.test(line)) inWorkdirs = true
 				continue
 			}
@@ -702,6 +715,28 @@ class CodeGraphClient {
 	}
 }
 
+/**
+ * 直接以「已决议」workdir 启动客户端，不做任何二次决议（不 consult
+ * CODEGRAPH_GO_WORKDIR / cwd）。决议只发生一次（session_start / 手动
+ * codegraph-start），启动阶段不得再 consult env —— 否则 env 会把已过
+ * allowlist 的决议 workdir 改道，且改道结果不再过授权校验（M4）。
+ */
+async function startClientAt(
+	workdir: string,
+	note: string,
+): Promise<{ client: CodeGraphClient } | { error: string }> {
+	try {
+		const client = new CodeGraphClient(workdir, note)
+		await client.start()
+		return { client }
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err)
+		console.error(`[codegraph-go] failed to start: ${msg}`)
+		return { error: msg }
+	}
+}
+
+/** 从 cwd 决议后启动（仅用于仍需从 cwd 决议的场景；已决议路径用 startClientAt）。 */
 async function tryStartClient(
 	cwd: string,
 ): Promise<{ client: CodeGraphClient } | { error: string }> {
@@ -710,15 +745,7 @@ async function tryStartClient(
 		console.error(`[codegraph-go] ${decision.reason}`)
 		return { error: decision.reason }
 	}
-	try {
-		const client = new CodeGraphClient(decision.workdir, decision.note)
-		await client.start()
-		return { client }
-	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err)
-		console.error(`[codegraph-go] failed to start: ${msg}`)
-		return { error: msg }
-	}
+	return startClientAt(decision.workdir, decision.note)
 }
 
 /** 家目录下有哪些「像项目」的一级目录（仅提示用，不参与钩子）。 */
@@ -746,18 +773,19 @@ export default function (pi: ExtensionAPI) {
 	let lazyStartPromise: Promise<CodeGraphClient> | null = null
 
 	/**
-	 * 惰性取客户端：decision 不可用返回不可用原因；无客户端且 decision.ok 时
-	 * 首次调用才 spawn（复用 tryStartClient，工作目录用 decision.workdir）。
-	 * 启动失败返回错误串，下一次调用重试。
+	 * 惰性取客户端：优先返回已启动 client（手动 codegraph-start 拉起后工具
+	 * 直接可用，不再误报「尚未初始化」）；decision 不可用返回不可用原因；
+	 * 无客户端且 decision.ok 时首次调用才 spawn（工作目录用决议 workdir，
+	 * 启动阶段不二次决议）。启动失败返回错误串，下一次调用重试。
 	 */
 	async function getClient(): Promise<CodeGraphClient | string> {
+		if (client) return client
 		const d = decision
 		if (!d) return "codegraph-go 尚未初始化（尚无会话决策）"
 		if (!d.ok) return d.reason
-		if (client) return client
 		if (!lazyStartPromise) {
 			lazyStartPromise = (async () => {
-				const result = await tryStartClient(d.workdir)
+				const result = await startClientAt(d.workdir, d.note)
 				if ("client" in result) return result.client
 				throw new Error(result.error)
 			})()
@@ -872,9 +900,13 @@ ${projectLine}
 				ctx.ui.notify(`启动失败: ${d.reason}`, "error")
 				return
 			}
-			const result = await tryStartClient(d.workdir)
+			const result = await startClientAt(d.workdir, d.note)
 			if ("client" in result) {
 				client = result.client
+				// 把本次手动决策写回会话决策：后续工具调用直接复用已启动 client，
+				// before_agent_start / codegraph-info 等按 decision 展示的段落
+				// 也与实际运行状态一致（不再出现「已拉起仍报未初始化/未启用」）。
+				decision = d
 				if (!toolsRegistered) {
 					registerTools(pi, getClient)
 					toolsRegistered = true
@@ -898,6 +930,7 @@ ${projectLine}
 			}
 			client.stop()
 			client = null
+			// decision 保留：下次工具调用按同一决议惰性重启（按需拉起语义）。
 			ctx.ui.notify("已停止", "info")
 		},
 	})
@@ -905,7 +938,9 @@ ${projectLine}
 	pi.registerCommand("codegraph-info", {
 		description: "查看 codegraph 工作目录与上限",
 		handler: async (_args, ctx) => {
-			const d = makeWorkdirDecision(ctx.cwd)
+		// 会话已有决议时以其为准（手动 codegraph-start 写回后可能与重新推导
+		// 一致），保证「解析」行与实际使用的 workdir 一致。
+			const d = decision ?? makeWorkdirDecision(ctx.cwd)
 			const projects =
 				d.ok && isHomeDir(d.workdir) ? listProjects(d.workdir) : []
 			const lines = [

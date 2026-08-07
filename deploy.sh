@@ -33,21 +33,73 @@ done
 [ -n "$WORKDIR" ] || WORKDIR="$ROOT"
 
 # Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
-# pidfile, then a short window for it to exit. NO rm here — deleting the
-# pidfile/socket of a daemon that is still running is exactly what creates
-# the invisible flock holder (the daemon keeps the DB flock while becoming
-# unreachable through every pidfile and socket). Artifacts are only removed
-# below, after the flock is confirmed released and no daemon-mode process
-# for WORKDIR remains.
+# pidfile, then a short window for it to exit. The pid is verified against
+# the FULL daemon predicate (daemon_matches) with the workdir implied by
+# that pidfile's location before the signal — same PID-reuse guard as the
+# main kill loop below. NO rm here — deleting the pidfile/socket of a
+# daemon that is still running is exactly what creates the invisible flock
+# holder (the daemon keeps the DB flock while becoming unreachable through
+# every pidfile and socket). Artifacts are only removed below, after the
+# flock is confirmed released and no daemon-mode process for WORKDIR
+# remains.
 PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
 if [ -n "$PID" ]; then
-  if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
+  LEGACY_WD="$(cd "$(dirname "$(dirname "$CODEGRAPH_HOME/daemon.pid")")" && pwd 2>/dev/null)"
+  if daemon_matches "$PID" "$LEGACY_WD"; then
     kill "$PID" 2>/dev/null && echo "killed daemon pid $PID" || echo "daemon already stopped"
   else
-    echo "pid $PID does not belong to codegraph, skipping kill"
+    echo "pid $PID does not match daemon predicate, skipping kill"
   fi
   sleep 1
 fi
+
+# daemon_matches <pid> <wd>: FULL daemon predicate — argv0 basename ∈
+# {codegraph, codegraph-go} AND cmdline carries "-workdir <wd>" (both sides
+# normalized) AND environ has CODEGRAPH_DAEMON_INTERNAL=1 (daemon mode only
+# — never a foreground client or direct-mode session). All three must hold;
+# any unreadable /proc file is a non-match. Mirrors the Go-side
+# liveInvisibleHolderMatch, which re-verifies identity immediately before
+# every signal — this is the pre-signal recheck that closes the PID-reuse
+# kill window.
+daemon_matches() {
+  local pid="$1" wd="$2" argv0 base prev="" arg wdval=""
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  argv0=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -1)
+  [ -n "$argv0" ] || return 1
+  base=${argv0##*/}
+  case "$base" in
+    codegraph|codegraph-go) ;;
+    *) return 1 ;;
+  esac
+  # Normalize wd (cd && pwd strips a trailing slash and resolves ".") so
+  # it compares equal to the daemon's own normalized -workdir value — the
+  # shell mirror of the Go-side filepath.Clean in isInvisibleHolder.
+  wd="$(cd "$wd" 2>/dev/null && pwd || printf '%s' "$wd")"
+  while IFS= read -r arg; do
+    if [ "$prev" = "-workdir" ]; then wdval="$arg"; break; fi
+    prev="$arg"
+  done < <(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null)
+  [ -n "$wdval" ] || return 1
+  wdval="$(cd "$wdval" 2>/dev/null && pwd || printf '%s' "$wdval")"
+  [ "$wdval" = "$wd" ] || return 1
+  # Daemon mode only: CODEGRAPH_DAEMON_INTERNAL=1 must be in environ.
+  tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'CODEGRAPH_DAEMON_INTERNAL=1' || return 1
+  return 0
+}
+
+# scan_daemon_pids <workdir>: print pids of daemon-mode codegraph processes
+# whose -workdir value equals the argument (exact match). Reuses
+# daemon_matches — no duplicated predicate logic.
+scan_daemon_pids() {
+  local wd="$1" p pid
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    if daemon_matches "$pid" "$wd"; then
+      echo "$pid"
+    fi
+  done
+  true
+}
 
 echo "=== 替换二进制 ==="
 if [ -f "$BINARY" ]; then
@@ -72,64 +124,42 @@ KILLED_PID=""
 # pidfile and socket dentry were already removed ("invisible flock holder")
 # — the pidfile alone would miss it, and an unconditional rm would then
 # delete the artifacts of a process that still owns the DB flock.
-# (a) every pidfile's recorded pid (both candidate locations);
+# (a) every pidfile's recorded pid (both candidate locations), each paired
+#     with the workdir implied by ITS OWN pidfile location — a HOME-workdir
+#     daemon recorded in $CODEGRAPH_HOME/daemon.pid must be verified against
+#     $HOME, not the repo root;
 # (b) /proc scan: codegraph binary + -workdir $WORKDIR +
 #     CODEGRAPH_DAEMON_INTERNAL=1 (daemon mode only — never a foreground
 #     client or direct-mode session). A running daemon keeps its ORIGINAL
 #     argv[0] even after deploy renames its binary on disk to .old: the
 #     basename is still "codegraph-go", so the scan matches it by name —
 #     not by any ".old" suffix in the path.
+# Each entry is "<pid>:<expected-workdir>"; daemon_matches verifies against
+# that workdir before ANY signal.
 PIDS=""
 for pf in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
   [ -f "$pf" ] || continue
   PID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$pf" | grep -oE '[0-9]+' | head -1)
-  if [ -n "$PID" ] && ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID"; fi
+  if [ -n "$PID" ]; then
+    PFWD="$(cd "$(dirname "$(dirname "$pf")")" && pwd)"
+    if ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID:$PFWD"; fi
+  fi
 done
-
-# scan_daemon_pids <workdir>: print pids of daemon-mode codegraph processes
-# whose -workdir value equals the argument (exact match).
-scan_daemon_pids() {
-  local wd="$1" p pid argv0 base prev arg wdval
-  for p in /proc/[0-9]*; do
-    pid=${p#/proc/}
-    [ -r "$p/cmdline" ] || continue
-    argv0=$(tr '\0' '\n' <"$p/cmdline" 2>/dev/null | head -1)
-    [ -n "$argv0" ] || continue
-    base=${argv0##*/}
-    case "$base" in
-      codegraph|codegraph-go) ;;
-      *) continue ;;
-    esac
-    wdval=""
-    prev=""
-    while IFS= read -r arg; do
-      if [ "$prev" = "-workdir" ]; then wdval="$arg"; break; fi
-      prev="$arg"
-    done < <(tr '\0' '\n' <"$p/cmdline" 2>/dev/null)
-    # Normalize the daemon's -workdir value (cd && pwd strips a trailing
-    # slash and resolves ".") so it compares equal to the caller's WORKDIR
-    # — the shell mirror of the Go-side filepath.Clean in isInvisibleHolder.
-    wdval="$(cd "$wdval" 2>/dev/null && pwd || printf '%s' "$wdval")"
-    [ "$wdval" = "$wd" ] || continue
-    # Daemon mode only: CODEGRAPH_DAEMON_INTERNAL=1 must be in environ.
-    if ! tr '\0' '\n' <"$p/environ" 2>/dev/null | grep -qx 'CODEGRAPH_DAEMON_INTERNAL=1'; then
-      continue
-    fi
-    echo "$pid"
-  done
-  true
-}
 
 for PID in $(scan_daemon_pids "$WORKDIR"); do
-  if ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID"; fi
+  if ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID:$WORKDIR"; fi
 done
 
-for PID in $PIDS; do
+for entry in $PIDS; do
+  PID="${entry%%:*}"
+  PIDWD="${entry#*:}"
   if [ ! -r "/proc/$PID/cmdline" ]; then
     echo "pid $PID already gone, skipping"
     continue
   fi
-  if [ -r /proc/$PID/cmdline ] && tr '\0' ' ' </proc/$PID/cmdline | grep -q codegraph; then
+  # Full predicate recheck before SIGTERM (never signal a pid that is not
+  # provably our daemon for this workdir — PID reuse guard).
+  if daemon_matches "$PID" "$PIDWD"; then
     echo "restarting daemon pid $PID (SIGTERM)"
     kill "$PID" 2>/dev/null || true
     # Graceful exit window (daemon Stop drains sessions, checkpoints WAL):
@@ -141,14 +171,21 @@ for PID in $PIDS; do
       waited=$((waited + 1))
     done
     if kill -0 "$PID" 2>/dev/null; then
-      echo "daemon pid $PID still alive after 5s — SIGKILL"
-      kill -9 "$PID" 2>/dev/null || true
+      # Full predicate recheck again before the SIGKILL escalation: the pid
+      # may have exited and been reused by an unrelated process during the
+      # wait window. Never signal a process that no longer matches.
+      if daemon_matches "$PID" "$PIDWD"; then
+        echo "daemon pid $PID still alive after 5s — SIGKILL"
+        kill -9 "$PID" 2>/dev/null || true
+      else
+        echo "pid $PID no longer matches daemon predicate before SIGKILL — not killing"
+      fi
     else
       echo "daemon pid $PID exited"
     fi
     KILLED_PID="$PID"
   else
-    echo "pid $PID does not belong to codegraph, skipping kill"
+    echo "pid $PID does not match daemon predicate (expected workdir $PIDWD), skipping kill"
   fi
 done
 
