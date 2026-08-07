@@ -39,27 +39,6 @@ done
 # occur here (absolute, no symlinks).
 TMP_SOCK="/tmp/codegraph-go-$(printf '%s' "$WORKDIR" | sha256sum | cut -c1-16).sock"
 
-# Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
-# pidfile, then a short window for it to exit. The pid is verified against
-# the FULL daemon predicate (daemon_matches) with the workdir implied by
-# that pidfile's location before the signal — same PID-reuse guard as the
-# main kill loop below. NO rm here — deleting the pidfile/socket of a
-# daemon that is still running is exactly what creates the invisible flock
-# holder (the daemon keeps the DB flock while becoming unreachable through
-# every pidfile and socket). Artifacts are only removed below, after the
-# flock is confirmed released and no daemon-mode process for WORKDIR
-# remains.
-PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
-if [ -n "$PID" ]; then
-  LEGACY_WD="$(cd "$(dirname "$(dirname "$CODEGRAPH_HOME/daemon.pid")")" && pwd 2>/dev/null)"
-  if daemon_matches "$PID" "$LEGACY_WD"; then
-    kill "$PID" 2>/dev/null && echo "killed daemon pid $PID" || echo "daemon already stopped"
-  else
-    echo "pid $PID does not match daemon predicate, skipping kill"
-  fi
-  sleep 1
-fi
-
 # daemon_matches <pid> <wd>: FULL daemon predicate — argv0 basename ∈
 # {codegraph, codegraph-go} AND cmdline carries "-workdir <wd>" (both sides
 # normalized) AND environ has CODEGRAPH_DAEMON_INTERNAL=1 (daemon mode only
@@ -93,6 +72,27 @@ daemon_matches() {
   tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'CODEGRAPH_DAEMON_INTERNAL=1' || return 1
   return 0
 }
+
+# Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
+# pidfile, then a short window for it to exit. The pid is verified against
+# the FULL daemon predicate (daemon_matches) with the workdir implied by
+# that pidfile's location before the signal — same PID-reuse guard as the
+# main kill loop below. NO rm here — deleting the pidfile/socket of a
+# daemon that is still running is exactly what creates the invisible flock
+# holder (the daemon keeps the DB flock while becoming unreachable through
+# every pidfile and socket). Artifacts are only removed below, after the
+# flock is confirmed released and no daemon-mode process for WORKDIR
+# remains.
+PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+if [ -n "$PID" ]; then
+  LEGACY_WD="$(cd "$(dirname "$(dirname "$CODEGRAPH_HOME/daemon.pid")")" && pwd 2>/dev/null)"
+  if daemon_matches "$PID" "$LEGACY_WD"; then
+    kill "$PID" 2>/dev/null && echo "killed daemon pid $PID" || echo "daemon already stopped"
+  else
+    echo "pid $PID does not match daemon predicate, skipping kill"
+  fi
+  sleep 1
+fi
 
 # scan_daemon_pids <workdir>: print pids of daemon-mode codegraph processes
 # whose -workdir value equals the argument (exact match). Reuses
