@@ -11,16 +11,24 @@ import (
 )
 
 func TestResolvePath(t *testing.T) {
-	s := &Server{Workdir: "/workdir", Workdirs: []string{"/workdir"}}
+	// resolvePathIn now rejects nonexistent targets (no ghost paths handed to
+	// rg), so the workspace and the resolved paths must exist on disk.
+	base := t.TempDir()
+	ws := filepath.Join(base, "workdir")
+	if err := os.MkdirAll(filepath.Join(ws, "subdir", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Workdir: ws, Workdirs: []string{ws}}
 
 	tests := []struct {
 		input   string
 		want    string
 		wantErr bool
 	}{
-		{"", "/workdir", false},
-		{"subdir", "/workdir/subdir", false},
-		{"subdir/nested", "/workdir/subdir/nested", false},
+		{"", ws, false},
+		{"subdir", filepath.Join(ws, "subdir"), false},
+		{"subdir/nested", filepath.Join(ws, "subdir", "nested"), false},
+		{"subdir/missing", "", true}, // nonexistent tail → rejected, not a ghost path
 		{"../outside", "", true},
 	}
 
@@ -35,6 +43,73 @@ func TestResolvePath(t *testing.T) {
 				t.Errorf("resolvePath(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestResolvePathInPerRootGhostPath: per-root daemon (workdir IS the project
+// dir, e.g. /root/codegraph-go) receiving search path=codegraph-go joins into
+// /root/codegraph-go/codegraph-go, which does not exist. resolvePathIn must
+// reject it with a clear "not found" error instead of returning the ghost
+// path — rg would otherwise exit with status 2 ("No such file or
+// directory"). Existing subdirectories must still resolve.
+func TestResolvePathInPerRootGhostPath(t *testing.T) {
+	base := t.TempDir()
+	ws := filepath.Join(base, "codegraph-go")
+	if err := os.MkdirAll(filepath.Join(ws, "internal", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Workdir: ws, Workdirs: []string{ws}}
+
+	// Ghost path: workdir basename double-joined under itself → nonexistent.
+	_, err := s.resolvePathIn(ws, "codegraph-go")
+	if err == nil {
+		t.Fatal("expected nonexistent path to be rejected, got no error")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected clear not-found error, got: %v", err)
+	}
+
+	// Nonexistent tail under a real prefix is also rejected.
+	if _, err := s.resolvePathIn(ws, "internal/nope"); err == nil {
+		t.Fatal("expected nonexistent tail to be rejected")
+	}
+
+	// Existing subdirectory still resolves (normal-path regression guard).
+	got, err := s.resolvePathIn(ws, "internal/server")
+	if err != nil {
+		t.Fatalf("existing subdir rejected: %v", err)
+	}
+	if want := filepath.Join(ws, "internal", "server"); got != want {
+		t.Fatalf("resolvePathIn = %q, want %q", got, want)
+	}
+
+	// The workdir itself resolves via empty path and ".".
+	if got, err := s.resolvePathIn(ws, ""); err != nil || got != ws {
+		t.Fatalf("resolvePathIn('') = %q, %v; want %q", got, err, ws)
+	}
+	if got, err := s.resolvePathIn(ws, "."); err != nil || got != ws {
+		t.Fatalf("resolvePathIn('.') = %q, %v; want %q", got, err, ws)
+	}
+}
+
+// TestResolvePathInMainLibProjectPrefix: home/main-lib mode (workdir = parent,
+// e.g. /root) with an existing project subdirectory must keep resolving
+// project-level queries like search path=codegraph-go.
+func TestResolvePathInMainLibProjectPrefix(t *testing.T) {
+	base := t.TempDir()
+	ws := filepath.Join(base, "workdir")
+	proj := filepath.Join(ws, "codegraph-go")
+	if err := os.MkdirAll(filepath.Join(proj, "internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Workdir: ws, Workdirs: []string{ws}}
+
+	got, err := s.resolvePathIn(ws, "codegraph-go")
+	if err != nil {
+		t.Fatalf("existing project dir rejected: %v", err)
+	}
+	if got != proj {
+		t.Fatalf("resolvePathIn = %q, want %q", got, proj)
 	}
 }
 

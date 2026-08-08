@@ -114,16 +114,39 @@ func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir
 			b.WriteString(fmt.Sprintf("ListFiles error: %v\n", listErr))
 		}
 		found := false
-		// Normalize: try exact, suffix, and prefix (for project-level queries like "codegraph-go")
-		norm := filepath.Clean(args.Path)
-		if !strings.HasSuffix(norm, string(filepath.Separator)) {
-			norm += string(filepath.Separator)
+		// Workdir self-reference: in per-root mode (workdir IS the project
+		// directory) the files table stores workdir-relative keys
+		// (cmd/…, internal/…) that never contain the workdir's own name, so
+		// a query for the project itself — its basename, the workdir path, or
+		// "." — matched nothing and misreported "not indexed". When the
+		// query resolves to the workdir itself, any non-empty index counts as
+		// indexed: the whole DB belongs to this workdir. In home/main-lib
+		// mode (workdir = parent) this branch does not fire and the prefix
+		// match below keeps handling project-level queries like "codegraph-go".
+		wdClean := filepath.Clean(workdir)
+		queryTarget := args.Path
+		if !filepath.IsAbs(queryTarget) {
+			queryTarget = filepath.Join(wdClean, queryTarget)
 		}
-		for _, f := range files {
-			if f == args.Path || strings.HasSuffix(f, args.Path) || strings.HasPrefix(f, norm) {
+		queryTarget = filepath.Clean(queryTarget)
+		if queryTarget == wdClean || filepath.Clean(args.Path) == filepath.Base(wdClean) {
+			if len(files) > 0 {
 				b.WriteString(fmt.Sprintf("%s: indexed\n", args.Path))
 				found = true
-				break
+			}
+		}
+		if !found {
+			// Normalize: try exact, suffix, and prefix (for project-level queries like "codegraph-go")
+			norm := filepath.Clean(args.Path)
+			if !strings.HasSuffix(norm, string(filepath.Separator)) {
+				norm += string(filepath.Separator)
+			}
+			for _, f := range files {
+				if f == args.Path || strings.HasSuffix(f, args.Path) || strings.HasPrefix(f, norm) {
+					b.WriteString(fmt.Sprintf("%s: indexed\n", args.Path))
+					found = true
+					break
+				}
 			}
 		}
 		if !found {

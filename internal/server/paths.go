@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -28,7 +29,11 @@ func (s *Server) resolvePath(p string) (string, error) {
 // check, so a symlink inside the workspace cannot smuggle access (search,
 // files, explore, node …) outside it. When the target itself does not exist
 // yet, the deepest existing ancestor is resolved and the missing tail
-// re-appended before the check. Returns the canonical (real) path.
+// re-appended before the check. The returned path is the canonical (real)
+// path AND is guaranteed to exist on disk — a nonexistent target (ghost
+// path) is rejected with a clear "not found" error so callers never hand rg
+// a directory that does not exist (exit status 2). The escape check runs
+// before the existence check, so symlink escapes keep their own diagnostic.
 // When Workdir is "/" the entire filesystem is the workspace — this is
 // intentional for full-disk indexing scenarios and is not a sandbox escape.
 func (s *Server) resolvePathIn(root, p string) (string, error) {
@@ -59,6 +64,17 @@ func (s *Server) resolvePathIn(root, p string) (string, error) {
 	}
 	if !pathWithinRealRoot(realRoot, realTarget) {
 		return "", fmt.Errorf("path %q resolves outside workspace %q (symlink escape)", p, s.displayRoot(root))
+	}
+	// The final path must exist before callers (rg, readLines) consume it.
+	// resolveExistingAncestor deliberately resolves nonexistent tails so
+	// symlinks in the existing prefix are still followed and escape-checked,
+	// which means a missing target would otherwise flow through as a ghost
+	// path and make rg exit with status 2 ("No such file or directory").
+	// Reject it here with a clear error instead (search/files/callers/impact
+	// all route through this jail). The escape check above runs first, so
+	// symlink escapes keep their specific diagnostic.
+	if _, err := os.Stat(realTarget); err != nil {
+		return "", fmt.Errorf("path %q not found (not indexed or does not exist)", p)
 	}
 	return realTarget, nil
 }
