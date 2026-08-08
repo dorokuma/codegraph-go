@@ -118,14 +118,18 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 		s.resetDetect()
 		return "", nil, fmt.Errorf(
 			"no .codegraph index found walking up from %s; pass a path inside an indexed project, or omit projectPath to use the session default",
-			abs,
+			s.displayPath(abs),
 		)
 	}
 	// B7/W9: the located project root must live inside a configured workdir
 	// (symlink-resolved on both sides); otherwise a projectPath can point the
 	// server at any indexed directory on disk.
 	if !s.projectRootAllowed(resolved) {
-		return "", nil, fmt.Errorf("project %q outside configured workdirs %v", projectPath, s.Workdirs)
+		shown := make([]string, 0, len(s.Workdirs))
+		for _, wd := range s.Workdirs {
+			shown = append(shown, s.displayRoot(wd))
+		}
+		return "", nil, fmt.Errorf("project %q outside configured workdirs %v", s.displayPath(abs), shown)
 	}
 	if resolved == s.Workdir {
 		return s.Workdir, s.Database, nil

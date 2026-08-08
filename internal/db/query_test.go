@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -708,6 +709,63 @@ func TestGetFactsByTarget(t *testing.T) {
 	}
 }
 
+// TestGetFactsByTargetLimited: the read must be capped (no unbounded memory
+// for targets with huge fact piles) and truncation must be explicit.
+func TestGetFactsByTargetLimited(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	old := maxFactsByTarget
+	maxFactsByTarget = 3
+	defer func() { maxFactsByTarget = old }()
+
+	for i := 0; i < 10; i++ {
+		if _, err := database.InsertFact(&Fact{
+			TargetFile: "pile.go", TargetSymbol: "Pile",
+			Content: fmt.Sprintf("fact%d", i), ContentHash: fmt.Sprintf("h%d", i),
+			Status: "active",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// created_at has second resolution: all inserts above share one second,
+	// which makes ORDER BY created_at a no-op tiebreaker. Give each row a
+	// distinct timestamp so the "newest first" ordering is actually tested.
+	if _, err := database.conn.Exec("UPDATE facts SET created_at = id"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit-limit variant reports the truncation flag.
+	facts, truncated, err := database.GetFactsByTargetLimited("pile.go", "Pile", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 4 || !truncated {
+		t.Fatalf("limited: got %d facts, truncated=%v; want 4 and true", len(facts), truncated)
+	}
+	if facts[0].Content != "fact9" {
+		t.Fatalf("newest fact must come first, got %q", facts[0].Content)
+	}
+
+	// Non-truncated read.
+	facts, truncated, err = database.GetFactsByTargetLimited("pile.go", "Pile", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 10 || truncated {
+		t.Fatalf("untruncated: got %d facts, truncated=%v; want 10 and false", len(facts), truncated)
+	}
+
+	// GetFactsByTarget delegates to the default cap (logs, still bounded).
+	facts, err = database.GetFactsByTarget("pile.go", "Pile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != maxFactsByTarget {
+		t.Fatalf("GetFactsByTarget must cap at maxFactsByTarget=%d, got %d", maxFactsByTarget, len(facts))
+	}
+}
+
 func TestSearchFacts(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -1357,5 +1415,122 @@ func TestSearchFactsLiteralWildcards(t *testing.T) {
 	}
 	if len(facts) != 1 || facts[0].Content != "plain text content" {
 		t.Fatalf("control search = %+v", facts)
+	}
+}
+
+// TestSupersedeFactValidatesNewID: a supersede must never point at a missing
+// or non-active fact, and failed attempts must not mutate anything.
+func TestSupersedeFactValidatesNewID(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	id1, _ := database.InsertFact(&Fact{TargetFile: "a.go", Content: "old", ContentHash: "h1", Status: "active"})
+	id2, _ := database.InsertFact(&Fact{TargetFile: "a.go", Content: "new", ContentHash: "h2", Status: "active"})
+	dead, _ := database.InsertFact(&Fact{TargetFile: "a.go", Content: "dead", ContentHash: "h3", Status: "active"})
+	if err := database.RetractFact(dead); err != nil {
+		t.Fatal(err)
+	}
+
+	// newID missing
+	if err := database.SupersedeFact(id1, 99999); err == nil {
+		t.Fatal("expected error for missing newID")
+	}
+	// newID exists but is not active
+	if err := database.SupersedeFact(id1, dead); err == nil {
+		t.Fatal("expected error for non-active newID")
+	}
+	// failed attempts must not have mutated the old fact
+	f1, err := database.GetFactByHash("h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f1.Status != "active" || f1.SupersededBy != 0 {
+		t.Fatalf("failed supersede mutated old fact: status=%q superseded_by=%d", f1.Status, f1.SupersededBy)
+	}
+	// a valid supersede still works
+	if err := database.SupersedeFact(id1, id2); err != nil {
+		t.Fatalf("valid supersede: %v", err)
+	}
+}
+
+// TestFullTextSearchRefsSkipsBody: the lightweight FTS variant must return
+// file:line refs without loading bodies, while the full variant keeps them.
+func TestFullTextSearchRefsSkipsBody(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	body := strings.Repeat("func UserService() { return 1 }\n", 200)
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "UserService", File: "/svc.go", Line: 10, EndLine: 20,
+		Body: body, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := database.FullTextSearchRefs("UserService", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("want 1 ref, got %d", len(refs))
+	}
+	if refs[0].File != "/svc.go" || refs[0].Line != 10 {
+		t.Fatalf("ref = %s:%d, want /svc.go:10", refs[0].File, refs[0].Line)
+	}
+	if refs[0].Body != "" {
+		t.Fatalf("lightweight FTS must not load body (got %d chars)", len(refs[0].Body))
+	}
+	// Context variant behaves identically.
+	refs, err = database.FullTextSearchRefsContext(context.Background(), "UserService", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Body != "" {
+		t.Fatalf("context variant: got %d refs, body=%d chars", len(refs), len(refs[0].Body))
+	}
+
+	// Full FTS still returns the body.
+	full, err := database.FullTextSearch("UserService", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != 1 || full[0].Body != body {
+		t.Fatalf("full FTS must keep body (got %d chars)", len(full[0].Body))
+	}
+}
+
+// TestListFilesInDirDirectChildrenOnly: only files directly in dir are
+// returned — nested paths are excluded (in SQL, so the LIMIT counts direct
+// children, not the whole subtree).
+func TestListFilesInDirDirectChildrenOnly(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for _, p := range []string{"root.go", "pkg/a.go", "pkg/b.go", "pkg/sub/c.go", "pkg2/x.go"} {
+		if err := database.UpsertFile(p, 100, 1000.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := database.ListFilesInDir("pkg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("pkg: got %v, want [pkg/a.go pkg/b.go]", got)
+	}
+	for _, f := range got {
+		if f == "pkg/sub/c.go" || f == "pkg2/x.go" || f == "root.go" {
+			t.Fatalf("unexpected file in dir listing: %v", got)
+		}
+	}
+
+	// Root listing keeps returning only direct children.
+	got, err = database.ListFilesInDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "root.go" {
+		t.Fatalf("root: got %v, want [root.go]", got)
 	}
 }

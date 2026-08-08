@@ -1,6 +1,7 @@
 package resolution
 
 import (
+	"container/list"
 	"encoding/json"
 	"log"
 	"os"
@@ -127,55 +128,54 @@ type synthEdge struct {
 	Meta     map[string]string
 }
 
-// lruCache is a bounded in-memory cache with LRU eviction.
+// lruCache is a bounded in-memory cache with O(1) LRU eviction (map + doubly
+// linked list; the previous slice-move implementation made every touch O(n),
+// amplifying CPU/IO for large workspaces).
 type lruCache struct {
 	max   int
-	keys  []string
-	store map[string]string
+	store map[string]*list.Element
+	ll    *list.List // front = most recently used
+}
+
+type lruEntry struct {
+	key   string
+	value string
 }
 
 func newLRUCache(max int) *lruCache {
 	return &lruCache{
 		max:   max,
-		keys:  make([]string, 0, max),
-		store: make(map[string]string),
+		store: make(map[string]*list.Element, max),
+		ll:    list.New(),
 	}
 }
 
 func (l *lruCache) get(key string) (string, bool) {
-	v, ok := l.store[key]
-	if ok {
-		l.touch(key)
+	el, ok := l.store[key]
+	if !ok {
+		return "", false
 	}
-	return v, ok
+	l.ll.MoveToFront(el)
+	return el.Value.(*lruEntry).value, true
 }
 
 func (l *lruCache) put(key, value string) {
-	if _, ok := l.store[key]; ok {
-		l.store[key] = value
-		l.touch(key)
+	if el, ok := l.store[key]; ok {
+		el.Value.(*lruEntry).value = value
+		l.ll.MoveToFront(el)
 		return
 	}
-	if len(l.keys) >= l.max {
-		oldest := l.keys[len(l.keys)-1]
-		l.keys = l.keys[:len(l.keys)-1]
-		delete(l.store, oldest)
-	}
-	l.store[key] = value
-	l.keys = append([]string{key}, l.keys...)
-}
-
-func (l *lruCache) touch(key string) {
-	for i, k := range l.keys {
-		if k == key {
-			l.keys = append(l.keys[:i], l.keys[i+1:]...)
-			break
+	if l.ll.Len() >= l.max {
+		if oldest := l.ll.Back(); oldest != nil {
+			l.ll.Remove(oldest)
+			delete(l.store, oldest.Value.(*lruEntry).key)
 		}
 	}
-	l.keys = append([]string{key}, l.keys...)
+	el := l.ll.PushFront(&lruEntry{key: key, value: value})
+	l.store[key] = el
 }
 
-func (l *lruCache) len() int { return len(l.store) }
+func (l *lruCache) len() int { return l.ll.Len() }
 
 const fileContentMaxEntries = 256
 
@@ -343,11 +343,32 @@ func dispatcherField(src string) string {
 	return ""
 }
 
-// resolveCallbackTarget picks the best callable node named cbName in the context
-// of a registration call made at caller. It prefers same-file, same-directory,
-// and same-type (via class-method containment) over a blind global first match.
-func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db.Node) *db.Node {
-	nodes := ctx.getNodesByName(cbName)
+// callableProximityScore ranks a callable candidate against the caller and
+// registration files (lower is better): same file as the caller beats same
+// directory, which beats the registration file/directory, which beats a
+// subdirectory of the caller's directory.
+func callableProximityScore(c db.Node, callerFile, regFile string) int {
+	cDir := filepath.Dir(c.File)
+	switch {
+	case callerFile != "" && c.File == callerFile:
+		return 1
+	case callerFile != "" && cDir == filepath.Dir(callerFile):
+		return 2
+	case regFile != "" && c.File == regFile:
+		return 3
+	case regFile != "" && cDir == filepath.Dir(regFile):
+		return 4
+	case callerFile != "" && strings.HasPrefix(c.File, filepath.Dir(callerFile)+string(filepath.Separator)):
+		return 10
+	default:
+		return 100
+	}
+}
+
+// pickCallableByProximity chooses among same-named function/method candidates
+// preferring proximity to the caller/registration files. On a tie the first
+// candidate in the input order wins (stable fallback).
+func pickCallableByProximity(nodes []db.Node, callerFile, regFile string) *db.Node {
 	var callables []db.Node
 	for _, n := range nodes {
 		if n.Kind == db.KindMethod || n.Kind == db.KindFunction {
@@ -358,44 +379,25 @@ func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db
 		return nil
 	}
 	if len(callables) == 1 {
-		n := callables[0]
-		return &n
+		return &callables[0]
 	}
-
-	// Score each candidate: lower is better.
-	type cand struct {
-		n     db.Node
-		score int
-	}
-	var ranked []cand
-	callerDir := filepath.Dir(caller.File)
-	regDir := filepath.Dir(reg.File)
-	for _, c := range callables {
-		sc := 100
-		cDir := filepath.Dir(c.File)
-		if c.File == caller.File {
-			sc = 1
-		} else if cDir == callerDir {
-			sc = 2
-		} else if c.File == reg.File {
-			sc = 3
-		} else if cDir == regDir {
-			sc = 4
-		} else if strings.HasPrefix(c.File, callerDir+string(filepath.Separator)) {
-			sc = 10
-		}
-		ranked = append(ranked, cand{n: c, score: sc})
-	}
-
-	// Stable: pick the lowest score; if tie, first in original order wins (fallback).
-	best := &ranked[0]
-	for i := 1; i < len(ranked); i++ {
-		if ranked[i].score < best.score {
-			best = &ranked[i]
+	best := callables[0]
+	bestScore := callableProximityScore(best, callerFile, regFile)
+	for _, c := range callables[1:] {
+		if sc := callableProximityScore(c, callerFile, regFile); sc < bestScore {
+			best = c
+			bestScore = sc
 		}
 	}
-	n := best.n
-	return &n
+	return &best
+}
+
+// resolveCallbackTarget picks the best callable node named cbName in the context
+// of a registration call made at caller. It prefers same-file, same-directory,
+// and same-type (via class-method containment) over a blind global first match.
+func resolveCallbackTarget(ctx *synthCtx, cbName string, caller *db.Node, reg db.Node) *db.Node {
+	nodes := ctx.getNodesByName(cbName)
+	return pickCallableByProximity(nodes, caller.File, reg.File)
 }
 
 // argReCache avoids recompiling the registrar-name regex per call site.
@@ -587,14 +589,10 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 				if handlerName == "" {
 					continue
 				}
-				var handler *db.Node
-				for _, n := range ctx.getNodesByName(handlerName) {
-					if n.Kind == db.KindFunction || n.Kind == db.KindMethod {
-						nn := n
-						handler = &nn
-						break
-					}
-				}
+				// Same-file / same-directory preference instead of a blind
+				// global first match (audit: multi-module same-named handlers
+				// got cross-wired to whichever node the DB returned first).
+				handler := pickCallableByProximity(ctx.getNodesByName(handlerName), "", file)
 				if handler == nil {
 					continue
 				}

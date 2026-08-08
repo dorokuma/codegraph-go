@@ -4,7 +4,7 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.8.2**. Index logic version **18**.
+Current version: **0.9.0**. Index logic version **18**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
 
@@ -36,7 +36,7 @@ Alignment: steps **1–9** done incl. 7.5 (logic **18**). Not full feature-parit
 - **Portable index paths:** files/nodes stored relative to workdir (schema 17+); safe to move/copy the tree after reindex
 - **Auto-sync:** file watcher with 2-second debounce on every configured workdir; new directories are watched recursively
 - **Staleness warning:** warns when referenced files are pending sync
-- **Index skip rules:** indexing applies built-in skip rules (internal skip.go) and does not parse `.gitignore`; search tools run ripgrep, which respects ignore files by default and uses `--no-ignore` when an explicit path is given
+- **Index skip rules:** indexing applies built-in skip rules (internal skip.go) and does not parse `.gitignore`; search tools run ripgrep, which respects ignore files by default and only sweep ignored files when `no_ignore=true` is passed
 - **Agent fact storage:** `store_fact` / `search_facts` tools let agents attach cross-session findings, decisions, and notes to code symbols; facts survive index rebuilds
 
 
@@ -46,7 +46,7 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.8.2 |
+| Display version | 0.9.0 |
 | Index logic | 18 |
 | Feature parity | **not claimed** (step 10 open) |
 
@@ -94,7 +94,7 @@ codegraph-go -workdir /path/to/project
 |--------|---------|
 | `explore` | **PRIMARY.** Overview or `query=` bag of names → Flow + source (treat as already Read) |
 | `node` | `file` alone = Read-like source + dependents; `name` = body + trail |
-| `search` | Symbol FTS or ripgrep (`pattern`) |
+| `search` | Symbol FTS or ripgrep (`pattern`); literal by default — `regex=true` for regex, `no_ignore=true` to include ignored files |
 | `callers` / `callees` / `impact` | Call graph; optional `file` pin |
 | `files` | Glob listing |
 | `status` | Index health |

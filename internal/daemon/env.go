@@ -14,6 +14,13 @@ const (
 	EnvIdleTimeoutMS  = "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS"
 	EnvPPIDPollMS     = "CODEGRAPH_PPID_POLL_MS"
 	EnvLogAttach      = "CODEGRAPH_MCP_LOG_ATTACH"
+	// EnvMCPToken enables optional socket auth: when set (on both the proxy
+	// and the daemon — SpawnDetached inherits the environment), every
+	// session must present the token in its client hello or the connection
+	// is dropped. Default empty = auth off, preserving existing deployments.
+	// The token must never be logged (audit high: socket has no app-level
+	// auth).
+	EnvMCPToken = "CODEGRAPH_MCP_TOKEN"
 )
 
 const (
@@ -63,4 +70,12 @@ func truthy(raw string) bool {
 		return false
 	}
 	return true
+}
+
+// MCPToken returns the socket-auth token from the environment, or "" when
+// auth is disabled. Used by both sides of the handshake: the daemon rejects
+// sessions whose client hello does not match, the proxy includes it in its
+// hello. Never log the returned value.
+func MCPToken() string {
+	return strings.TrimSpace(os.Getenv(EnvMCPToken))
 }

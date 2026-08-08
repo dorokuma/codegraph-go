@@ -16,7 +16,11 @@ func (s *Server) resolvePath(p string) (string, error) {
 			return result, nil
 		}
 	}
-	return "", fmt.Errorf("path %q is outside all workdirs %v", p, s.Workdirs)
+	names := make([]string, 0, len(s.Workdirs))
+	for _, wd := range s.Workdirs {
+		names = append(names, filepath.Base(wd))
+	}
+	return "", fmt.Errorf("path %q is outside all workdirs (%s)", p, strings.Join(names, ", "))
 }
 
 // resolvePathIn joins p under root and rejects escapes outside root (B6/W8).
@@ -50,13 +54,39 @@ func (s *Server) resolvePathIn(root, p string) (string, error) {
 		// are still followed (and rejected if they escape).
 		realTarget, err = resolveExistingAncestor(target)
 		if err != nil {
-			return "", fmt.Errorf("path %q is outside workspace %q", p, root)
+			return "", fmt.Errorf("path %q is outside workspace %q", p, s.displayRoot(root))
 		}
 	}
 	if !pathWithinRealRoot(realRoot, realTarget) {
-		return "", fmt.Errorf("path %q resolves to %q outside workspace %q (symlink escape)", p, realTarget, root)
+		return "", fmt.Errorf("path %q resolves outside workspace %q (symlink escape)", p, s.displayRoot(root))
 	}
 	return realTarget, nil
+}
+
+// displayRoot renders a workspace root for client-facing messages without
+// leaking the absolute path: relative to the session workdir when under it,
+// otherwise just the basename (audit low: error output must not expose host
+// layout).
+func (s *Server) displayRoot(root string) string {
+	if s != nil && s.Workdir != "" && filepath.Clean(root) != filepath.Clean(s.Workdir) {
+		if rel, err := filepath.Rel(s.Workdir, root); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return rel
+		}
+	}
+	return filepath.Base(root)
+}
+
+// displayPath renders a resolved absolute path for client-facing messages
+// without leaking the host layout: relative to the session workdir when under
+// it, otherwise just the basename (same policy as displayRoot, for paths that
+// are NOT under the project root and therefore can't be shown relative to it).
+func (s *Server) displayPath(p string) string {
+	if s != nil && s.Workdir != "" {
+		if rel, err := filepath.Rel(s.Workdir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return filepath.ToSlash(rel)
+		}
+	}
+	return filepath.Base(p)
 }
 
 // realRoot returns the canonical (EvalSymlinks-resolved) form of root,

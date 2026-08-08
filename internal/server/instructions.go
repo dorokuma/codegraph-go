@@ -19,7 +19,7 @@ dozen near-duplicate tools). Lower prompt noise, same capabilities.
 
 - **node** — file alone = Read-like numbered source + dependents; name = body
   trail (includeCode to see implementation).
-- **search** — pattern; simple identifiers hit FTS first.
+- **search** — pattern is matched literally by default (simple identifiers hit FTS first); set regex=true for regex (ripgrep syntax); set no_ignore=true to also search .gitignore'd files.
 - **callers** / **callees** / **impact** — call graph (pass file when overloaded).
 - **files** — glob listing. **status** — index health.
 - **affected** — tests after edits. **communities** — module structure.

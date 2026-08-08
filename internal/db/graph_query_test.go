@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"os"
 	"testing"
 )
@@ -412,5 +413,96 @@ func TestGetImportTargetNames(t *testing.T) {
 	}
 	if len(names) != 1 || names[0] != "pkg" {
 		t.Fatalf("want [pkg], got %v", names)
+	}
+}
+
+// TestGetNodesByKindLimited: explicit limit + truncation flag, and the plain
+// GetNodesByKind delegation keeps working with its default cap.
+func TestGetNodesByKindLimited(t *testing.T) {
+	db, _ := setupGraphDB(t) // A, B, C functions + D struct
+
+	funcs, truncated, err := db.GetNodesByKindLimited(KindFunction, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(funcs) != 2 || !truncated {
+		t.Fatalf("limit 2: got %d nodes, truncated=%v (want 2, true)", len(funcs), truncated)
+	}
+	all, truncated, err := db.GetNodesByKindLimited(KindFunction, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || truncated {
+		t.Fatalf("limit 10: got %d nodes, truncated=%v (want 3, false)", len(all), truncated)
+	}
+	plain, err := db.GetNodesByKind(KindFunction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != 3 {
+		t.Fatalf("GetNodesByKind = %d nodes, want 3", len(plain))
+	}
+}
+
+// TestGraphQueriesCapped: callers/callees/impact (and the WithKind variants)
+// must be bounded by graphQueryRowLimit instead of loading every row.
+func TestGraphQueriesCapped(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	old := graphQueryRowLimit
+	graphQueryRowLimit = 2
+	defer func() { graphQueryRowLimit = old }()
+
+	idX, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "X", File: "x.go", Line: 1, Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for _, n := range []string{"a", "b", "c"} {
+		id, err := database.UpsertNode(&Node{Kind: KindFunction, Name: n, File: n + ".go", Line: 1, Language: "go"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		if _, err := database.UpsertEdge(&Edge{SourceID: id, TargetID: idX, Kind: EdgeCalls, File: n + ".go", Line: 5}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	callers, err := database.GetCallers(idX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 2 {
+		t.Fatalf("GetCallers capped: got %d, want 2", len(callers))
+	}
+	callees, err := database.GetCallees(ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callees) != 1 {
+		t.Fatalf("GetCallees: got %d, want 1", len(callees))
+	}
+	impact, err := database.GetImpact(idX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impact) != 2 {
+		t.Fatalf("GetImpact capped: got %d, want 2", len(impact))
+	}
+	refs, err := database.GetCallersWithKindContext(context.Background(), idX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("GetCallersWithKindContext capped: got %d, want 2", len(refs))
+	}
+	crefs, err := database.GetCalleesWithKindContext(context.Background(), ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(crefs) != 1 {
+		t.Fatalf("GetCalleesWithKindContext: got %d, want 1", len(crefs))
 	}
 }

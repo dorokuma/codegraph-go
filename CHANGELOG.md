@@ -3,6 +3,53 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-08-08
+
+### Added
+- Go interface 方法现在提取为 `kind=signature` 节点（此前作为成员方法丢失）。
+- config 的 `workdirs` 与 `-workdir` 支持 `~` 与 `$VAR`/`${VAR}` 展开
+  （`expandPath`）：`~/proj` 与 `$PROJECT_ROOT` 按用户预期解析，展开为空
+  的条目被跳过；Pi 适配器授权根同步同一展开语义，避免 `~/proj` 变成字面
+  的 `.../~/proj` 导致会话 workdir 对不上。
+- 新增可选环境变量 `CODEGRAPH_MCP_TOKEN`：daemon unix socket 的可选 token
+  鉴权，默认关闭（不设即行为不变）。
+- safelog 新增日志脱敏：敏感键整值打码 + 常见密钥形状（PEM 私钥、
+  Basic/Bearer、JWT、sk-/ghp_/AKIA/AIza/xox/Stripe 等）正则打码，覆盖
+  slog 与 legacy `log.Printf` 两条路径。能力边界：best-effort，不替代源头
+  不记录密钥——匹配不到已知形状的密钥仍可能出现在日志里，密钥不应写入日志。
+
+### Changed
+- **BREAKING:** `search` 默认字面匹配（`--fixed-strings`），`regex=true`
+  才启用正则语义；`search` 默认尊重 `.gitignore`，`no_ignore=true` 才加
+  `--no-ignore` 扫忽略文件。服务端 schema 与 Pi 适配器同步新增 `regex` /
+  `no_ignore` 布尔参数（默认 false），MCP 客户端不再能靠旧契约静默得到
+  正则/忽略扫描行为。
+- `$CODEGRAPH_CONFIG` 指向不存在的文件时被跳过，继续默认查找
+  （./codegraph-config.yaml → ~/.config/codegraph/config.yaml），调用方
+  不再追死路径；Pi 适配器同步该查找语义。
+- Display / daemon wire version **0.9.0**。
+
+### Fixed
+- Go 多行 import 在 tree-sitter 主路径丢失 imports 边。
+- JS `require()` 调用不提取。
+- C-like / Rust / Ruby / PHP 调用边行号错位。
+- 同名符号跨文件错连。
+- watcher 失败不回队导致静默漏索引。
+- symlink 替换后幻灵索引（旧目标条目残留）。
+
+### Security
+- daemon 与 tool 分发层加 recover：panic 转为单次调用错误，不击穿共享
+  daemon 进程。
+- 所有 tool 参数加服务端硬上限（结果数、深度、offset/limit 等 clamp）。
+- 全部 action 加超时（search/files/node/graph/facts 30s，communities 60s）。
+- `store_fact` 内容限额：写库上限 + 回读截断，防事实表膨胀成磁盘 DoS。
+- rg 输出改流式读取，不再整体吞入内存。
+
+### Migration
+- `search` 迁移：需要正则匹配时显式传 `regex=true`；需要扫忽略文件时传
+  `no_ignore=true`。
+- 提取器修复后建议重建索引以获得完整收益（增量索引会逐步自愈）。
+
 ## [0.8.10] - 2026-08-07
 
 ### Fixed

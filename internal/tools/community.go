@@ -22,6 +22,34 @@ type CommunityArgs struct {
 	MinSize     int    `json:"minSize,omitempty" jsonschema:"minimum community size (nodes) to include in output (default 3),optional"`
 }
 
+// maxCommunityNodes bounds the graph Louvain will run on. GetGraphSnapshot
+// can return up to graphSnapshotCap (~500k) nodes; full-graph Louvain on
+// that size burns CPU for a long time while holding the DB read lock (audit
+// high: communities had no timeout and no size guard). 100k nodes covers
+// every realistic project (≈20k files) while keeping a hostile/oversized
+// index from pinning the daemon. A var so tests can lower it.
+var maxCommunityNodes = 100_000
+
+// ctxCheckInterval bounds how often the graph-build loops poll ctx: checking
+// on every iteration would add a branch + atomic load per edge on a snapshot
+// of up to ~500k rows, while every 4096 rows keeps the overhead negligible
+// and a canceled request is still noticed within a single pass (worst case a
+// few ms of extra work on a huge index).
+const ctxCheckInterval = 4096
+
+// ctxCheckEvery returns ctx.Err() at most once per ctxCheckInterval calls,
+// i.e. periodically instead of on every iteration.
+func ctxCheckEvery(ctx context.Context, i int) error {
+	if i&(ctxCheckInterval-1) == 0 {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// maxCommunities caps reported communities (server layer clamps too; this
+// is defense in depth for direct package use).
+const maxCommunities = 100
+
 // CommunityResult is the result of the communities tool.
 type CommunityResult struct {
 	Content []ContentItem `json:"content"`
@@ -77,11 +105,22 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	if args.Max <= 0 {
 		args.Max = 20
 	}
+	if args.Max > maxCommunities {
+		args.Max = maxCommunities
+	}
 	if args.MinSize <= 0 {
 		args.MinSize = 3
 	}
 
-	// Step 1: Load graph snapshot
+	// Step 1: Load graph snapshot. GetGraphSnapshot has no ctx variant (the
+	// DB side is not interruptible), so check ctx before and after the call
+	// and poll periodically through the build loops below — a canceled
+	// request must abort during graph construction, not only at the Louvain
+	// gates. The 60s server deadline therefore bounds the build + enrichment
+	// phase for real, not just the tail ends.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	snapshot, err := database.GetGraphSnapshot()
 	if err != nil {
 		return nil, fmt.Errorf("load graph snapshot: %w", err)
@@ -93,12 +132,30 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 		}, nil
 	}
 
+	// Node-scale guard (audit high): refuse before the O(E) graph build and
+	// Louvain pass instead of burning CPU on an oversized index. The DB
+	// snapshot itself is already capped at ~500k rows; this keeps the
+	// expensive part bounded.
+	if len(snapshot.Nodes) > maxCommunityNodes {
+		return nil, fmt.Errorf("community detection refused: index has %d nodes (max %d) — the full-graph Louvain pass would take too long; ask the operator to analyze a smaller index", len(snapshot.Nodes), maxCommunityNodes)
+	}
+
+	// Cancellation gate: the Louvain pass itself is not interruptible and
+	// the snapshot is expensive, so refuse a canceled request before
+	// building the graph.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Step 2: Build node ID mapping (DB node id → 0-based compact ID for gonum)
 	// and reverse mapping (compact ID → db.Node for output enrichment).
 	nodeIndex := make(map[int64]int64, len(snapshot.Nodes))      // DB node ID → compact ID
 	reverseIndex := make(map[int64]db.Node, len(snapshot.Nodes)) // compact ID → DB node
 	g := simple.NewWeightedUndirectedGraph(0, 0)
 	for i, n := range snapshot.Nodes {
+		if err := ctxCheckEvery(ctx, i); err != nil {
+			return nil, err
+		}
 		cid := int64(i)
 		nodeIndex[n.ID] = cid
 		reverseIndex[cid] = n
@@ -108,7 +165,10 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	// Step 3: Add weighted edges.
 	// Filter out 'contains' edges, project directed→undirected, accumulate weight by provenance.
 	edgeWeights := make(map[[2]int64]float64)
-	for _, e := range snapshot.Edges {
+	for i, e := range snapshot.Edges {
+		if err := ctxCheckEvery(ctx, i); err != nil {
+			return nil, err
+		}
 		if e.Kind == db.EdgeContains {
 			continue
 		}
@@ -128,13 +188,23 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	}
 
 	totalWeightedEdges := 0
+	i := 0
 	for pair, w := range edgeWeights {
+		if err := ctxCheckEvery(ctx, i); err != nil {
+			return nil, err
+		}
 		g.SetWeightedEdge(simple.WeightedEdge{
 			F: simple.Node(pair[0]),
 			T: simple.Node(pair[1]),
 			W: w,
 		})
 		totalWeightedEdges++
+		i++
+	}
+
+	// Final cancellation gate before the (non-interruptible) Louvain pass.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Step 4: Run Louvain community detection.
@@ -169,10 +239,15 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 		commList = commList[:args.Max]
 	}
 
-	// Step 5: Enrich each community with statistics.
+	// Step 5: Enrich each community with statistics. buildCommunityInfo scans
+	// all edges per community (up to maxCommunities × snapshot edges), so it
+	// polls ctx periodically too.
 	infos := make([]CommunityInfo, 0, len(commList))
 	for _, ce := range commList {
-		info := buildCommunityInfo(ce.id, ce.nodes, ce.dbIDs, nodeIndex, reverseIndex, snapshot)
+		info, err := buildCommunityInfo(ctx, ce.id, ce.nodes, ce.dbIDs, nodeIndex, reverseIndex, snapshot)
+		if err != nil {
+			return nil, err
+		}
 		infos = append(infos, info)
 	}
 
@@ -225,7 +300,9 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	}, nil
 }
 
-// buildCommunityInfo computes per-community statistics.
+// buildCommunityInfo computes per-community statistics. It returns an error
+// when ctx is canceled mid-scan (the per-community edge pass is O(edges) and
+// can dominate runtime when many communities are reported).
 //
 // Parameters:
 //   - id: community index in the Louvain result
@@ -234,9 +311,9 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 //   - nodeIndex: DB node ID → compact ID
 //   - revIndex: compact ID → db.Node
 //   - snapshot: full graph snapshot (for edge scans)
-func buildCommunityInfo(id int, nodes []graph.Node, dbIDs []int64,
+func buildCommunityInfo(ctx context.Context, id int, nodes []graph.Node, dbIDs []int64,
 	nodeIndex map[int64]int64, revIndex map[int64]db.Node,
-	snapshot *db.GraphSnapshot) CommunityInfo {
+	snapshot *db.GraphSnapshot) (CommunityInfo, error) {
 
 	// Build a set of compact IDs for O(1) membership tests.
 	compactSet := make(map[int64]bool, len(nodes))
@@ -249,7 +326,10 @@ func buildCommunityInfo(id int, nodes []graph.Node, dbIDs []int64,
 	weightedDeg := make(map[int64]float64)
 	internalEdges := 0
 
-	for _, e := range snapshot.Edges {
+	for i, e := range snapshot.Edges {
+		if err := ctxCheckEvery(ctx, i); err != nil {
+			return CommunityInfo{}, err
+		}
 		if e.Kind == db.EdgeContains {
 			continue
 		}
@@ -339,5 +419,5 @@ func buildCommunityInfo(id int, nodes []graph.Node, dbIDs []int64,
 		TopSymbols:    topSymbols,
 		TopFiles:      topFiles,
 		KindDist:      kindDist,
-	}
+	}, nil
 }

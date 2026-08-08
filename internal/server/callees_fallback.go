@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -33,15 +32,15 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		"--line-number", "--no-heading", "--color=never",
 		"--max-count=20",
 		"-e", defPattern, root)
-	defOut, err := rgDef.Output()
-	if err != nil || len(bytes.TrimSpace(defOut)) == 0 {
-		// err != nil with a non-exit-1 code means rg itself is broken (not
-		// merely "no match") — surface the error instead of masking it with a
-		// misleading "no definitions" answer or a pointless fallback run.
+	// Streamed + capped: the old rg.Output() loaded the whole match set into
+	// memory before the per-definition loop (audit medium).
+	defLines, _, err := rgOutputLines(rgDef, 2000, 1<<20)
+	if err != nil || len(defLines) == 0 {
 		if err != nil {
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
-				return nil, nil, fmt.Errorf("rg definitions: %w", err)
-			}
+			// err != nil with a non-exit-1 code means rg itself is broken (not
+			// merely "no match") — surface the error instead of masking it with a
+			// misleading "no definitions" answer or a pointless fallback run.
+			return nil, nil, fmt.Errorf("rg definitions: %w", err)
 		}
 		// Fallback uses an independent context — primary may have exhausted its timeout.
 		fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -51,13 +50,11 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 			"--line-number", "--no-heading", "--color=never",
 			"--max-count=20",
 			"-e", fallbackPattern, root)
-		defOut, err = rgDefFallback.Output()
+		defLines, _, err = rgOutputLines(rgDefFallback, 2000, 1<<20)
 		if err != nil {
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
-				return nil, nil, fmt.Errorf("rg definitions fallback: %w", err)
-			}
+			return nil, nil, fmt.Errorf("rg definitions fallback: %w", err)
 		}
-		if len(bytes.TrimSpace(defOut)) == 0 {
+		if len(defLines) == 0 {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "no definitions found for " + args.Name}},
 			}, nil, nil
@@ -69,7 +66,7 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		line int
 	}
 	var defs []defMatch
-	for _, line := range strings.Split(strings.TrimSpace(string(defOut)), "\n") {
+	for _, line := range defLines {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) < 2 {
 			continue

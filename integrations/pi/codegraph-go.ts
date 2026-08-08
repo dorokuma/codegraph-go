@@ -86,6 +86,27 @@ function normPath(p: string): string {
 	}
 }
 
+/**
+ * 与二进制 config.expandPath 同语义（L2）：展开开头 ~（或裸 ~）为 $HOME，
+ * 再展开 $VAR / ${VAR}（未设置的变量展开为空串）；$HOME 不可解析时 ~ 原样
+ * 保留。config workdirs 里写 ~/proj 或 $PROJECT_ROOT 时，Pi 侧授权根与
+ * 二进制侧展开结果一致，会话 workdir 才对得上。
+ */
+function expandPath(p: string): string {
+	if (!p) return p
+	if (p === "~" || p.startsWith("~/")) {
+		const home = os.homedir()
+		if (home) {
+			p = p === "~" ? home : path.join(home, p.slice(2))
+		}
+	}
+	return p.replace(/\$([A-Za-z_][A-Za-z0-9_]*|\{[^}]*\})/g, (m, name) => {
+		const key = name[0] === "{" ? name.slice(1, -1) : name
+		const v = process.env[key]
+		return v !== undefined ? v : ""
+	})
+}
+
 function isFilesystemRoot(dir: string): boolean {
 	const resolved = normPath(dir)
 	if (resolved === path.parse(resolved).root) return true
@@ -206,7 +227,15 @@ export function resolveWorkdir(cwd: string): WorkdirDecision {
 /** config 文件查找（与二进制 ConfigPath 同一优先级）。找不到返回 null。 */
 function configFilePath(): string | null {
 	const env = process.env.CODEGRAPH_CONFIG
-	if (env) return env
+	if (env) {
+		// 与二进制 ConfigPath 同语义（L1）：$CODEGRAPH_CONFIG 指向不存在的文件
+		// 时跳过，继续查本地/全局候选——env 指向死路径时仍能读到真实 config
+		// 的 workdirs，授权根不会被错误收窄成 $HOME。
+		if (fs.existsSync(env)) return env
+		console.warn(
+			`[codegraph-go] $CODEGRAPH_CONFIG=${env} 不存在，跳过并继续默认查找（与二进制 ConfigPath 一致）`,
+		)
+	}
 	const local = path.resolve("./codegraph-config.yaml")
 	if (fs.existsSync(local)) return local
 	const home = os.homedir()
@@ -223,11 +252,31 @@ function configFilePath(): string | null {
  * - flow：键行内联列表 `workdirs: [/root, /opt]`（逗号分隔，项可带引号
  *   与行尾注释，`]` 后可带行尾注释）
  * 下一个顶格非列表项键结束该段（flow 键行后若还有 `- <path>` 行继续收）。
- * 不做完整 YAML；读不到文件或格式异常 → 空列表（= 无 config，回落 $HOME）。
+ *
+ * 限制（M8）：不做完整 YAML，与 Go 端 yaml.v3 不同构。轻量解析器无法忠实
+ * 处理的构造（锚点 &、别名 *、多文档 ---、块标量 |/>、flow 列表内嵌 {…}
+ * mapping）一律整体判为「不可解析」→ 返回空列表 → 调用方按与 Go 端
+ * WorkdirAllowlist 相同的语义回退到 $HOME（Go 对不可解析/空 workdirs 的
+ * config 文件也是 $HOME 兜底），绝不拿猜出来的子集当授权根。
+ * 真正的授权校验始终在二进制侧（main.go ValidateWorkdirs）执行，Pi 侧只是
+ * 会话级 UX 判定；解析失败不会静默放行任何路径。
  */
 function parseConfigWorkdirs(filePath: string): string[] {
 	try {
 		const data = fs.readFileSync(filePath, "utf8")
+		if (
+			/&[A-Za-z0-9_-]+/.test(data) || // 锚点定义（workdirs: &defaults）
+			/\*[A-Za-z0-9_-]+/.test(data) || // 别名引用（- *defaults）
+			/^---\s*$/m.test(data) || // 多文档分隔
+			/^[ \t]*[|>][-+]?\s*$/m.test(data) // 块标量指示符
+		) {
+			console.warn(
+				`[codegraph-go] config ${filePath} 含轻量解析器无法处理的 YAML 构造` +
+					`（锚点/别名/多文档/块标量），授权根按「config 不可解析」回退到 $HOME` +
+					`（与二进制 WorkdirAllowlist 语义一致）`,
+			)
+			return []
+		}
 		const roots: string[] = []
 		let inWorkdirs = false
 		for (const raw of data.split("\n")) {
@@ -236,6 +285,15 @@ function parseConfigWorkdirs(filePath: string): string[] {
 				// flow 风格键行：`workdirs: [a, b]` 同行解析内联列表
 				const flow = line.match(/^workdirs\s*:\s*\[(.*)\]\s*(?:#.*)?$/)
 				if (flow) {
+					if (/[{}]/.test(flow[1])) {
+						// flow mapping 嵌在列表里（workdirs: [/a, {b: c}]）——无法解析，
+						// 整体回退，不猜子集。
+						console.warn(
+							`[codegraph-go] config ${filePath} 的 workdirs 含 flow mapping` +
+								`（{…}），轻量解析器不支持，回退到 $HOME`,
+						)
+						return []
+					}
 					inWorkdirs = true
 					for (const item of flow[1].split(",")) {
 						const p = item.trim().replace(/^["']|["']$/g, "").replace(/\s+#.*$/, "")
@@ -258,7 +316,8 @@ function parseConfigWorkdirs(filePath: string): string[] {
 			}
 		}
 		return roots
-	} catch {
+	} catch (e) {
+		console.warn(`[codegraph-go] 无法读取 config ${filePath}（${e}），授权根回退到 $HOME`)
 		return []
 	}
 }
@@ -276,7 +335,11 @@ export function allowedRoots(): string[] {
 			const roots: string[] = []
 			const seen = new Set<string>()
 			for (const r of parsed) {
-				const c = normPath(r)
+				// 与二进制 WorkdirAllowlist 同语义（L2）：先 expandPath（~ 与
+				// $VAR 展开），展开为空则跳过该 root，再做 canonical（normPath）。
+				const e = expandPath(r)
+				if (!e) continue
+				const c = normPath(e)
 				if (c && !seen.has(c)) {
 					seen.add(c)
 					roots.push(c)
@@ -284,6 +347,13 @@ export function allowedRoots(): string[] {
 			}
 			return roots
 		}
+		// 文件存在但解析失败（parseConfigWorkdirs 已打 warning）或 workdirs 为空：
+		// 与二进制 WorkdirAllowlist 完全一致地回退到 $HOME（Go 对「不可解析 /
+		// 空列表」的 config 文件同样是 $HOME 兜底），不静默放行、也不擅自收窄。
+		// 二进制侧的 ValidateWorkdirs 才是真正的授权校验。
+		console.warn(
+			`[codegraph-go] config ${cfg} 未解析出 workdirs，授权根回退到 $HOME（与二进制语义一致）`,
+		)
 	}
 	const home = normPath(os.homedir())
 	return home ? [home] : []
@@ -736,18 +806,6 @@ async function startClientAt(
 	}
 }
 
-/** 从 cwd 决议后启动（仅用于仍需从 cwd 决议的场景；已决议路径用 startClientAt）。 */
-async function tryStartClient(
-	cwd: string,
-): Promise<{ client: CodeGraphClient } | { error: string }> {
-	const decision = resolveWorkdir(cwd)
-	if (!decision.ok) {
-		console.error(`[codegraph-go] ${decision.reason}`)
-		return { error: decision.reason }
-	}
-	return startClientAt(decision.workdir, decision.note)
-}
-
 /** 家目录下有哪些「像项目」的一级目录（仅提示用，不参与钩子）。 */
 function listProjects(workdir: string): string[] {
 	const out: string[] = []
@@ -997,7 +1055,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => Promise<CodeGraphClien
 		promptSnippet: "Code search & call-graph analysis via unified action router",
 		promptGuidelines: [
 			"Use codegraph with action='explore' FIRST for codebase/symbol overview. Empty query = project overview.",
-			"Use action='search' for regex/literal code search (file:line results).",
+			"Use action='search' for literal code search (file:line results); set regex=true for regex matching, no_ignore=true to include .gitignore'd files.",
 			"Use action='files' to list files by glob.",
 			"Use action='callees'/'callers'/'impact' for call-graph analysis.",
 			"Use action='node' for full symbol detail (location, signature, deps) or file reading with line numbers.",
@@ -1015,7 +1073,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => Promise<CodeGraphClien
 					"node", "status", "affected", "communities", "store_fact", "search_facts",
 				],
 			}),
-			pattern: Type.Optional(Type.String({ description: "search: regex or literal pattern (ripgrep syntax)" })),
+			pattern: Type.Optional(Type.String({ description: "search: literal text to find (default); set regex=true for regular expression semantics" })),
 			name: Type.Optional(Type.String({ description: "callees/callers/impact/node: symbol name" })),
 			file: Type.Optional(Type.String({ description: "node/callees/callers/impact: file path or basename to pin" })),
 			query: Type.Optional(Type.String({ description: "explore/search_facts: symbol or free-text / search term" })),
@@ -1023,6 +1081,8 @@ function registerTools(pi: ExtensionAPI, getClient: () => Promise<CodeGraphClien
 			glob: Type.Optional(Type.String({ description: 'search/files/callees/callers/impact: file glob filter, e.g. "*.go"' })),
 			max: Type.Optional(Type.Number({ description: "search/files/explore/callees/callers/impact/communities/search_facts: result cap" })),
 			ignore_case: Type.Optional(Type.Boolean({ description: "search: case-insensitive search" })),
+			regex: Type.Optional(Type.Boolean({ description: "search: treat pattern as a regular expression (default false: literal match)" })),
+			no_ignore: Type.Optional(Type.Boolean({ description: "search: include .gitignore'd files (default false: ignore rules are respected)" })),
 			line: Type.Optional(Type.Number({ description: "node: pin definition at/around this line" })),
 			includeCode: Type.Optional(Type.Boolean({ description: "node: include source body (default false)" })),
 			symbolsOnly: Type.Optional(Type.Boolean({ description: "node: symbol map + dependents only" })),

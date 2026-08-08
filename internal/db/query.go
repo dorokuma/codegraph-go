@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,6 +22,10 @@ const (
 	KindStruct    = "struct"
 	KindInterface = "interface"
 	KindFile      = "file"
+	// KindSignature marks interface-method declaration nodes (extraction
+	// emits them as first-class symbols). They are declarations, not
+	// callable bodies: never call targets.
+	KindSignature = "signature"
 )
 
 // EdgeKind constants
@@ -195,12 +200,40 @@ func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 	return scanFact(row)
 }
 
-// GetFactsByTarget returns all facts for a given target_file and optionally target_symbol.
-// Pass symbol="" to ignore symbol filter.
+// maxFactsByTarget caps GetFactsByTarget rows. A target can accumulate a
+// large pile of agent facts, each with content; loading all of them just to
+// show a few would balloon memory (the display layer caps separately). A var
+// so tests can lower it.
+var maxFactsByTarget = 500
+
+// GetFactsByTarget returns up to maxFactsByTarget facts for a given
+// target_file and optionally target_symbol, newest first, and logs when more
+// exist (truncation is reported so a capped read is never mistaken for the
+// full pile). Pass symbol="" to ignore symbol filter. Callers that need the
+// truncation flag explicitly should use GetFactsByTargetLimited.
 func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
+	facts, truncated, err := d.GetFactsByTargetLimited(file, symbol, maxFactsByTarget)
+	if truncated {
+		sym := ""
+		if symbol != "" {
+			sym = "/" + symbol
+		}
+		log.Printf("db: facts for target %s%s exceed the read cap (%d); returning the newest %d, more exist", file, sym, maxFactsByTarget, maxFactsByTarget)
+	}
+	return facts, err
+}
+
+// GetFactsByTargetLimited returns up to limit facts for a given target_file
+// and optionally target_symbol, newest first, plus whether more rows exist.
+// limit <= 0 falls back to maxFactsByTarget. Unlike GetFactsByTarget,
+// truncation is explicit here so callers can surface it in responses.
+func (d *DB) GetFactsByTargetLimited(file, symbol string, limit int) ([]Fact, bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	if limit <= 0 {
+		limit = maxFactsByTarget
+	}
 	q := `SELECT id, target_file, target_symbol, target_line, content, content_hash,
 		author, status, COALESCE(superseded_by,0), created_at, updated_at
 		FROM facts WHERE target_file = ?`
@@ -209,13 +242,22 @@ func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
 		q += ` AND target_symbol = ?`
 		args = append(args, symbol)
 	}
-	q += ` ORDER BY created_at DESC`
+	q += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit+1)
 	rows, err := d.conn.Query(q, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	return scanFacts(rows)
+	facts, err := scanFacts(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(facts) > limit
+	if truncated {
+		facts = facts[:limit]
+	}
+	return facts, truncated, nil
 }
 
 // SearchFacts searches facts by content substring (case-insensitive LIKE),
@@ -264,12 +306,33 @@ func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, e
 }
 
 // SupersedeFact marks oldID as superseded and links it to newID (the replacing fact).
-// Both IDs must exist and oldID must be active.
+// Both IDs must exist, oldID must be active, and newID must exist and be
+// active: a supersede chain must never point at a missing or already-dead
+// fact, or agents reading facts hit a broken link. Validation and the update
+// run in ONE transaction so the invariant holds atomically.
 func (d *DB) SupersedeFact(oldID, newID int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	result, err := d.conn.Exec(`
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("supersede fact: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var newStatus string
+	err = tx.QueryRow(`SELECT status FROM facts WHERE id = ?`, newID).Scan(&newStatus)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("supersede fact: new fact %d not found", newID)
+	}
+	if err != nil {
+		return fmt.Errorf("supersede fact: lookup new fact %d: %w", newID, err)
+	}
+	if newStatus != "active" {
+		return fmt.Errorf("supersede fact: new fact %d is not active (status %q)", newID, newStatus)
+	}
+
+	result, err := tx.Exec(`
 		UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
 		WHERE id = ? AND status = 'active'
 	`, newID, time.Now().Unix(), oldID)
@@ -280,7 +343,7 @@ func (d *DB) SupersedeFact(oldID, newID int64) error {
 	if n == 0 {
 		return fmt.Errorf("fact %d not found or not active", oldID)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // RetractFact marks a fact as retracted (agent later determined it was wrong).
@@ -817,17 +880,45 @@ func (d *DB) GetNodeByID(id int64) (*Node, error) {
 	return scanOneNode(row)
 }
 
-// GetNodesByKind returns all nodes of a given kind (for whole-graph synthesis passes).
+// getNodesByKindCap bounds GetNodesByKind results. A single kind can hold
+// hundreds of thousands of rows (each with a body up to MaxBodyChars) in very
+// large indexes; whole-graph synthesis passes call this per kind. A var so
+// tests can lower it to exercise truncation.
+var getNodesByKindCap = 50_000
+
+// GetNodesByKind returns nodes of a given kind (for whole-graph synthesis
+// passes), capped at getNodesByKindCap rows to bound memory and RLock hold
+// time. Callers that need the full set with explicit truncation reporting
+// should use GetNodesByKindLimited.
 func (d *DB) GetNodesByKind(kind string) ([]Node, error) {
+	nodes, _, err := d.GetNodesByKindLimited(kind, getNodesByKindCap)
+	return nodes, err
+}
+
+// GetNodesByKindLimited returns up to limit nodes of a given kind (ordered by
+// id for deterministic truncation) plus whether more rows exist. limit <= 0
+// falls back to the getNodesByKindCap default.
+func (d *DB) GetNodesByKindLimited(kind string, limit int) ([]Node, bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes WHERE kind = ?`, kind)
+	if limit <= 0 {
+		limit = getNodesByKindCap
+	}
+	rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes WHERE kind = ? ORDER BY id LIMIT ?`, kind, limit+1)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	return scanNodes(rows)
+	nodes, err := scanNodes(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(nodes) > limit
+	if truncated {
+		nodes = nodes[:limit]
+	}
+	return nodes, truncated, nil
 }
 
 // GetIncomingEdges returns edges targeting nodeID, optionally filtered by kinds.
@@ -951,6 +1042,14 @@ func (d *DB) GetNodeByFileLine(file string, line int) (*Node, error) {
 // Official CodeGraph walks calls + references (routes→handlers) + bridges.
 const structuralEdgeSQL = `('calls','references','bridge')`
 
+// graphQueryRowLimit bounds graph-query results (callers/callees/impact). Hot
+// symbols can have tens of thousands of edges; without a cap a single query
+// would load them all (with bodies) under RLock. Rows beyond the cap are
+// silently dropped (no flag available on these signatures) — the cap is far
+// above practical hotspot sizes, it bounds memory, not results. A var so
+// tests can lower it.
+var graphQueryRowLimit = 50_000
+
 // GetCallers returns nodes that call/reference the given node ID.
 // Includes: call sites, route→handler references (reversed), bridge sources.
 // A3: multiple call-site edges to the same node exist now; callers are the
@@ -966,7 +1065,8 @@ func (d *DB) GetCallers(nodeID int64) ([]Node, error) {
 		FROM edges e
 		JOIN nodes n ON n.id = e.source_id
 		WHERE e.target_id = ? AND e.kind IN `+structuralEdgeSQL+`
-	`, nodeID)
+		ORDER BY n.id LIMIT ?
+	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -988,7 +1088,8 @@ func (d *DB) GetCallees(nodeID int64) ([]Node, error) {
 		FROM edges e
 		JOIN nodes n ON n.id = e.target_id
 		WHERE e.source_id = ? AND e.kind IN `+structuralEdgeSQL+`
-	`, nodeID)
+		ORDER BY n.id LIMIT ?
+	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1013,7 +1114,8 @@ func (d *DB) GetCallersWithKindContext(ctx context.Context, nodeID int64) ([]Nod
 		FROM edges e
 		JOIN nodes n ON n.id = e.source_id
 		WHERE e.target_id = ? AND e.kind IN `+structuralEdgeSQL+`
-	`, nodeID)
+		ORDER BY n.id LIMIT ?
+	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1038,7 +1140,8 @@ func (d *DB) GetCalleesWithKindContext(ctx context.Context, nodeID int64) ([]Nod
 		FROM edges e
 		JOIN nodes n ON n.id = e.target_id
 		WHERE e.source_id = ? AND e.kind IN `+structuralEdgeSQL+`
-	`, nodeID)
+		ORDER BY n.id LIMIT ?
+	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1078,7 +1181,8 @@ func (d *DB) GetImpact(nodeID int64) (map[string]int, error) {
 		  AND kind IN `+structuralEdgeSQL+`
 		GROUP BY file
 		ORDER BY cnt DESC
-	`, nodeID)
+		LIMIT ?
+	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1251,19 +1355,17 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 		// S3/F5: on conflict refresh language (excluded.language), matching the
 		// old UpsertNode DO UPDATE semantics the pre-batch path used — a
 		// re-imported module from another language must not keep stale meta.
-		if _, err := tx.Exec(`
+		// RETURNING id replaces the old INSERT-then-SELECT round trip (one
+		// fewer query per row on a single-connection pool; SQLite 3.35+).
+		var id int64
+		if err := tx.QueryRow(`
 			INSERT INTO nodes (kind, name, file, line, language)
 			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT(file, line, kind, name) DO UPDATE SET
 				language = excluded.language
-		`, n.Kind, n.Name, n.File, n.Line, n.Language); err != nil {
+			RETURNING id
+		`, n.Kind, n.Name, n.File, n.Line, n.Language).Scan(&id); err != nil {
 			return nil, fmt.Errorf("replace file insert module node %s: %w", n.Name, err)
-		}
-		var id int64
-		if err := tx.QueryRow(`
-			SELECT id FROM nodes WHERE file = ? AND line = ? AND kind = ? AND name = ?
-		`, n.File, n.Line, n.Kind, n.Name).Scan(&id); err != nil {
-			return nil, fmt.Errorf("replace file module node id lookup %s: %w", n.Name, err)
 		}
 		moduleIDs[i] = id
 	}
@@ -1285,7 +1387,7 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 		if n.IsExported {
 			exported = 1
 		}
-		if _, err := tx.Exec(`
+		if err := tx.QueryRow(`
 			INSERT INTO nodes (
 				kind, name, file, line, end_line, body, language,
 				qualified_name, signature, docstring,
@@ -1303,18 +1405,12 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 				visibility = excluded.visibility,
 				is_exported = excluded.is_exported,
 				return_type = excluded.return_type
+			RETURNING id
 		`, n.Kind, n.Name, n.File, n.Line, n.EndLine, body, n.Language,
 			n.QualifiedName, n.Signature, n.Docstring,
-			nullInt(n.StartColumn), nullInt(n.EndColumn), n.Visibility, exported, n.ReturnType); err != nil {
+			nullInt(n.StartColumn), nullInt(n.EndColumn), n.Visibility, exported, n.ReturnType).Scan(&ids[i]); err != nil {
 			return nil, fmt.Errorf("replace file insert node %s: %w", n.Name, err)
 		}
-		var id int64
-		if err := tx.QueryRow(`
-			SELECT id FROM nodes WHERE file = ? AND line = ? AND kind = ? AND name = ?
-		`, n.File, n.Line, n.Kind, n.Name).Scan(&id); err != nil {
-			return nil, fmt.Errorf("replace file node id lookup %s: %w", n.Name, err)
-		}
-		ids[i] = id
 	}
 	// Map batch placeholder ids (negative) to the real inserted ids. Values in
 	// the batch-node range -(1..len(nodes)) map to nodes; deeper negatives map
@@ -1519,9 +1615,16 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 	// Escape LIKE special chars in dir so _ and % are matched literally.
 	escaped := escapeLikePattern(dir)
 	pattern := escaped + "/%"
+	// Constrain to direct children in SQL (exactly one segment below dir) so
+	// the LIMIT below counts only what this call can return. A bare `dir/%`
+	// LIKE would pull the whole subtree — tens of thousands of nested paths
+	// — and could truncate before the Go-level direct-child filter, silently
+	// dropping direct children (M4-aligned cap as in ListFilesContext).
+	subPattern := escaped + "/%/%"
 
 	rows, err := d.conn.QueryContext(ctx,
-		"SELECT path FROM files WHERE path LIKE ? ESCAPE '\\' ORDER BY path", pattern)
+		"SELECT path FROM files WHERE path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\' ORDER BY path LIMIT 100000",
+		pattern, subPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -1533,7 +1636,8 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 		if err := rows.Scan(&p); err != nil {
 			return nil, fmt.Errorf("list files in dir scan: %w", err)
 		}
-		// Only include files directly in this directory, not subdirectories.
+		// Only include files directly in this directory, not subdirectories
+		// (backstop for the SQL-level constraint above).
 		if filepath.ToSlash(filepath.Dir(filepath.ToSlash(p))) == dir {
 			files = append(files, p)
 		}
@@ -1730,6 +1834,47 @@ func (d *DB) FullTextSearchContext(ctx context.Context, query string, limit int)
 
 	rows, err := d.conn.QueryContext(ctx, `
 		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
+			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
+			n.visibility, n.is_exported, n.return_type
+		FROM nodes_fts fts
+		JOIN nodes n ON n.id = fts.rowid
+		WHERE nodes_fts MATCH ?
+		ORDER BY rank
+		LIMIT ?
+	`, safe, limit)
+	if err != nil {
+		return nil, fmt.Errorf("fts search %q: %w", query, err)
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// FullTextSearchRefs is a lightweight FullTextSearch for callers that only
+// need file:line references (search result listings). It returns the same
+// []Node shape but WITHOUT bodies — bodies can be up to MaxBodyChars each and
+// dominate the memory cost of a result set. Use FullTextSearch when the body
+// is actually needed.
+func (d *DB) FullTextSearchRefs(query string, limit int) ([]Node, error) {
+	return d.FullTextSearchRefsContext(context.Background(), query, limit)
+}
+
+// FullTextSearchRefsContext is the context-aware variant of FullTextSearchRefs.
+func (d *DB) FullTextSearchRefsContext(ctx context.Context, query string, limit int) ([]Node, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	safe := escapeFTS5Query(query)
+	if safe == "" {
+		return nil, nil
+	}
+
+	// Same query as FullTextSearchContext but with a constant '' in place of
+	// n.body; scanNodeRow keeps every other field populated.
+	rows, err := d.conn.QueryContext(ctx, `
+		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, '' AS body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type
 		FROM nodes_fts fts

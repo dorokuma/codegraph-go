@@ -54,14 +54,16 @@ func (d *FrameworkDetector) DetectRoutes(source string, filePath string, languag
 // ---------- Go frameworks: Gin, chi, gorilla/mux ----------
 
 var (
-	// Gin: r.GET("/path", handler) — also matches chained r.Group("/v1").GET(...)
-	ginRouteRe = regexp.MustCompile(`([\w)]+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*"([^"]+)"\s*,\s*(\w+)`)
+	// Handler capture groups accept bare names, dotted names (pkg.Handler,
+	// s.List) and method values ((*T).M); simplifyHandlerName reduces them to
+	// a bare symbol for linking.
+	ginRouteRe = regexp.MustCompile(`([\w)]+)\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*"([^"]+)"\s*,\s*([\w.]+|\(\*?[\w.]+\)\.\w+)`)
 	// chi: r.Get("/path", handler), r.Post("/path", handler)
-	chiRouteRe = regexp.MustCompile(`(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*(\w+)`)
+	chiRouteRe = regexp.MustCompile(`(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*([\w.]+|\(\*?[\w.]+\)\.\w+)`)
 	// mux: r.HandleFunc("/path", handler).Methods("GET", "POST")
-	muxRouteRe = regexp.MustCompile(`(\w+)\.HandleFunc\s*\(\s*"([^"]+)"\s*,\s*(\w+)\s*\)\.Methods\s*\(\s*"([^"]+)"\s*(?:,\s*"[^"]+")*\s*\)`)
+	muxRouteRe = regexp.MustCompile(`(\w+)\.HandleFunc\s*\(\s*"([^"]+)"\s*,\s*([\w.]+|\(\*?[\w.]+\)\.\w+)\s*\)\.Methods\s*\(\s*"([^"]+)"\s*(?:,\s*"[^"]+")*\s*\)`)
 	// mux: r.Methods("GET").Path("/path").HandlerFunc(handler)
-	muxRouteRe2 = regexp.MustCompile(`(\w+)\.Methods\s*\(\s*"(\w+)"\s*\)\.Path\s*\(\s*"([^"]+)"\s*\)\.HandlerFunc\s*\(\s*(\w+)`)
+	muxRouteRe2 = regexp.MustCompile(`(\w+)\.Methods\s*\(\s*"(\w+)"\s*\)\.Path\s*\(\s*"([^"]+)"\s*\)\.HandlerFunc\s*\(\s*([\w.]+|\(\*?[\w.]+\)\.\w+)`)
 )
 
 // GoFrame route marker embedded in route.qualified_name for synthesizer join.
@@ -202,9 +204,9 @@ func (d *FrameworkDetector) detectGoFrameRoutes(source, filePath string) []Route
 
 var (
 	// Express: app.get("/path", handler), router.post("/path", handler)
-	expressRouteRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)`)
+	expressRouteRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"]([^'"]+)['"]\s*,\s*([\w.]+)`)
 	// Express with middleware: app.get("/path", middleware1, middleware2, ..., handler)
-	expressRouteMiddlewareRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(?:\w+\s*,\s*)*(\w+)`)
+	expressRouteMiddlewareRe = regexp.MustCompile(`(\w+)\.(get|post|put|delete|patch|head|options|all)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(?:(?:[\w.]+)\s*,\s*)*([\w.]+)`)
 	// NestJS: @Get("/path"), @Post("/path"), @Controller("prefix")
 	nestjsRouteRe = regexp.MustCompile(`@(Get|Post|Put|Delete|Patch|Options|Head|All)\s*\(\s*['"]?([^'")\s]+)['"]?\s*\)`)
 	// NestJS Controller prefix
@@ -657,7 +659,7 @@ func extractCSharpHandler(lines []string, attrLine int) string {
 
 var (
 	// Axum: .route("/path", get(handler))
-	axumRouteRe = regexp.MustCompile(`\.route\s*\(\s*['"]([^'"]+)['"]\s*,\s*(get|post|put|delete|patch|head|options)\s*\(\s*(\w+)`)
+	axumRouteRe = regexp.MustCompile(`\.route\s*\(\s*['"]([^'"]+)['"]\s*,\s*(get|post|put|delete|patch|head|options)\s*\(\s*([\w.]+)`)
 	// actix / Rocket: #[get("/path")], #[post("/path")]
 	actixRouteRe = regexp.MustCompile(`#\[(get|post|put|delete|patch|head|options)\s*\(\s*['"]([^'"]+)['"]\s*\)]`)
 )
@@ -717,7 +719,7 @@ func extractRustHandler(lines []string, attrLine int) string {
 
 var (
 	// Vapor: app.get("path", use: handler), app.post("path", use: handler)
-	vaporRouteRe = regexp.MustCompile(`(app|router)\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]\s*,\s*use:\s*(\w+)`)
+	vaporRouteRe = regexp.MustCompile(`(app|router)\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]\s*,\s*use:\s*([\w.]+)`)
 )
 
 func (d *FrameworkDetector) detectSwiftRoutes(source string, filePath string) []RouteNode {

@@ -43,7 +43,11 @@ func ClearAliasCache() {
 }
 
 // LoadProjectAliases reads tsconfig.json then jsconfig.json under projectRoot.
-// Returns nil when no usable paths block exists.
+// Returns the first usable paths block (tsconfig wins when both exist). When
+// tsconfig exists but has no paths, jsconfig is still tried (audit: the old
+// code returned nil on the first parseable file and never reached jsconfig).
+// Cache entries are keyed per (root, file) so a later-added jsconfig is picked
+// up even when an earlier tsconfig parse was cached as "no aliases".
 func LoadProjectAliases(projectRoot string) *AliasMap {
 	projectRoot = filepath.Clean(projectRoot)
 	for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
@@ -53,11 +57,15 @@ func LoadProjectAliases(projectRoot string) *AliasMap {
 			continue
 		}
 		mtime := st.ModTime().UnixNano()
+		key := projectRoot + "\x00" + name
 		aliasCacheMu.Lock()
-		if e, ok := aliasCache[projectRoot]; ok && e.modTime == mtime {
+		if e, ok := aliasCache[key]; ok && e.modTime == mtime {
 			a := e.aliases
 			aliasCacheMu.Unlock()
-			return a
+			if a != nil {
+				return a
+			}
+			continue // this file parsed cleanly but has no paths — try the next one
 		}
 		aliasCacheMu.Unlock()
 
@@ -67,14 +75,13 @@ func LoadProjectAliases(projectRoot string) *AliasMap {
 		}
 		aliases := parseTsconfigAliases(projectRoot, raw)
 		aliasCacheMu.Lock()
-		aliasCache[projectRoot] = &aliasCacheEntry{modTime: mtime, aliases: aliases}
-		// Only cache under projectRoot once we found a parseable file.
+		aliasCache[key] = &aliasCacheEntry{modTime: mtime, aliases: aliases}
 		aliasCacheMu.Unlock()
-		return aliases
+		if aliases != nil {
+			return aliases
+		}
+		// No paths in this file — fall through and try jsconfig.json.
 	}
-	aliasCacheMu.Lock()
-	aliasCache[projectRoot] = &aliasCacheEntry{modTime: 0, aliases: nil}
-	aliasCacheMu.Unlock()
 	return nil
 }
 

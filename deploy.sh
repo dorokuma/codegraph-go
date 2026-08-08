@@ -1,6 +1,8 @@
 #!/bin/bash
 # codegraph-go 一键部署：编译 → 杀进程 → 替换二进制 → 重启 daemon
-set -e
+# M4: -u（未定义变量直接报错）+ pipefail（管道中段失败即退出）。
+# 所有本来可容忍缺失的管道（cat/grep 找不到 pidfile/pid）都显式 `|| true`。
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="${BINARY:-$HOME/.local/bin/codegraph-go}"
@@ -83,7 +85,7 @@ daemon_matches() {
 # every pidfile and socket). Artifacts are only removed below, after the
 # flock is confirmed released and no daemon-mode process for WORKDIR
 # remains.
-PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
 if [ -n "$PID" ]; then
   LEGACY_WD="$(cd "$(dirname "$(dirname "$CODEGRAPH_HOME/daemon.pid")")" && pwd 2>/dev/null)"
   if daemon_matches "$PID" "$LEGACY_WD"; then
@@ -109,17 +111,38 @@ scan_daemon_pids() {
 }
 
 echo "=== 替换二进制 ==="
+# M6: install 目标父目录（~/.local/bin）在新机器上可能不存在，先建好。
+mkdir -p "$(dirname "$BINARY")"
 if [ -f "$BINARY" ]; then
-  install -m 755 ./bin/codegraph-go "$BINARY.new" && \
-  mv "$BINARY" "$BINARY.old" && \
-  mv "$BINARY.new" "$BINARY" || { mv "$BINARY.old" "$BINARY" 2>/dev/null; echo "DEPLOY FAILED: rolled back"; exit 1; }
-  rm -f "$BINARY.old"
+  if install -m 755 ./bin/codegraph-go "$BINARY.new" && \
+     mv "$BINARY" "$BINARY.old" && \
+     mv "$BINARY.new" "$BINARY"; then
+    rm -f "$BINARY.old"
+  else
+    # 失败回滚：只在确实已经把旧二进制挪走、且新二进制没装上时恢复 .old；
+    # 上次崩溃残留的旧 .old 绝不能被当成回滚源覆盖新二进制。
+    if [ -f "$BINARY.old" ] && [ ! -f "$BINARY" ]; then
+      mv "$BINARY.old" "$BINARY" 2>/dev/null || true
+    fi
+    rm -f "$BINARY.new" 2>/dev/null || true
+    echo "DEPLOY FAILED: rolled back" >&2
+    exit 1
+  fi
 else
-  install -m 755 ./bin/codegraph-go "$BINARY"
+  if ! install -m 755 ./bin/codegraph-go "$BINARY"; then
+    echo "DEPLOY FAILED: could not install $BINARY" >&2
+    exit 1
+  fi
 fi
 echo "DEPLOYED → $BINARY"
-rm -rf ./bin
-echo "cleaned build output ./bin"
+# rm -rf 保护：只允许删除本次构建产物目录。仓库若被检到 / 下，`rm -rf ./bin`
+# 会变成 `rm -rf /bin`；符号链接的 bin 也绝不能跟随删除。
+if [ "$ROOT" = "/" ] || [ -L "$ROOT/bin" ] || [ ! -d "$ROOT/bin" ]; then
+  echo "WARN: skipping ./bin cleanup ($ROOT/bin is not a plain build dir)"
+else
+  rm -rf -- "$ROOT/bin"
+  echo "cleaned build output $ROOT/bin"
+fi
 
 echo "=== 升级后强制重启 daemon ==="
 # WORKDIR was resolved in the stop section above (first existing pidfile
@@ -146,7 +169,7 @@ KILLED_PID=""
 PIDS=""
 for pf in "$ROOT/.codegraph/daemon.pid" "$CODEGRAPH_HOME/daemon.pid"; do
   [ -f "$pf" ] || continue
-  PID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$pf" | grep -oE '[0-9]+' | head -1)
+  PID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$pf" | grep -oE '[0-9]+' | head -1 || true)
   if [ -n "$PID" ]; then
     PFWD="$(cd "$(dirname "$(dirname "$pf")")" && pwd)"
     if ! echo "$PIDS" | grep -qw "$PID"; then PIDS="$PIDS $PID:$PFWD"; fi
@@ -250,7 +273,26 @@ fi
 # workaround, not proper daemonization. This way the next client connects
 # immediately instead of paying spawn + index time.
 mkdir -p "$WORKDIR/.codegraph"
-CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
+# M5: 预热参数与 Go 侧 SpawnDetached（internal/daemon/spawn.go）对齐：
+# -workdir <root> + 可选 -config。config 文件按与 Go ConfigPath 相同的优先级
+# 解析（$CODEGRAPH_CONFIG > ./codegraph-config.yaml > ~/.config/codegraph/
+# config.yaml），显式传入后 daemon 的完整 workdirs 列表不再依赖其 cwd（Go
+# spawn 的 daemon cwd 是 workdir 本身，裸 ./codegraph-config.yaml 查找会静默
+# 指向别的文件）。CODEGRAPH_CONFIG 本身也会经环境变量继承给 daemon。
+# 故意不传 -no-sync：部署要的是默认同步 daemon，与普通 client 的 SpawnOpts 一致。
+DEPLOY_CFG=""
+if [ -n "${CODEGRAPH_CONFIG:-}" ]; then
+  DEPLOY_CFG="$CODEGRAPH_CONFIG"
+elif [ -f "$ROOT/codegraph-config.yaml" ]; then
+  DEPLOY_CFG="$ROOT/codegraph-config.yaml"
+elif [ -f "$HOME/.config/codegraph/config.yaml" ]; then
+  DEPLOY_CFG="$HOME/.config/codegraph/config.yaml"
+fi
+if [ -n "$DEPLOY_CFG" ]; then
+  CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" -config "$DEPLOY_CFG" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
+else
+  CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
+fi
 SPAWN_PID=$!
 # Verify the warm-up actually took the lock AND bound the socket AND is
 # alive: the pidfile is written before the socket bind, so a pidfile alone
@@ -274,7 +316,7 @@ for i in $(seq 1 15); do
   sleep 0.2
 done
 if [ "$ready" = "1" ]; then
-  NEWPID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" | grep -oE '[0-9]+' | head -1)
+  NEWPID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" | grep -oE '[0-9]+' | head -1 || true)
   echo "new daemon warmed up for $WORKDIR (pid $NEWPID)"
 else
   echo "WARN: daemon warm-up did not take the lock — the next client will spawn it automatically"
@@ -292,7 +334,7 @@ if [ "${DEPLOY_COMMIT:-0}" = "1" ]; then
   if git diff --cached --quiet; then
     echo "无改动，跳过提交"
   else
-    VERSION=$(grep 'PackageVersion' internal/daemon/paths.go | grep -o '"[^"]*"' | tr -d '"')
+    VERSION=$(grep 'PackageVersion' internal/daemon/paths.go | grep -o '"[^"]*"' | tr -d '"' || true)
     if [ -z "$VERSION" ]; then
       VERSION="unknown"
       echo "warning: VERSION is empty, using 'unknown'"

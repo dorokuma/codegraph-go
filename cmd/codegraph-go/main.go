@@ -136,6 +136,12 @@ func main() {
 		}
 	}
 	cfg.Workdirs = unique
+	// M7: LoadConfig leaves Workdirs empty only when os.Getwd fails AND there
+	// is no -workdir/config source; indexing [0] below would panic. Fail with
+	// an actionable message instead.
+	if len(cfg.Workdirs) == 0 {
+		log.Fatalf("no workdir: current directory cannot be resolved (os.Getwd failed) and no workdirs from -workdir or config; run from an existing directory or pass -workdir")
+	}
 	// Primary workdir for backward compat (cfg.Workdir = workdirs[0]).
 	cfg.Workdir = cfg.Workdirs[0]
 

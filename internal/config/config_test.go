@@ -156,13 +156,91 @@ func TestValidateWorkdirsSymlinkRoot(t *testing.T) {
 	}
 }
 
-// TestConfigPathEnv: $CODEGRAPH_CONFIG wins the lookup and is returned even
-// when the file does not exist (LoadConfig reports the read error itself).
+// TestConfigPathEnv: $CODEGRAPH_CONFIG wins the lookup when the file exists;
+// a nonexistent path is skipped (L1) and the lookup falls through to the
+// remaining candidates.
 func TestConfigPathEnv(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	t.Setenv("CODEGRAPH_CONFIG", p)
-	if got := ConfigPath(); got != p {
-		t.Fatalf("ConfigPath() = %q, want %q", got, p)
+	dir := t.TempDir()
+	// Isolate $HOME so the ~/.config/codegraph/config.yaml candidate cannot
+	// exist in this test (this machine has a real one).
+	t.Setenv("HOME", filepath.Join(dir, "isolated-home"))
+	good := filepath.Join(dir, "good.yaml")
+	if err := os.WriteFile(good, []byte("workdirs: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEGRAPH_CONFIG", good)
+	if got := ConfigPath(); got != good {
+		t.Fatalf("ConfigPath() = %q, want %q (existing $CODEGRAPH_CONFIG wins)", got, good)
+	}
+
+	// Nonexistent $CODEGRAPH_CONFIG is skipped: with no local/global config
+	// the lookup returns "" instead of a dead path.
+	missing := filepath.Join(dir, "does-not-exist.yaml")
+	t.Setenv("CODEGRAPH_CONFIG", missing)
+	if got := ConfigPath(); got != "" {
+		t.Fatalf("ConfigPath() = %q, want \"\" when $CODEGRAPH_CONFIG points at a missing file", got)
+	}
+
+	// The next candidate in the priority order is used instead.
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(dir, "codegraph-config.yaml")
+	if err := os.WriteFile(local, []byte("workdirs: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := ConfigPath(); got != "./codegraph-config.yaml" {
+		t.Fatalf("ConfigPath() = %q, want ./codegraph-config.yaml after skipping missing $CODEGRAPH_CONFIG", got)
+	}
+}
+
+// TestExpandPath: ~ and $VAR expansion in config-supplied workdirs (L2).
+func TestExpandPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no $HOME: %v", err)
+	}
+	if got := expandPath("~/proj"); got != filepath.Join(home, "proj") {
+		t.Fatalf("expandPath(~/proj) = %q, want %q", got, filepath.Join(home, "proj"))
+	}
+	if got := expandPath("~"); got != home {
+		t.Fatalf("expandPath(~) = %q, want %q", got, home)
+	}
+	t.Setenv("CODEGRAPH_TEST_VAR", "/opt/x")
+	if got := expandPath("$CODEGRAPH_TEST_VAR/proj"); got != "/opt/x/proj" {
+		t.Fatalf("expandPath($VAR/proj) = %q, want /opt/x/proj", got)
+	}
+	if got := expandPath("/plain/path"); got != "/plain/path" {
+		t.Fatalf("expandPath(plain) = %q, want /plain/path", got)
+	}
+}
+
+// TestWorkdirAllowlistTilde: config workdirs written with ~ are expanded
+// before they become authority roots (L2), so `workdirs: [~/proj]` matches
+// the expanded workdir instead of the literal tilde path.
+func TestWorkdirAllowlistTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no $HOME: %v", err)
+	}
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfg, []byte("workdirs:\n  - ~/cg-allow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := WorkdirAllowlist(cfg)
+	want := canonical(filepath.Join(home, "cg-allow"))
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("WorkdirAllowlist = %v, want [%s]", got, want)
+	}
+	// The expanded root must accept the expanded workdir (validation
+	// round-trip).
+	if err := ValidateWorkdirs([]string{filepath.Join(home, "cg-allow")}, got); err != nil {
+		t.Fatalf("expanded workdir rejected by expanded allowlist: %v", err)
 	}
 }
 

@@ -2,8 +2,10 @@ package resolution
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -60,7 +62,7 @@ func LoadWorkspacePackages(projectRoot string) *WorkspacePackages {
 
 	for _, pattern := range readWorkspaceGlobs(projectRoot) {
 		for _, dir := range expandWorkspaceGlob(projectRoot, pattern) {
-			pkgName := readPackageName(filepath.Join(projectRoot, dir))
+			pkgName := readPackageName(filepath.Join(projectRoot, dir, "package.json"))
 			if pkgName == "" {
 				continue
 			}
@@ -188,25 +190,129 @@ func parsePnpmPackages(yaml string) []string {
 
 func expandWorkspaceGlob(projectRoot, pattern string) []string {
 	norm := filepath.ToSlash(strings.TrimRight(pattern, "/"))
-	star := strings.IndexByte(norm, '*')
-	if star < 0 {
-		return []string{norm}
+	if strings.Contains(norm, "**") {
+		return expandDoubleStarGlob(projectRoot, norm)
 	}
-	base := strings.TrimRight(norm[:star], "/")
-	entries, err := os.ReadDir(filepath.Join(projectRoot, base))
+	// filepath.Glob handles multi-level segment patterns like apps/*/lib that
+	// a single ReadDir layer cannot express.
+	matches, err := filepath.Glob(filepath.Join(projectRoot, filepath.FromSlash(norm)))
 	if err != nil {
 		return nil
 	}
 	var out []string
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "node_modules" {
+	for _, m := range matches {
+		st, err := os.Stat(m)
+		if err != nil || !st.IsDir() {
 			continue
 		}
-		if base == "" {
-			out = append(out, e.Name())
-		} else {
-			out = append(out, base+"/"+e.Name())
+		name := filepath.Base(m)
+		if name == "node_modules" || strings.HasPrefix(name, ".") {
+			continue
 		}
+		rel, err := filepath.Rel(projectRoot, m)
+		if err != nil {
+			continue
+		}
+		out = append(out, filepath.ToSlash(rel))
 	}
+	sort.Strings(out)
 	return out
+}
+
+// expandDoubleStarGlob walks the directory tree under the pattern prefix for
+// "**" globs (packages/**, apps/**/lib style). The prefix before the first
+// "**" is walked recursively; the segments after it are matched per path
+// segment, where "**" matches zero or more whole segments (npm/yarn
+// semantics: apps/**/lib matches apps/web/lib and apps/a/b/lib). node_modules
+// and hidden directories are never descended into. A trailing "**"
+// (packages/**) matches every directory below the prefix.
+func expandDoubleStarGlob(projectRoot, pattern string) []string {
+	if !strings.Contains(pattern, "**") {
+		return nil
+	}
+	segs := strings.Split(pattern, "/")
+	starIdx := -1
+	var tail []string
+	for i, s := range segs {
+		if starIdx < 0 && strings.Contains(s, "**") {
+			starIdx = i
+		}
+		if starIdx < 0 {
+			continue
+		}
+		if s == "**" {
+			// consecutive "**" segments collapse into one wildcard
+			if len(tail) == 0 || tail[len(tail)-1] != "**" {
+				tail = append(tail, "**")
+			}
+			continue
+		}
+		tail = append(tail, s)
+	}
+	if starIdx < 0 {
+		return nil
+	}
+	if len(tail) == 0 {
+		// pattern ended right after "**" (packages/**): match any depth
+		tail = []string{"**"}
+	}
+	prefix := strings.Join(segs[:starIdx], "/")
+	base := filepath.Join(projectRoot, filepath.FromSlash(prefix))
+	var out []string
+	_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if path == base {
+			return nil // the prefix itself is the container, not a package
+		}
+		// Never descend into dependencies, VCS or hidden dirs: their nested
+		// package.json files would pollute the workspace table and silently
+		// misroute imports (must-fix: returning nil instead of fs.SkipDir
+		// walked straight into node_modules/.git).
+		name := filepath.Base(path)
+		if name == "node_modules" || strings.HasPrefix(name, ".") {
+			return fs.SkipDir
+		}
+		rel, rerr := filepath.Rel(projectRoot, path)
+		if rerr != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		rest := strings.TrimPrefix(relSlash, prefix)
+		rest = strings.TrimPrefix(rest, "/")
+		if !matchSegments(tail, strings.Split(rest, "/")) {
+			return nil
+		}
+		out = append(out, relSlash)
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}
+
+// matchSegments reports whether the glob tail segments (which may contain
+// "**", matching zero or more whole segments) match the path segments rest.
+// Non-wildcard segments are matched with filepath.Match, so '*'/'?' keep
+// working within a single segment (they never cross '/').
+func matchSegments(tail, rest []string) bool {
+	for len(tail) > 0 {
+		if tail[0] == "**" {
+			for i := 0; i <= len(rest); i++ {
+				if matchSegments(tail[1:], rest[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(rest) == 0 {
+			return false
+		}
+		ok, err := filepath.Match(tail[0], rest[0])
+		if err != nil || !ok {
+			return false
+		}
+		tail, rest = tail[1:], rest[1:]
+	}
+	return len(rest) == 0
 }

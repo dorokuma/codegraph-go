@@ -308,7 +308,7 @@ func (d *DB) promoteEdgesNew() error {
 // by recoverEdgesRebuild before schema.sql in Open. Entry is idempotent: the
 // state probe uses PRAGMA index introspection on the unique index column set
 // (3 columns = old key, 5 columns = new key), never DDL substring matching.
-func (d *DB) rebuildEdgesUniqueKey() error {
+func (d *DB) rebuildEdgesUniqueKey() (retErr error) {
 	// No recovery should have left a copy behind; a leftover here is never
 	// authoritative (recoverEdgesRebuild promoted it pre-schema if needed).
 	if _, err := d.conn.Exec(`DROP TABLE IF EXISTS edges_new`); err != nil {
@@ -329,9 +329,20 @@ func (d *DB) rebuildEdgesUniqueKey() error {
 		return fmt.Errorf("edges rebuild: disable foreign_keys: %w", err)
 	}
 	defer func() {
-		// Re-enable FK enforcement on this connection; the DSN also sets it for
-		// every new connection, so a failure here cannot leave FKs off.
-		_, _ = d.conn.Exec(`PRAGMA foreign_keys=ON`)
+		// Re-enable FK enforcement on this connection. The DSN also sets it
+		// for NEW connections, but this one is pooled for the process
+		// lifetime (MaxOpenConns(1)) — if the re-enable failed and was
+		// swallowed, CASCADE would silently stop working (deleting a node
+		// would orphan its edges/unresolved_refs). Surface the failure: it
+		// propagates through ensureSchema out of Open and aborts startup
+		// (the next Open starts with a fresh connection that re-enables FK).
+		if _, err := d.conn.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%v (additionally failed to re-enable foreign_keys: %w)", retErr, err)
+			} else {
+				retErr = fmt.Errorf("edges rebuild: re-enable foreign_keys: %w", err)
+			}
+		}
 	}()
 
 	// One transaction for the whole DDL/DML sequence: either the new key is

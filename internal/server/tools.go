@@ -6,11 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/dorokuma/codegraph-go/internal/daemon"
@@ -25,11 +28,13 @@ import (
 // ---------- args types ----------
 
 type searchArgs struct {
-	Pattern     string `json:"pattern"      jsonschema:"regex or literal pattern (ripgrep syntax)"`
+	Pattern     string `json:"pattern"      jsonschema:"literal text by default; set regex=true to treat pattern as a regular expression (ripgrep syntax)"`
 	Path        string `json:"path,omitempty" jsonschema:"optional subdirectory under workspace,optional"`
 	Glob        string `json:"glob,omitempty" jsonschema:"optional file glob filter, e.g. \"*.go\",optional"`
 	MaxResults  int    `json:"max_results,omitempty" jsonschema:"global match cap (default 70; per-file also capped),optional"`
 	IgnoreCase  bool   `json:"ignore_case,omitempty" jsonschema:"case-insensitive search,optional"`
+	NoIgnore    bool   `json:"no_ignore,omitempty" jsonschema:"search inside .gitignore'd files (default false: ignore rules are respected),optional"`
+	Regex       bool   `json:"regex,omitempty" jsonschema:"treat pattern as a regular expression (default false: literal match),optional"`
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
@@ -113,7 +118,7 @@ type searchFactsArgs struct {
 // (Grok, Pi, etc.): one tool schema instead of N near-duplicate tools.
 type codegraphArgs struct {
 	Action       string   `json:"action" jsonschema:"Action to perform: explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts"`
-	Pattern      string   `json:"pattern,omitempty" jsonschema:"search: regex or literal pattern,optional"`
+	Pattern      string   `json:"pattern,omitempty" jsonschema:"search: literal by default (regex=true enables regex),optional"`
 	Name         string   `json:"name,omitempty" jsonschema:"callees/callers/impact/node: symbol name,optional"`
 	File         string   `json:"file,omitempty" jsonschema:"node/callees/callers/impact: file path or basename to pin,optional"`
 	Query        string   `json:"query,omitempty" jsonschema:"explore/search_facts: free-text or search term,optional"`
@@ -122,6 +127,8 @@ type codegraphArgs struct {
 	Max          int      `json:"max,omitempty" jsonschema:"result cap (search/files/explore/graph/communities/search_facts),optional"`
 	MaxResults   int      `json:"max_results,omitempty" jsonschema:"alias of max for search/callers/callees/impact,optional"`
 	IgnoreCase   bool     `json:"ignore_case,omitempty" jsonschema:"search: case-insensitive,optional"`
+	NoIgnore     bool     `json:"no_ignore,omitempty" jsonschema:"search: include .gitignore'd files (default false),optional"`
+	Regex        bool     `json:"regex,omitempty" jsonschema:"search: treat pattern as regex (default false: literal),optional"`
 	Line         int      `json:"line,omitempty" jsonschema:"node: pin definition line,optional"`
 	IncludeCode  *bool    `json:"includeCode,omitempty" jsonschema:"node: include source body (default false),optional"`
 	SymbolsOnly  bool     `json:"symbolsOnly,omitempty" jsonschema:"node file mode: symbol map only,optional"`
@@ -176,7 +183,7 @@ func NewMCPServer(s *Server) *mcp.Server {
 					Description: "explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts",
 					Enum:        []interface{}{"explore", "search", "files", "node", "callers", "callees", "impact", "status", "affected", "communities", "store_fact", "search_facts"},
 				},
-				"pattern":      {Type: "string", Description: "search: regex or literal; files: glob pattern"},
+				"pattern":      {Type: "string", Description: "search: literal by default (regex=true enables regex); files: glob pattern"},
 				"name":         {Type: "string", Description: "symbol name for node/callers/callees/impact"},
 				"file":         {Type: "string", Description: "file path/basename pin for node/graph actions"},
 				"query":        {Type: "string", Description: "explore/search_facts free text"},
@@ -185,6 +192,8 @@ func NewMCPServer(s *Server) *mcp.Server {
 				"max":          {Type: "integer", Description: "result cap"},
 				"max_results":  {Type: "integer", Description: "alias of max"},
 				"ignore_case":  {Type: "boolean", Description: "search: case-insensitive"},
+				"no_ignore":    {Type: "boolean", Description: "search: include .gitignore'd files (default false)"},
+				"regex":        {Type: "boolean", Description: "search: treat pattern as regex (default false: literal)"},
 				"line":         {Type: "integer", Description: "node: pin line"},
 				"includeCode":  {Type: "boolean", Description: "node: include body"},
 				"symbolsOnly":  {Type: "boolean", Description: "node file mode: map only"},
@@ -212,7 +221,19 @@ func NewMCPServer(s *Server) *mcp.Server {
 }
 
 // toolCodegraph routes action= to the internal handlers (same implementations as pre-0.8 tools).
-func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (*mcp.CallToolResult, any, error) {
+// The deferred recover is the tool-dispatch panic barrier (audit critical): a
+// panic inside any action (e.g. a bad slice index from a hostile max) must
+// become a single-call MCP error — never a crash of the shared daemon process
+// that serves every session. The daemon's serveConn recover catches panics
+// outside the tool path (transport/hello).
+func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (res *mcp.CallToolResult, out any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("tool panic (action=%q): %v\n%s", args.Action, r, debug.Stack())
+			res, out = nil, nil
+			err = fmt.Errorf("codegraph tool %q panicked: %v", args.Action, r)
+		}
+	}()
 	action := strings.ToLower(strings.TrimSpace(args.Action))
 	if action == "" {
 		return nil, nil, fmt.Errorf("action is required (one of: %s)", strings.Join(codegraphActions, ", "))
@@ -231,7 +252,8 @@ func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, ar
 	case "search":
 		return s.toolSearch(ctx, req, searchArgs{
 			Pattern: args.Pattern, Path: args.Path, Glob: args.Glob, MaxResults: cap,
-			IgnoreCase: args.IgnoreCase, ProjectPath: args.ProjectPath,
+			IgnoreCase: args.IgnoreCase, NoIgnore: args.NoIgnore, Regex: args.Regex,
+			ProjectPath: args.ProjectPath,
 		})
 	case "files":
 		pattern := args.Pattern
@@ -295,9 +317,10 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	if args.Pattern == "" {
 		return nil, nil, fmt.Errorf("pattern is required")
 	}
-	if args.MaxResults == 0 {
-		args.MaxResults = defaultSearchGlobal
-	}
+	// Clamp the global cap: negative values would panic downstream slice
+	// operations, absurd values would amplify memory/CPU (audit critical #2,
+	// H2). The final payload is truncated to defaultOutputChars regardless.
+	args.MaxResults = clampLimit(args.MaxResults, defaultSearchGlobal, maxSearchResults)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Pattern, args.Path); p != "" {
 			args.ProjectPath = p
@@ -311,8 +334,8 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 
 	// Official CodeGraph search is symbol-first. For a plain identifier with no
 	// path/glob/regex metacharacters, hit FTS before spawning rg.
-	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && isSimpleIdent(args.Pattern) {
-		nodes, err := database.FullTextSearchContext(ctx, args.Pattern, args.MaxResults)
+	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && !args.Regex && isSimpleIdent(args.Pattern) {
+		nodes, err := database.FullTextSearchRefsContext(ctx, args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
 			for _, n := range nodes {
@@ -338,34 +361,28 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	if args.IgnoreCase {
 		rg.Args = append(rg.Args, "-i")
 	}
+	// Literal matching by default: a caller pattern like "a(b" must search
+	// for that text, not fail as an invalid regex or burn CPU on a crafted
+	// expression. Only the explicit regex=true flag enables regex semantics
+	// (audit M1).
+	if !args.Regex {
+		rg.Args = append(rg.Args, "--fixed-strings")
+	}
 	if args.Glob != "" {
 		rg.Args = append(rg.Args, "--glob", args.Glob)
 	}
-	// When the user specifies a path they intend to search that directory
-	// regardless of .gitignore rules. Otherwise a seemingly thorough search
-	// silently skips ignored files.
-	if args.Path != "" {
+	// Respect .gitignore unless the caller explicitly opts out: ignoring a
+	// path's ignore rules would surface .env/private keys into the agent
+	// (audit M2). no_ignore=true re-enables the old sweep.
+	if args.NoIgnore {
 		rg.Args = append(rg.Args, "--no-ignore")
 	}
 	rg.Args = append(rg.Args, "--", args.Pattern, root)
-	out, err := rg.Output()
-	if err != nil && len(out) == 0 {
-		// rg exits 1 on no matches; other errors should surface.
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			msg := "no matches"
-			if args.Path != "" {
-				indexed, cerr := countIndexedUnder(ctx, database, projRoot, root)
-				if cerr == nil && indexed == 0 {
-					msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
-				}
-			}
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: msg}},
-			}, nil, nil
-		}
+	outLines, _, err := rgOutputLines(rg, args.MaxResults, rgMaxOutputBytes)
+	if err != nil {
 		return nil, nil, fmt.Errorf("rg search: %w", err)
 	}
-	if len(out) == 0 {
+	if len(outLines) == 0 {
 		// When a path subdirectory is specified, the user may be searching
 		// an unindexed area. Check whether any files are indexed under root
 		// and include a hint so the agent knows to use built-in tools.
@@ -373,14 +390,14 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		if args.Path != "" {
 			indexed, cerr := countIndexedUnder(ctx, database, projRoot, root)
 			if cerr == nil && indexed == 0 {
-				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, root)
+				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, db.RelPath(projRoot, root))
 			}
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 		}, nil, nil
 	}
-	text := relativizeRgOutput(string(out), projRoot)
+	text := relativizeRgOutput(strings.Join(outLines, "\n")+"\n", projRoot)
 	text = limitLines(text, args.MaxResults)
 	text = truncateOutput(text, defaultOutputChars)
 	text = s.addStalenessWarning(text)
@@ -396,9 +413,9 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	if pattern == "" {
 		pattern = "**/*"
 	}
-	if args.Max == 0 {
-		args.Max = defaultFilesMax
-	}
+	// Clamp: a negative max previously reached lines[:args.Max] and panicked
+	// (audit critical #2); an unbounded max would load the whole rg output.
+	args.Max = clampLimit(args.Max, defaultFilesMax, maxFilesResults)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Path); p != "" {
 			args.ProjectPath = p
@@ -431,7 +448,7 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 			return nil, nil, ferr
 		}
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: text}},
+			Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(text, defaultOutputChars)}},
 		}, nil, nil
 	}
 
@@ -452,21 +469,17 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 		}
 	}
 	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, root)
-	out, err := rg.Output()
+	lines, _, err := rgOutputLines(rg, args.Max, rgMaxOutputBytes)
 	if err != nil {
-		// rg exits 1 when nothing matched; other failures must surface.
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "no files matched"}},
-			}, nil, nil
-		}
-		if len(out) == 0 {
+		if len(lines) == 0 {
 			return nil, nil, fmt.Errorf("rg files: %w", err)
 		}
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) > args.Max {
-		lines = lines[:args.Max]
+	if len(lines) == 0 {
+		// rg exits 1 when nothing matched; other failures surface above.
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no files matched"}},
+		}, nil, nil
 	}
 	var b strings.Builder
 	for _, l := range lines {
@@ -520,6 +533,8 @@ func globMatch(pattern, relPath string) bool {
 }
 
 func (s *Server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args exploreArgs) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	// Default skipCode=true matching official CodeGraph behavior.
 	skipCode := true
 	if args.SkipCode != nil {
@@ -566,9 +581,7 @@ func (s *Server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
-	if args.MaxResults == 0 {
-		args.MaxResults = defaultSymbolMax
-	}
+	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
@@ -601,9 +614,7 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
-	if args.MaxResults == 0 {
-		args.MaxResults = defaultSymbolMax
-	}
+	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
@@ -643,21 +654,17 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	if args.Glob != "" {
 		rg.Args = append(rg.Args, "--glob", args.Glob)
 	}
-	out, err := rg.Output()
-	if err != nil && len(out) == 0 {
-		// rg exits 1 on no matches; any other error means rg itself failed and
-		// must surface instead of masquerading as "no references" (aligned
-		// with toolSearch).
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no references found (index empty for this symbol; rg fallback also empty)"}}}, nil, nil
+	outLines, _, err := rgOutputLines(rg, rgCap, rgMaxOutputBytes)
+	if err != nil {
+		if len(outLines) == 0 {
+			return nil, nil, fmt.Errorf("rg callers fallback: %w", err)
 		}
-		return nil, nil, fmt.Errorf("rg callers fallback: %w", err)
 	}
 	// Compile (or reuse) a regex that matches definitions of the target symbol.
 	// The fixed prefix is the same for every name; only the quoted name varies.
 	defRe := s.getCachedDefRe(args.Name)
 	var filtered []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range outLines {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) < 3 {
 			continue
@@ -694,9 +701,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	if args.Name == "" {
 		return nil, nil, fmt.Errorf("name is required")
 	}
-	if args.MaxResults == 0 {
-		args.MaxResults = defaultSymbolMax
-	}
+	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Name, args.Path); p != "" {
 			args.ProjectPath = p
@@ -727,23 +732,21 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		"--line-number", "--no-heading", "--color=never",
 		"--fixed-strings",
 		"-c", "-w", args.Name, root)
-	out, err := rg.Output()
-	if err != nil && len(out) == 0 {
-		// rg exits 1 on no matches; any other error means rg itself failed and
-		// must surface instead of masquerading as "no references" (aligned
-		// with toolSearch).
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no files reference " + args.Name}}}, nil, nil
+	outLines, _, err := rgOutputLines(rg, args.MaxResults, rgMaxOutputBytes)
+	if err != nil {
+		if len(outLines) == 0 {
+			return nil, nil, fmt.Errorf("rg impact fallback: %w", err)
 		}
-		return nil, nil, fmt.Errorf("rg impact fallback: %w", err)
 	}
-	rgText := relativizeRgOutput(string(out), projRoot)
+	rgText := relativizeRgOutput(strings.Join(outLines, "\n")+"\n", projRoot)
 	result := "# Impact of " + args.Name + " (rg fallback)\n" + limitLines(rgText, args.MaxResults)
 	result = truncateOutput(result, defaultOutputChars)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: result}}}, nil, nil
 }
 
 func (s *Server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args nodeArgs) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Name, args.File); p != "" {
 			args.ProjectPath = p
@@ -794,6 +797,8 @@ func (s *Server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args node
 }
 
 func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -828,6 +833,8 @@ func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 	if args.Stdin {
 		return nil, nil, fmt.Errorf("stdin is not supported over MCP; pass files as a list instead")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -853,6 +860,17 @@ func (s *Server) toolAffected(ctx context.Context, _ *mcp.CallToolRequest, args 
 }
 
 func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, args communitiesArgs) (*mcp.CallToolResult, any, error) {
+	// Louvain on a large index is the heaviest tool: give it a longer
+	// deadline than the default 30s, but still bound it (audit high: full-
+	// graph community detection had no timeout at all). The node-count cap
+	// lives in tools.ToolCommunity — the real protection against CPU burn.
+	// Since ToolCommunity polls ctx through the graph-build and enrichment
+	// loops, this deadline now actually aborts a canceled run mid-build
+	// instead of only at the Louvain gates; the non-interruptible remainder
+	// is the DB snapshot SELECT and the gonum Louvain/Q passes themselves.
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	args.Max = clampLimit(args.Max, 20, maxCommunities)
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Path); p != "" {
 			args.ProjectPath = p
@@ -885,11 +903,19 @@ func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, ar
 // ---------- store_fact ----------
 
 func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args storeFactArgs) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.TargetFile == "" {
 		return nil, nil, fmt.Errorf("targetFile is required")
 	}
 	if args.Content == "" {
 		return nil, nil, fmt.Errorf("content is required")
+	}
+	// Bound the fact size before it reaches the DB: an unbounded content
+	// would let any caller grow the facts table into a disk DoS and make
+	// every read-back path slow (audit high M9).
+	if len(args.Content) > maxFactContentLen {
+		return nil, nil, fmt.Errorf("content too large: %d bytes (max %d)", len(args.Content), maxFactContentLen)
 	}
 
 	if args.ProjectPath == "" {
@@ -916,7 +942,7 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		targetFile = filepath.Clean(filepath.Join(root, targetFile))
 	}
 	if rel, rerr := filepath.Rel(root, targetFile); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, nil, fmt.Errorf("targetFile %q is outside the project root %q", args.TargetFile, root)
+		return nil, nil, fmt.Errorf("targetFile %q is outside the project root %q", args.TargetFile, s.displayRoot(root))
 	}
 	realTarget, rerr := filepath.EvalSymlinks(targetFile)
 	if rerr != nil {
@@ -926,7 +952,7 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		}
 	}
 	if !pathWithinRealRoot(s.realRoot(root), realTarget) {
-		return nil, nil, fmt.Errorf("targetFile %q resolves to %q outside the project root %q (symlink escape)", args.TargetFile, realTarget, root)
+		return nil, nil, fmt.Errorf("targetFile %q resolves to %q outside the project root %q (symlink escape)", args.TargetFile, s.displayPath(realTarget), s.displayRoot(root))
 	}
 	// Store the workdir-relative key (portable, like the indexer's keys).
 	if rel, rerr := filepath.Rel(root, targetFile); rerr == nil && rel != "." {
@@ -945,16 +971,12 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		return nil, nil, fmt.Errorf("check hash: %w", err)
 	}
 	if existing != nil {
-		sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
-		out := map[string]interface{}{
-			"duplicate":   true,
-			"fact":        existing,
-			"same_target": sameTargetFacts,
+		sameTarget, gerr := database.GetFactsByTarget(targetFile, args.TargetSymbol)
+		if gerr != nil {
+			// Read-back failure is non-fatal: still report the duplicate.
+			sameTarget = nil
 		}
-		b, _ := json.Marshal(out)
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
-		}, nil, nil
+		return s.storeFactResponse(existing, sameTarget, map[string]interface{}{"duplicate": true})
 	}
 
 	f := &db.Fact{
@@ -983,23 +1005,74 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
 
 	resp := map[string]interface{}{
-		"duplicate":   false,
-		"fact":        inserted,
-		"same_target": sameTargetFacts,
+		"duplicate": false,
 	}
 	if supersedeErr != "" {
 		resp["supersede_warning"] = supersedeErr
 	}
 
-	b, _ := json.Marshal(resp)
+	return s.storeFactResponse(inserted, sameTargetFacts, resp)
+}
+
+// storeFactResponse marshals the store_fact JSON payload with hard bounds:
+// same_target facts are limited to maxFactsReadback rows and each fact's
+// content is truncated to maxFactContentShown bytes before marshaling
+// (read-back LIMIT + cap; audit high: GetFactsByTarget has no LIMIT and the
+// response was not truncated). Extra rows are summarized, not dropped
+// silently.
+func (s *Server) storeFactResponse(fact *db.Fact, sameTarget []db.Fact, extra map[string]interface{}) (*mcp.CallToolResult, any, error) {
+	resp := make(map[string]interface{}, len(extra)+2)
+	for k, v := range extra {
+		resp[k] = v
+	}
+	if fact != nil {
+		f := *fact
+		f.Content = truncateFactContent(f.Content)
+		resp["fact"] = f
+	}
+	type factView struct {
+		db.Fact
+	}
+	var shown []factView
+	for i, f := range sameTarget {
+		if i >= maxFactsReadback {
+			break
+		}
+		f.Content = truncateFactContent(f.Content)
+		shown = append(shown, factView{Fact: f})
+	}
+	if len(sameTarget) > len(shown) {
+		resp["same_target_truncated"] = len(sameTarget) - len(shown)
+	}
+	resp["same_target"] = shown
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return nil, nil, err
+	}
+	text := truncateOutput(string(b), defaultOutputChars)
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
+}
+
+// truncateFactContent cuts fact content echoed back to the client to
+// maxFactContentShown bytes so responses stay small even for max-size facts.
+func truncateFactContent(content string) string {
+	if len(content) <= maxFactContentShown {
+		return content
+	}
+	cut := maxFactContentShown
+	for cut > 0 && !utf8.ValidString(content[:cut]) {
+		cut--
+	}
+	return content[:cut] + "… (fact content truncated)"
 }
 
 // ---------- search_facts ----------
 
 func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, args searchFactsArgs) (*mcp.CallToolResult, any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if args.ProjectPath == "" {
 		if p := s.detectProject(args.Path, args.TargetFile); p != "" {
 			args.ProjectPath = p
@@ -1011,10 +1084,9 @@ func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, ar
 	}
 	defer s.releaseProject(root)
 
-	max := args.Max
-	if max <= 0 {
-		max = 20
-	}
+	// Clamp the row cap: the DB LIMIT takes this value verbatim (audit H2),
+	// and the JSON payload used to be marshaled unbounded (audit H3).
+	max := clampLimit(args.Max, 20, maxFactsResults)
 	status := args.Status
 	if status == "" {
 		status = "active"
@@ -1031,8 +1103,13 @@ func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, ar
 		}, nil, nil
 	}
 
+	// Truncate each fact's content before marshaling so the intermediate
+	// JSON is bounded, then truncate the payload again as the final cap.
+	for i := range facts {
+		facts[i].Content = truncateFactContent(facts[i].Content)
+	}
 	b, _ := json.Marshal(facts)
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		Content: []mcp.Content{&mcp.TextContent{Text: truncateOutput(string(b), defaultOutputChars)}},
 	}, nil, nil
 }

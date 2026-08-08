@@ -23,6 +23,12 @@ type GraphQueryArgs struct {
 	Depth      int    `json:"depth,omitempty"` // impact / multi-hop
 }
 
+// maxGraphResults bounds MaxResults for the graph traversal tools (audit
+// high: the graph side only defaulted <=0 and let any large cap through;
+// the server layer clamps first — this is defense in depth for direct
+// package use, so the BFS/collection never allocates for an unbounded cap).
+const maxGraphResults = 200
+
 // ExploreArgs drives the primary explore tool (official-style).
 type ExploreArgs struct {
 	Query    string `json:"query,omitempty"` // symbol names / free text; empty = overview
@@ -37,9 +43,7 @@ func ToolCallersGraph(ctx context.Context, database *db.DB, workdir string, args
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
-	if args.MaxResults <= 0 {
-		args.MaxResults = 40
-	}
+	args.MaxResults = clampGraphMax(args.MaxResults)
 
 	defs, err := resolveDefs(ctx, database, args.Name, args.Path, args.File, args.Glob, workdir)
 	if err != nil {
@@ -89,9 +93,7 @@ func ToolCalleesGraph(ctx context.Context, database *db.DB, workdir string, args
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
-	if args.MaxResults <= 0 {
-		args.MaxResults = 40
-	}
+	args.MaxResults = clampGraphMax(args.MaxResults)
 
 	defs, err := resolveDefs(ctx, database, args.Name, args.Path, args.File, args.Glob, workdir)
 	if err != nil {
@@ -141,9 +143,7 @@ func ToolImpactGraph(ctx context.Context, database *db.DB, workdir string, args 
 	if args.Name == "" {
 		return "", false, fmt.Errorf("name is required")
 	}
-	if args.MaxResults <= 0 {
-		args.MaxResults = 40
-	}
+	args.MaxResults = clampGraphMax(args.MaxResults)
 	depth := args.Depth
 	if depth <= 0 {
 		depth = 2
@@ -231,6 +231,18 @@ func ToolImpactGraph(ctx context.Context, database *db.DB, workdir string, args 
 		fmt.Fprintf(&b, "%s\n", db.RelPath(workdir, h.file))
 	}
 	return b.String(), true, nil
+}
+
+// clampGraphMax normalizes a graph-tool MaxResults: <=0 falls back to the
+// 40 default, values over maxGraphResults are cut to the cap (audit high).
+func clampGraphMax(v int) int {
+	if v <= 0 {
+		return 40
+	}
+	if v > maxGraphResults {
+		return maxGraphResults
+	}
+	return v
 }
 
 // ToolExplore builds an overview or a symbol-centered context pack (official primary tool).
@@ -766,8 +778,10 @@ func resolveDefs(ctx context.Context, database *db.DB, name, pathFilter, fileHin
 		return nil, err
 	}
 	if len(nodes) == 0 {
-		// FTS fallback for partial names
-		nodes, err = database.FullTextSearchContext(ctx, name, 20)
+		// FTS fallback for partial names. Refs variant: callers (callers/
+		// callees/impact) render file:line only and never touch Body — no
+		// point pulling up to MaxBodyChars per hit.
+		nodes, err = database.FullTextSearchRefsContext(ctx, name, 20)
 		if err != nil {
 			return nil, err
 		}

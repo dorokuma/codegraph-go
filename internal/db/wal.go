@@ -77,6 +77,13 @@ func (w *WALCheckpoint) runCheckpoint() {
 	w.db.mu.RLock()
 	defer w.db.mu.RUnlock()
 
+	// Close-without-Stop safety: DB.Close nils conn under the write lock. If
+	// Stop was never called, the next ticker fire would dereference a nil
+	// conn and panic. A closed DB simply has nothing to checkpoint.
+	if w.db.conn == nil {
+		return
+	}
+
 	// PASSIVE: checkpoint as much as possible without blocking readers.
 	// Returns (busy, log) — we ignore busy (readers are fine).
 	rows, err := w.db.conn.Query("PRAGMA wal_checkpoint(PASSIVE)")

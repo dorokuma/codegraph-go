@@ -27,14 +27,20 @@ func TruncateBody(body string) string {
 	return body[:cut] + "\n/* ... body truncated ... */"
 }
 
-// callTargetKinds are symbol kinds that make sense as call targets.
+// callTargetKinds are symbol kinds that make sense as call targets. Kept in
+// sync with internal/resolution/name_matcher.go (the resolution package is
+// the production path; this copy serves the deprecated ResolveBestTarget and
+// must not drift from it): structs and interfaces are excluded — a call edge
+// to a struct/interface node is almost always a wrong match (audit: calls
+// linked to class/struct nodes). Classes stay (Python/JS instantiation is a
+// real call pattern); route and foreign_function are framework targets.
+// Signature nodes are interface-method declarations, never call targets, so
+// they are excluded too (they fall out via the map, like file/module).
 var callTargetKinds = map[string]bool{
 	KindFunction:       true,
 	KindMethod:         true,
 	"route":            true,
-	KindClass:          true, // constructors / type refs
-	KindStruct:         true,
-	KindInterface:      true,
+	KindClass:          true,
 	"foreign_function": true,
 }
 
@@ -45,6 +51,12 @@ var callTargetKinds = map[string]bool{
 //
 // Ambiguous ubiquitous names (too many candidates) return 0 rather than a
 // low-confidence wrong edge — better no edge than a wrong one.
+//
+// Deprecated: superseded by internal/resolution.MatchName, which the
+// resolution pass uses for all call/import edges. Kept for legacy callers
+// and tests; its callTargetKinds must stay aligned with name_matcher.go
+// (both now exclude struct/interface/signature/file/module from call
+// targets).
 func ResolveBestTarget(candidates []Node, fromFile string, preferCallTarget bool) int64 {
 	if len(candidates) == 0 {
 		return 0
@@ -68,10 +80,10 @@ func ResolveBestTarget(candidates []Node, fromFile string, preferCallTarget bool
 
 	for _, c := range candidates {
 		if preferCallTarget && !callTargetKinds[c.Kind] {
-			// file/module placeholders are weak call targets
-			if c.Kind == KindFile || c.Kind == "module" {
-				continue
-			}
+			// Call edges must not attach to non-callable kinds (structs,
+			// interfaces, files, modules, signatures, variables, …) even
+			// when no function matches. Same rule as MatchName.
+			continue
 		}
 		score := 0
 		if c.File == fromFile {
@@ -135,6 +147,13 @@ func StoragePath(workdir, path string) string {
 }
 
 // AbsPath joins a storage key (relative or absolute) under workdir for disk I/O.
+//
+// Relative keys are jailed inside workdir: a key that would escape (e.g. a
+// hand-crafted or malicious "../../etc/passwd" row in the index) returns ""
+// instead of a path outside the workspace, so callers doing disk reads through
+// AbsPath cannot be tricked into reading arbitrary files. Absolute stored keys
+// are returned as-is (legacy indexes store out-of-workdir files in absolute
+// form on purpose).
 func AbsPath(workdir, stored string) string {
 	stored = strings.TrimSpace(stored)
 	if stored == "" {
@@ -146,10 +165,17 @@ func AbsPath(workdir, stored string) string {
 	if workdir == "" {
 		return filepath.Clean(stored)
 	}
+	wd := filepath.Clean(workdir)
 	if stored == "." {
-		return filepath.Clean(workdir)
+		return wd
 	}
-	return filepath.Clean(filepath.Join(workdir, filepath.FromSlash(stored)))
+	joined := filepath.Clean(filepath.Join(wd, filepath.FromSlash(stored)))
+	rel, err := filepath.Rel(wd, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// Path escapes workdir — refuse rather than expose out-of-tree files.
+		return ""
+	}
+	return joined
 }
 
 // RelPath makes paths shorter for agent-facing output.

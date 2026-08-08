@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	stdsync "sync"
 	"sync/atomic"
 	"time"
@@ -168,6 +169,12 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 	if workdirs == nil {
 		workdirs = []string{workdir}
 	}
+	// Audit low: workdir=/ deliberately opens the whole filesystem as the
+	// workspace (resolvePathIn's jail is a no-op then). Never silently: a
+	// misconfigured daemon must at least say so in its log.
+	if filepath.Clean(workdir) == string(filepath.Separator) {
+		slog.Warn("workdir is the filesystem root ( / ): the entire disk is the workspace and path jailing is disabled — use a project directory unless full-disk indexing is intended")
+	}
 	database, err := db.Open(workdir)
 	if err != nil {
 		slog.Error("open database", "error", err)
@@ -200,11 +207,21 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 		walCP.Stop()
 		if w := s.Watcher.Load(); w != nil {
 			w.Stop()
+			// Stop's grace period may expire with a reindex pass still in
+			// flight (a single-file reindex can exceed stopGracePeriod). The
+			// pass winds down because BgDone is closed, but closing the DB
+			// before it finishes would panic: the pass's next d.conn call
+			// hits the nil conn Close left behind (use-after-close). Wait it
+			// out — no timeout, there is no safe second chance after Close.
+			w.WaitIdle()
 		}
 		s.ExtraMu.Lock()
 		for _, w := range s.ExtraWatchers {
 			if w != nil {
 				w.Stop()
+				// Same rule as the primary watcher: wait for the in-flight
+				// pass before closing this workdir's DB below.
+				w.WaitIdle()
 			}
 		}
 		for _, edb := range s.ExtraDBs {

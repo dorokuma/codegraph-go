@@ -38,17 +38,25 @@ func SetupLogger(level string) (*slog.Logger, func()) {
 
 	globalWriter = newNonBlockWriter(os.Stderr, writerChCap)
 
+	// H1: every byte that reaches the writer passes through the scrubbing
+	// writer, so legacy log.Printf / log.Fatalf calls in lower layers (db,
+	// extraction, …) — which bypass the slog handler — are secret-scrubbed
+	// too. The slog handler additionally blanks whole values under sensitive
+	// keys via ReplaceAttr before formatting.
+	scrub := &scrubbingWriter{w: globalWriter}
+
 	// Route the standard log package through the non-blocking writer so all
 	// existing log.Printf / log.Fatalf calls in lower layers (db, extraction,
 	// …) are non-blocking without needing source changes.
-	log.SetOutput(globalWriter)
+	log.SetOutput(scrub)
 	log.SetFlags(log.LstdFlags)
 
 	// Build a slog.TextHandler that writes to the non-blocking writer.
 	levelVar := new(slog.LevelVar)
 	levelVar.Set(parseLevel(level))
-	textHandler := slog.NewTextHandler(globalWriter, &slog.HandlerOptions{
-		Level: levelVar,
+	textHandler := slog.NewTextHandler(scrub, &slog.HandlerOptions{
+		Level:       levelVar,
+		ReplaceAttr: redactAttr,
 	})
 	logger := slog.New(textHandler)
 	slog.SetDefault(logger)

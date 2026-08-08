@@ -79,6 +79,41 @@ func TestStoragePathAndAbsPathRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAbsPathJailsEscapes: relative storage keys that would escape workdir
+// (hand-crafted or malicious index rows) must be rejected with "" so callers
+// doing disk reads through AbsPath cannot be tricked out of the workspace.
+func TestAbsPathJailsEscapes(t *testing.T) {
+	wd := "/proj/root"
+	escapes := []string{
+		"../../etc/passwd",
+		"pkg/../../../x",
+		"a/../../b",
+		"..",
+	}
+	for _, s := range escapes {
+		if got := AbsPath(wd, s); got != "" {
+			t.Errorf("AbsPath(%q) = %q, want \"\" (escape must be rejected)", s, got)
+		}
+	}
+
+	inside := map[string]string{
+		"pkg/a.go":       filepath.Join(wd, "pkg", "a.go"),
+		"pkg/../a.go":    filepath.Join(wd, "a.go"), // resolves inside → allowed
+		"a":              filepath.Join(wd, "a"),
+		".":              wd,
+		wd + "/pkg/a.go": filepath.Join(wd, "pkg", "a.go"), // absolute inside
+	}
+	for s, want := range inside {
+		if got := AbsPath(wd, s); got != want {
+			t.Errorf("AbsPath(%q) = %q, want %q", s, got, want)
+		}
+	}
+	// Absolute stored keys (legacy out-of-workdir files) are kept as-is.
+	if got := AbsPath(wd, "/elsewhere/x.go"); got != "/elsewhere/x.go" {
+		t.Errorf("absolute legacy key must pass through, got %q", got)
+	}
+}
+
 func TestSqliteFileDSNEscapesSpecials(t *testing.T) {
 	dsn := sqliteFileDSN("/tmp/weird path/db#1?.db")
 	if !strings.Contains(dsn, "%20") || !strings.Contains(dsn, "%23") || !strings.Contains(dsn, "%3F") {

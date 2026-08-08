@@ -25,7 +25,15 @@ func ResolveImportPath(workdir, fromFile, spec, lang string) []string {
 	}
 	workdir = filepath.Clean(workdir)
 	// Normalize so cargo/go resolution joins correctly with absolute roots.
+	storedFrom := fromFile
 	fromFile = db.AbsPath(workdir, fromFile)
+	if fromFile == "" && storedFrom != "" {
+		// The storage key escapes workdir (db.AbsPath refuses out-of-tree
+		// keys and returns ""). Fail closed: resolving against
+		// filepath.Dir("") == "." would silently resolve relative to the
+		// process CWD instead of the workspace (must-fix).
+		return nil
+	}
 	fromDir := filepath.Dir(fromFile)
 
 	switch lang {

@@ -68,6 +68,12 @@ type Orchestrator struct {
 	// keep warning forever after one permanent failure).
 	partialMu    sync.Mutex
 	partialFails int
+	// indexFailed lists the paths that failed during the most recent
+	// IndexChanges pass (ErrKeepOldIndex partial failures, stat errors,
+	// index-delete errors). Guarded by partialMu; read via
+	// IndexFailedFiles(). The watcher uses it to requeue only the files that
+	// actually failed instead of burning the whole batch's retry budget.
+	indexFailed []string
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
@@ -443,6 +449,7 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	// an earlier pass cannot trigger a warning on a clean pass.
 	o.partialMu.Lock()
 	o.partialFails = 0
+	o.indexFailed = nil
 	o.partialMu.Unlock()
 	totalFiles, totalNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if done%500 == 0 {
@@ -597,6 +604,30 @@ func (o *Orchestrator) PartialFailures() int {
 	return o.partialFails
 }
 
+// recordIndexFailure appends one failed path to the current pass's
+// IndexFailedFiles list. Only called from IndexChanges (the watcher's
+// reindex path); IndexAll/IndexAllWithProgress run parallel jobs whose
+// failures are reported via PartialFailures only.
+func (o *Orchestrator) recordIndexFailure(path string) {
+	o.partialMu.Lock()
+	o.indexFailed = append(o.indexFailed, path)
+	o.partialMu.Unlock()
+}
+
+// IndexFailedFiles returns the paths that failed during the most recent
+// IndexChanges pass: extraction partial failures (ErrKeepOldIndex), stat
+// errors, and index-delete errors. Reset at the start of every pass like
+// PartialFailures, so the value is only meaningful right after a pass
+// returned. The watcher requeues only these paths instead of burning the
+// whole batch's retry budget on one permanent failure.
+func (o *Orchestrator) IndexFailedFiles() []string {
+	o.partialMu.Lock()
+	defer o.partialMu.Unlock()
+	out := make([]string, len(o.indexFailed))
+	copy(out, o.indexFailed)
+	return out
+}
+
 // indexFile extracts and writes the index for one file. data, when non-nil,
 // is the file content already read by the caller (indexIfNeeded's content-hash
 // gate, F4) and is reused instead of reading the file a second time; nil means
@@ -633,7 +664,25 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 	// gates treat the file as current, so an unchanged broken file would be
 	// skipped forever. Leaving the stale meta makes the next IndexAll retry
 	// the file (self-healing). ErrKeepOldIndex is non-fatal (M7).
-	result, tsErrored, extractErr := o.extractFile(lang, string(data), store)
+	// Normalize once for every consumer (extractors, route detection, bridge
+	// detection): strip BOM and normalize CRLF so anchors/line math agree.
+	source := normalizeSource(string(data))
+	result, tsErrored, extractErr := o.extractFile(lang, source, store)
+	// T5: tree-sitter TIMEOUT is not a parse verdict — the regex fallback can
+	// yield partial/noisy results that would silently degrade a previously
+	// complete tree-sitter index (and the fresh content hash would stop any
+	// retry, so the quality loss would be permanent). Keep the old index when
+	// one exists; only a file with no prior index gets the weak fallback
+	// written (something beats nothing on the first pass).
+	if errors.Is(extractErr, ErrTSParseTimeout) {
+		if old, cerr := o.fileNodeCount(store); cerr != nil || old > 0 {
+			log.Printf("warning: tree-sitter parse timed out for %s, keeping existing index", path)
+			// No meta touch (M2): the stale meta makes the next IndexAll
+			// retry the file; ErrKeepOldIndex keeps the pass going (M7).
+			return 0, ErrKeepOldIndex
+		}
+		extractErr = nil
+	}
 	if extractErr != nil {
 		log.Printf("warning: extraction failed for %s: %v (keeping existing index)", path, extractErr)
 		return 0, ErrKeepOldIndex
@@ -663,7 +712,7 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 
 	// Detect framework routes (linked to handlers after node insert).
 	detector := NewFrameworkDetector()
-	routes := detector.DetectRoutes(string(data), store, lang)
+	routes := detector.DetectRoutes(source, store, lang)
 	for _, route := range routes {
 		handler := simplifyHandlerName(strings.TrimSpace(route.Handler))
 		nodes = append(nodes, ExtractedNode{
@@ -720,20 +769,39 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 	}
 
 	// name:line → dbNodes index; bare-name best-hit map (same ranking as before).
+	// Names defined at more than one (line, rank) spot are ambiguous and are
+	// deliberately NOT registered as bare-name hits: same-file linking must
+	// never first-wins across two same-named symbols (audit: two String()
+	// methods on different receivers stole each other's calls).
 	nodeIdx := make(map[string]int, len(dbNodes))
 	type bareHit struct{ idx, rank, line int }
 	bareBest := map[string]bareHit{}
+	ambiguous := map[string]bool{}
+	nameIdx := map[string][]int{}
 	for i := 1; i < len(dbNodes); i++ { // skip the file node
 		n := dbNodes[i]
 		nodeIdx[fmt.Sprintf("%s:%d", n.Name, n.Line)] = i
+		if n.Kind == "signature" {
+			// Interface method signatures can be neither a call source nor a
+			// call target; keep them out of the link maps entirely.
+			continue
+		}
+		nameIdx[n.Name] = append(nameIdx[n.Name], i)
 		prev, ok := bareBest[n.Name]
 		rank := bareRank(n.Kind)
+		if ok && (prev.line != n.Line || prev.rank != rank) {
+			ambiguous[n.Name] = true
+		}
 		if !ok || rank > prev.rank || (rank == prev.rank && n.Line < prev.line) {
 			bareBest[n.Name] = bareHit{idx: i, rank: rank, line: n.Line}
 		}
 	}
 	sameFileBare := make(map[string]int, len(bareBest))
 	for name, hit := range bareBest {
+		if ambiguous[name] {
+			continue
+		}
+		// Bare name → best unambiguous hit (compatibility with older indexes).
 		nodeIdx[name] = hit.idx
 		sameFileBare[name] = hit.idx
 	}
@@ -759,6 +827,40 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 				Provenance: "exact",
 			})
 			return
+		}
+		// Ambiguous same-file name (multiple definitions): link only when
+		// exactly one definition's source range contains the reference line.
+		// Any other case parks the ref so the resolution pass can decide
+		// (and refuses when the candidates still tie).
+		if idxs := nameIdx[targetName]; len(idxs) > 1 {
+			hit := -1
+			contain := 0
+			for _, idx := range idxs {
+				n := dbNodes[idx]
+				if n.Kind == db.KindFile || n.Kind == "module" || n.Kind == "signature" {
+					continue
+				}
+				end := n.EndLine
+				if end == 0 {
+					end = n.Line
+				}
+				if n.Line <= line && line <= end {
+					contain++
+					hit = idx
+				}
+			}
+			if contain == 1 {
+				dbEdges = append(dbEdges, db.Edge{
+					SourceID:   ph(from),
+					TargetID:   ph(hit),
+					Kind:       kind,
+					File:       store,
+					Line:       line,
+					Col:        col,
+					Provenance: "exact",
+				})
+				return
+			}
 		}
 		if !ShouldParkRef(o.db, targetName) {
 			return
@@ -884,7 +986,7 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 	// Cross-language bridges: same-file source; target may be foreign placeholder
 	// (still written as edge so bridge tooling keeps working; full resolution in step 7).
 	bridgeDetector := NewCrossLanguageDetector()
-	bridges := bridgeDetector.Detect(string(data), store, lang)
+	bridges := bridgeDetector.Detect(source, store, lang)
 	for _, bridge := range bridges {
 		targetName := strings.TrimSpace(bridge.TargetFunc)
 		if targetName == "" {
@@ -937,7 +1039,11 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 // fallback when tree-sitter fails. Returns the result, whether tree-sitter
 // itself errored (false when it succeeded, was unavailable, or regex is the
 // only extractor), and an error only when every extractor failed (A4) —
-// callers then keep the previous index for the file.
+// callers then keep the previous index for the file. One exception: when
+// tree-sitter TIMED OUT (ErrTSParseTimeout) and the regex fallback produced
+// a non-empty result, the sentinel is returned as the error so callers can
+// tell "timeout" from a genuine parse verdict and keep a good old index
+// instead of overwriting it with weak regex partial results (must-fix).
 func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, bool, error) {
 	if o.extractFn != nil {
 		return o.extractFn(lang, source, store)
@@ -952,6 +1058,11 @@ func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, b
 		// unparseable file (fallback also empty) apart from a successfully
 		// extracted empty file, and keep the old index in the former case.
 		fb, ferr := NewExtractor(lang).Extract(source, store)
+		if errors.Is(err, ErrTSParseTimeout) && ferr == nil {
+			// Timeout is NOT a parse verdict: signal it via the sentinel so
+			// the caller keeps the old index when one exists (see indexFile).
+			return fb, true, fmt.Errorf("%w: %s parse timed out, regex fallback used", ErrTSParseTimeout, lang)
+		}
 		return fb, true, ferr
 	}
 	res, err := NewExtractor(lang).Extract(source, store)
@@ -989,10 +1100,12 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	var errs []error
 
 	// M7: per-pass semantics, same as IndexAll — reset the partial-failure
-	// count before the pass so PartialFailures() reflects only this batch
-	// (a stale count from an earlier pass would keep warning forever).
+	// count (and the failed-files list) before the pass so PartialFailures()
+	// and IndexFailedFiles() reflect only this batch (a stale count from an
+	// earlier pass would keep warning forever).
 	o.partialMu.Lock()
 	o.partialFails = 0
+	o.indexFailed = nil
 	o.partialMu.Unlock()
 
 	for _, path := range files {
@@ -1005,9 +1118,11 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 				// File was deleted (or renamed away): remove the stale index.
 				if derr := o.db.DeleteFile(o.storePath(path)); derr != nil {
 					errs = append(errs, fmt.Errorf("delete index %s: %w", path, derr))
+					o.recordIndexFailure(path)
 				}
 			} else {
 				errs = append(errs, fmt.Errorf("stat %s: %w", path, err))
+				o.recordIndexFailure(path)
 			}
 			continue
 		}
@@ -1034,6 +1149,7 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 			} else {
 				errs = append(errs, ierr)
 			}
+			o.recordIndexFailure(path)
 		}
 		storeKeys = append(storeKeys, o.storePath(path))
 	}
@@ -1069,6 +1185,7 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	// M7: per-pass partial-failure count (see IndexAll).
 	o.partialMu.Lock()
 	o.partialFails = 0
+	o.indexFailed = nil
 	o.partialMu.Unlock()
 	indexedFiles, indexedNodes, jerr := o.runIndexJobs(jobs, func(done, total int) {
 		if onProgress != nil && (done%10 == 0 || done == total) {

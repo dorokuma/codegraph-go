@@ -279,6 +279,27 @@ func TestFindBraceEnd(t *testing.T) {
 			start: 0,
 			want:  3,
 		},
+		{
+			// Go raw string: the backslash inside `...` must not escape the
+			// closing backtick; otherwise the string never closes and the
+			// real closing brace of the function is swallowed.
+			lines: []string{"func f() {", "\ts := `\\`", "\tif x {", "\t\tg()", "\t}", "}"},
+			start: 0,
+			want:  6,
+		},
+		{
+			// Python triple-quoted string: braces inside """...""" must not
+			// count as block braces.
+			lines: []string{"func f() {", `    s := """a" b"""`, "    if x {", "    }", "}"},
+			start: 0,
+			want:  5,
+		},
+		{
+			// JS regex literal: the lone { in /a{2,}/ must not count.
+			lines: []string{"function f() {", "    const re = /a{2,}/;", "}"},
+			start: 0,
+			want:  3,
+		},
 	}
 
 	for _, tt := range tests {
@@ -286,6 +307,22 @@ func TestFindBraceEnd(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("findBraceEnd: got %d, want %d", got, tt.want)
 		}
+	}
+}
+
+func TestFindBraceEndScanBudget(t *testing.T) {
+	// An unterminated block must not scan the whole file: past the soft
+	// budget (20000 lines, see maxBraceScanLines in extractor.go) the scan
+	// stops early and the declaration line alone is returned.
+	const budget = 20000
+	lines := make([]string, 0, budget+100)
+	lines = append(lines, "func f() {")
+	for i := 0; i < budget+50; i++ {
+		lines = append(lines, "\tx := 1")
+	}
+	lines = append(lines, "}") // closes after the budget
+	if got := findBraceEnd(lines, 0); got != 1 {
+		t.Fatalf("findBraceEnd = %d, want 1 (scan must stop at the soft budget, declaration line only)", got)
 	}
 }
 

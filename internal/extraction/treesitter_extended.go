@@ -1,6 +1,7 @@
 package extraction
 
 import (
+	"fmt"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -134,7 +135,7 @@ func (e *TreeSitterExtractor) processCLikeFunction(node *sitter.Node, source []b
 	// Extract calls from function body
 	body := node.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }
 
@@ -222,7 +223,24 @@ func (e *TreeSitterExtractor) processCLikeImport(node *sitter.Node, source []byt
 			}
 		}
 	case "use_declaration":
-		// Rust: use foo::bar
+		// Rust: use foo::bar — flatten the whole use tree (use foo::{a, b},
+		// use a::b as c, nested use lists) the same way the regex fallback
+		// does, because the direct children are use_list/scoped_use_list nodes
+		// that carry no import path by themselves.
+		if e.language == "rust" {
+			spec := strings.TrimSpace(node.Content(source))
+			spec = strings.TrimPrefix(spec, "use")
+			spec = strings.TrimSuffix(spec, ";")
+			for _, path := range splitRustUsePaths(spec) {
+				if path != "" {
+					*edges = append(*edges, ExtractedEdge{
+						SourceName: filePath, TargetName: path, Kind: "imports", File: filePath, Line: line,
+					})
+				}
+			}
+			return
+		}
+		// Other languages (e.g. PHP): keep the direct-child scan.
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
 			if child.Type() == "scoped_identifier" || child.Type() == "identifier" {
@@ -264,7 +282,7 @@ func (e *TreeSitterExtractor) processCLikeImport(node *sitter.Node, source []byt
 	}
 }
 
-func (e *TreeSitterExtractor) findCLikeCalls(node *sitter.Node, source []byte, filePath string, funcName string, funcLine int, edges *[]ExtractedEdge, seen map[string]bool) {
+func (e *TreeSitterExtractor) findCLikeCalls(node *sitter.Node, source []byte, filePath string, funcName string, edges *[]ExtractedEdge, seen map[string]bool) {
 	if node.Type() == "function_declaration" || node.Type() == "method_declaration" || node.Type() == "lambda_expression" {
 		return
 	}
@@ -277,16 +295,22 @@ func (e *TreeSitterExtractor) findCLikeCalls(node *sitter.Node, source []byte, f
 	if node.Type() == "call_expression" || node.Type() == "call" ||
 		node.Type() == "method_invocation" || node.Type() == "navigation_expression" {
 		calleeName := extractCalleeName(node, source)
-		if calleeName != "" && calleeName != funcName && !seen[calleeName] && !isBuiltinKeyword(calleeName) {
-			seen[calleeName] = true
-			*edges = append(*edges, ExtractedEdge{
-				SourceName: funcName, TargetName: calleeName, Kind: "calls", File: filePath, Line: funcLine,
-			})
+		if calleeName != "" && calleeName != funcName && !isBuiltinKeyword(calleeName) {
+			// Call-site line, not the enclosing function's definition line
+			// (audit: C-like/Rust/Ruby/PHP edges pointed at the definition).
+			callLine := int(node.StartPoint().Row) + 1
+			key := fmt.Sprintf("%s:%d", calleeName, callLine)
+			if !seen[key] {
+				seen[key] = true
+				*edges = append(*edges, ExtractedEdge{
+					SourceName: funcName, TargetName: calleeName, Kind: "calls", File: filePath, Line: callLine,
+				})
+			}
 		}
 	}
 
 	for i := 0; i < int(node.ChildCount()); i++ {
-		e.findCLikeCalls(node.Child(i), source, filePath, funcName, funcLine, edges, seen)
+		e.findCLikeCalls(node.Child(i), source, filePath, funcName, edges, seen)
 	}
 }
 
@@ -374,7 +398,7 @@ func (e *TreeSitterExtractor) processRustFunction(node *sitter.Node, source []by
 	}
 	body := node.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }
 
@@ -502,7 +526,7 @@ func (e *TreeSitterExtractor) processRubyMethod(node *sitter.Node, source []byte
 	}
 	body := node.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }
 
@@ -600,7 +624,7 @@ func (e *TreeSitterExtractor) processPHPFunction(node *sitter.Node, source []byt
 	}
 	body := node.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }
 
@@ -762,7 +786,7 @@ func (e *TreeSitterExtractor) processLuaFunction(node *sitter.Node, source []byt
 	}
 	body := node.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }
 
@@ -862,6 +886,6 @@ func (e *TreeSitterExtractor) emitLuaAnonFunc(fn *sitter.Node, source []byte, fi
 	}
 	body := fn.ChildByFieldName("body")
 	if body != nil {
-		e.findCLikeCalls(body, source, filePath, name, startLine, edges, make(map[string]bool))
+		e.findCLikeCalls(body, source, filePath, name, edges, make(map[string]bool))
 	}
 }

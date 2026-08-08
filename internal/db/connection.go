@@ -29,6 +29,16 @@ type DB struct {
 
 // Open opens (or creates) the SQLite database at .codegraph/codegraph.db under workdir.
 func Open(workdir string) (db *DB, err error) {
+	// Resolve to an absolute path up front. The DSN is a file:// URI where a
+	// relative path would be misparsed — "file://proj/.codegraph/codegraph.db"
+	// treats "proj" as the URI host. Absolute also keeps Path(), WALSize()
+	// etc. stable regardless of the caller's cwd.
+	absWorkdir, aerr := filepath.Abs(workdir)
+	if aerr != nil {
+		return nil, fmt.Errorf("resolve workdir %q: %w", workdir, aerr)
+	}
+	workdir = absWorkdir
+
 	dir := filepath.Join(workdir, ".codegraph")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create .codegraph dir: %w", err)

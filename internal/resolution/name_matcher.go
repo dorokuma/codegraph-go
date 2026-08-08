@@ -18,13 +18,16 @@ const (
 // ambiguousCeiling: above this, refuse fuzzy global pick (same idea as official).
 const ambiguousCeiling = 80
 
+// callTargetKinds are symbol kinds that make sense as call targets. Structs
+// and interfaces are excluded: a call edge to a struct/interface node is
+// almost always a wrong match (audit: calls linked to class/struct nodes).
+// Classes stay (Python/JS instantiation is a real call pattern); route and
+// foreign_function are framework targets.
 var callTargetKinds = map[string]bool{
 	db.KindFunction:    true,
 	db.KindMethod:      true,
 	"route":            true,
 	db.KindClass:       true,
-	db.KindStruct:      true,
-	db.KindInterface:   true,
 	"foreign_function": true,
 }
 
@@ -57,14 +60,15 @@ func MatchName(candidates []db.Node, refName, fromFile string, preferCall bool) 
 	}
 
 	best := MatchResult{}
+	bestCount := 0
 	fromDir := filepath.Dir(fromFile)
 	fromParent := filepath.Dir(fromDir)
 
 	for _, c := range candidates {
 		if preferCall && !callTargetKinds[c.Kind] {
-			if c.Kind == db.KindFile || c.Kind == "module" {
-				continue
-			}
+			// Call edges must not attach to non-callable kinds (structs,
+			// interfaces, files, modules, …) even when no function matches.
+			continue
 		}
 		score := 0
 		prov := ProvHeuristic
@@ -93,9 +97,18 @@ func MatchName(candidates []db.Node, refName, fromFile string, preferCall bool) 
 		}
 		if score > best.Score {
 			best = MatchResult{TargetID: c.ID, Provenance: prov, Score: score}
+			bestCount = 1
+		} else if score == best.Score && score > 0 {
+			// Same top score from a different candidate: ambiguous. DB order
+			// is not a stable tie-breaker and first-wins produced wrong edges
+			// (audit: two same-named symbols in the same file/dir).
+			bestCount++
 		}
 	}
 
+	if bestCount > 1 {
+		return MatchResult{} // ambiguous — refuse to guess
+	}
 	if len(candidates) > 1 && best.Score < 5 && preferCall {
 		return MatchResult{}
 	}

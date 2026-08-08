@@ -1,7 +1,9 @@
 package extraction
 
 import (
+	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -71,6 +73,7 @@ func NewExtractor(language string) *Extractor {
 // The regex extractor is best-effort and never fails; the error return keeps
 // the signature uniform with TreeSitterExtractor so callers can fall back.
 func (e *Extractor) Extract(source string, filePath string) (ExtractResult, error) {
+	source = normalizeSource(source)
 	var nodes []ExtractedNode
 	var edges []ExtractedEdge
 	switch e.language {
@@ -99,25 +102,42 @@ func (e *Extractor) Extract(source string, filePath string) (ExtractResult, erro
 	return promoteCallsToRefs(nodes, edges, filePath, e.language), nil
 }
 
+// normalizeSource strips a UTF-8 BOM and normalizes CRLF line endings to LF
+// so regex anchors (^func …), string comparisons and line-based scanners see
+// the same bytes regardless of file encoding (audit: BOM/CRLF handling).
+func normalizeSource(source string) string {
+	source = strings.TrimPrefix(source, "\uFEFF")
+	if strings.Contains(source, "\r\n") {
+		source = strings.ReplaceAll(source, "\r\n", "\n")
+	}
+	return source
+}
+
 // promoteCallsToRefs moves call edges into UnresolvedReference so the
 // orchestrator can same-file-link or park them as pending (step 2).
 func promoteCallsToRefs(nodes []ExtractedNode, edges []ExtractedEdge, filePath, lang string) ExtractResult {
 	out := ExtractResult{Nodes: nodes}
-	// Map symbol name → def line (first wins) for FromLine stamping.
-	defLine := make(map[string]int, len(nodes))
+	// Map symbol name → its definitions sorted by line, so the enclosing
+	// symbol of each call site can be picked by source range instead of a
+	// first-wins name lookup (two same-named methods must not steal each
+	// other's calls).
+	byName := make(map[string][]ExtractedNode, len(nodes))
 	for _, n := range nodes {
-		if _, ok := defLine[n.Name]; !ok {
-			defLine[n.Name] = n.Line
-		}
+		byName[n.Name] = append(byName[n.Name], n)
+	}
+	for name := range byName {
+		sort.Slice(byName[name], func(i, j int) bool {
+			return byName[name][i].Line < byName[name][j].Line
+		})
 	}
 	for _, e := range edges {
 		if e.Kind == "calls" {
 			// Do NOT drop noisy names here: same-file link needs the ref first
 			// (e.g. add/new/close). Noise is filtered only when parking cross-file
 			// unknowns in parkUnresolved.
-			fromLine := e.Line
-			if dl, ok := defLine[e.SourceName]; ok {
-				fromLine = dl
+			fromLine := 0
+			if ns := byName[e.SourceName]; len(ns) > 0 {
+				fromLine = enclosingDefLine(ns, e.Line)
 			}
 			out.Refs = append(out.Refs, UnresolvedReference{
 				FromName:      e.SourceName,
@@ -136,6 +156,44 @@ func promoteCallsToRefs(nodes []ExtractedNode, edges []ExtractedEdge, filePath, 
 	return out
 }
 
+// enclosingDefLine picks the definition line of the symbol whose source range
+// contains callLine (innermost wins). Falls back to the nearest definition at
+// or before the call line, then to the first definition, so a wrong end-line
+// never degrades attribution to a file-level ref. Returns 0 when no definition
+// exists for the name (caller treats the ref as file-level).
+func enclosingDefLine(nodes []ExtractedNode, callLine int) int {
+	var contain *ExtractedNode
+	for i := range nodes {
+		n := &nodes[i]
+		end := n.EndLine
+		if end == 0 {
+			end = n.Line
+		}
+		if n.Line <= callLine && callLine <= end {
+			if contain == nil || n.Line >= contain.Line {
+				contain = n
+			}
+		}
+	}
+	if contain != nil {
+		return contain.Line
+	}
+	var best *ExtractedNode
+	for i := range nodes {
+		n := &nodes[i]
+		if n.Line <= callLine && (best == nil || n.Line > best.Line) {
+			best = n
+		}
+	}
+	if best != nil {
+		return best.Line
+	}
+	if len(nodes) > 0 {
+		return nodes[0].Line
+	}
+	return 0
+}
+
 // NameTail returns the last segment of a dotted/qualified reference name.
 func NameTail(name string) string {
 	name = strings.TrimSpace(name)
@@ -146,6 +204,34 @@ func NameTail(name string) string {
 		return name[i+1:]
 	}
 	return name
+}
+
+// appendCallEdges scans body lines [startIdx, endIdx) for call sites and
+// appends one calls edge per distinct name:line hit, stamped with the
+// absolute call-site line (not the enclosing function's definition line).
+// exclude holds names that must not become targets (the function's own name,
+// matching the tree-sitter path); isKeyword filters language keywords.
+func appendCallEdges(edges *[]ExtractedEdge, filePath, sourceName string, lines []string, startIdx, endIdx int, callRe *regexp.Regexp, exclude map[string]bool, isKeyword func(string) bool) {
+	seen := map[string]bool{}
+	for li := startIdx; li < endIdx && li < len(lines); li++ {
+		for _, m := range callRe.FindAllStringSubmatch(lines[li], -1) {
+			if len(m) < 2 || exclude[m[1]] || isKeyword(m[1]) {
+				continue
+			}
+			key := fmt.Sprintf("%s:%d", m[1], li+1)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			*edges = append(*edges, ExtractedEdge{
+				SourceName: sourceName,
+				TargetName: m[1],
+				Kind:       "calls",
+				File:       filePath,
+				Line:       li + 1,
+			})
+		}
+	}
 }
 
 // ---------- Go extraction ----------
@@ -241,22 +327,8 @@ func (e *Extractor) extractGo(source string, filePath string) ([]ExtractedNode, 
 				Language: "go",
 			})
 
-			// Extract function calls from body
-			body := extractBody(lines, i, endLine)
-			callMatches := goCallRe.FindAllStringSubmatch(body, -1)
-			seen := map[string]bool{matches[1]: true}
-			for _, m := range callMatches {
-				if len(m) > 1 && !seen[m[1]] && !isGoKeyword(m[1]) {
-					seen[m[1]] = true
-					edges = append(edges, ExtractedEdge{
-						SourceName: matches[1],
-						TargetName: m[1],
-						Kind:       "calls",
-						File:       filePath,
-						Line:       lineNum,
-					})
-				}
-			}
+			// Extract function calls from body with call-site line numbers.
+			appendCallEdges(&edges, filePath, matches[1], lines, i, endLine, goCallRe, map[string]bool{matches[1]: true}, isGoKeyword)
 			continue
 		}
 	}
@@ -271,6 +343,10 @@ var (
 	jsClassRe  = regexp.MustCompile(`(?:export\s+)?class\s+(\w+)`)
 	jsCallRe   = regexp.MustCompile(`\b(\w+)\s*\(`)
 	jsImportRe = regexp.MustCompile(`(?:from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))`)
+	// Arrow functions assigned to a name: const f = (...) => … (fallback path).
+	jsArrowRe = regexp.MustCompile(`^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>`)
+	// Class-body methods: optional TS/JS modifiers, optional get/set prefix.
+	jsMethodRe = regexp.MustCompile(`^(?:(?:public|private|protected|static|async)\s+)*(?:get\s+|set\s+)?([A-Za-z_$][\w$]*)\s*\(`)
 )
 
 func (e *Extractor) extractJS(source string, filePath string) ([]ExtractedNode, []ExtractedEdge) {
@@ -312,6 +388,28 @@ func (e *Extractor) extractJS(source string, filePath string) ([]ExtractedNode, 
 				Body:     extractBody(lines, i, endLine),
 				Language: e.language,
 			})
+			// Methods inside the class body (fallback parity with tree-sitter).
+			e.extractJSClassMethods(&nodes, &edges, lines, i+1, endLine, filePath, matches[1])
+			continue
+		}
+
+		// Arrow functions assigned to const/let/var.
+		if matches := jsArrowRe.FindStringSubmatch(trimmed); len(matches) > 1 {
+			endLine := findBraceEnd(lines, i)
+			kind := "function"
+			if len(matches[1]) > 0 && matches[1][0] >= 'A' && matches[1][0] <= 'Z' {
+				kind = "component"
+			}
+			nodes = append(nodes, ExtractedNode{
+				Kind:     kind,
+				Name:     matches[1],
+				File:     filePath,
+				Line:     lineNum,
+				EndLine:  endLine,
+				Body:     extractBody(lines, i, endLine),
+				Language: e.language,
+			})
+			appendCallEdges(&edges, filePath, matches[1], lines, i, endLine, jsCallRe, map[string]bool{matches[1]: true}, isJSKeyword)
 			continue
 		}
 
@@ -329,26 +427,62 @@ func (e *Extractor) extractJS(source string, filePath string) ([]ExtractedNode, 
 				Language: e.language,
 			})
 
-			// Extract calls
-			callMatches := jsCallRe.FindAllStringSubmatch(body, -1)
-			seen := map[string]bool{matches[1]: true}
-			for _, m := range callMatches {
-				if len(m) > 1 && !seen[m[1]] && !isJSKeyword(m[1]) {
-					seen[m[1]] = true
-					edges = append(edges, ExtractedEdge{
-						SourceName: matches[1],
-						TargetName: m[1],
-						Kind:       "calls",
-						File:       filePath,
-						Line:       lineNum,
-					})
-				}
-			}
+			// Extract calls with call-site line numbers.
+			appendCallEdges(&edges, filePath, matches[1], lines, i, endLine, jsCallRe, map[string]bool{matches[1]: true}, isJSKeyword)
 			continue
 		}
 	}
 
 	return nodes, edges
+}
+
+// extractJSClassMethods extracts method definitions inside a class body
+// (regex fallback; the tree-sitter path handles methods natively). Only
+// class-body members at brace depth 1 are treated as methods: method bodies
+// can contain bare calls like `helper();` that satisfy jsMethodRe, and
+// without a depth check they would be misread as sibling methods with fake
+// contains edges (must-fix: the previous version scanned the whole class
+// range without tracking brace depth).
+func (e *Extractor) extractJSClassMethods(nodes *[]ExtractedNode, edges *[]ExtractedEdge, lines []string, startIdx, endIdx int, filePath, className string) {
+	sc := braceScanner{depth: 1} // class body members live at depth 1
+	for li := startIdx; li < endIdx && li < len(lines); li++ {
+		memberDepth := sc.depth
+		sc.scan(lines[li])
+		if memberDepth != 1 {
+			continue // inside a method/block body — not a member line
+		}
+		trimmed := strings.TrimSpace(lines[li])
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		m := jsMethodRe.FindStringSubmatch(trimmed)
+		if m == nil {
+			continue
+		}
+		name := m[1]
+		if isJSKeyword(name) {
+			continue // e.g. `if (`, `for (` — statement, not a method
+		}
+		methodEnd := findBraceEnd(lines, li)
+		*nodes = append(*nodes, ExtractedNode{
+			Kind:          "method",
+			Name:          name,
+			File:          filePath,
+			Line:          li + 1,
+			EndLine:       methodEnd,
+			Body:          extractBody(lines, li, methodEnd),
+			Language:      e.language,
+			QualifiedName: className + "." + name,
+		})
+		*edges = append(*edges, ExtractedEdge{
+			SourceName: className,
+			TargetName: name,
+			Kind:       "contains",
+			File:       filePath,
+			Line:       li + 1,
+		})
+		appendCallEdges(edges, filePath, name, lines, li, methodEnd, jsCallRe, map[string]bool{name: true}, isJSKeyword)
+	}
 }
 
 // ---------- Python extraction ----------
@@ -416,21 +550,8 @@ func (e *Extractor) extractPython(source string, filePath string) ([]ExtractedNo
 				Language: "python",
 			})
 
-			// Extract calls
-			callMatches := pyCallRe.FindAllStringSubmatch(body, -1)
-			seen := map[string]bool{matches[1]: true}
-			for _, m := range callMatches {
-				if len(m) > 1 && !seen[m[1]] && !isPythonKeyword(m[1]) {
-					seen[m[1]] = true
-					edges = append(edges, ExtractedEdge{
-						SourceName: matches[1],
-						TargetName: m[1],
-						Kind:       "calls",
-						File:       filePath,
-						Line:       lineNum,
-					})
-				}
-			}
+			// Extract calls with call-site line numbers.
+			appendCallEdges(&edges, filePath, matches[1], lines, i, endLine, pyCallRe, map[string]bool{matches[1]: true}, isPythonKeyword)
 			continue
 		}
 	}
@@ -441,7 +562,10 @@ func (e *Extractor) extractPython(source string, filePath string) ([]ExtractedNo
 // ---------- Rust extraction (regex; enough for use + fn + calls + metadata) ----------
 
 var (
-	rustFnRe     = regexp.MustCompile(`^(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*(\([^)]*\))\s*(?:->\s*([^{;]+))?`)
+	// Head matches up to (but not including) the parameter list; the params are
+	// extracted with a balanced-paren scan (rustFnHeadRe + readParenGroup) so
+	// nested parens in signatures (impl Fn(i32) -> i32, fn pointers) work.
+	rustFnHeadRe = regexp.MustCompile(`^(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?`)
 	rustStructRe = regexp.MustCompile(`^(pub(?:\s*\([^)]*\))?\s+)?(struct|enum|trait)\s+(\w+)`)
 	rustImplRe   = regexp.MustCompile(`^impl(?:\s*<[^>]*>)?\s+(?:(?:[\w:]+)\s+for\s+)?([\w]+)`)
 	rustUseRe    = regexp.MustCompile(`^use\s+(.+?);\s*$`)
@@ -540,10 +664,26 @@ func (e *Extractor) extractRust(source string, filePath string) ([]ExtractedNode
 			continue
 		}
 
-		if matches := rustFnRe.FindStringSubmatch(trimmed); len(matches) > 1 {
+		if matches := rustFnHeadRe.FindStringSubmatch(trimmed); len(matches) > 1 {
 			name := matches[1]
-			params := strings.TrimSpace(matches[2])
-			ret := strings.TrimSpace(matches[3])
+			// Balanced scan for the parameter list (supports nested parens like
+			// impl Fn(i32) -> i32 and fn-pointer parameter types).
+			params, after := readParenGroup(trimmed[len(matches[0]):])
+			if params == "" {
+				continue // no parameter list — not a function definition
+			}
+			// Return type: only when the remainder starts with -> (a `where`
+			// clause or attribute must not be mistaken for a return type).
+			ret := strings.TrimSpace(after)
+			if strings.HasPrefix(ret, "->") {
+				ret = strings.TrimSpace(strings.TrimPrefix(ret, "->"))
+				if i := strings.IndexAny(ret, "{;"); i >= 0 {
+					ret = ret[:i]
+				}
+				ret = strings.TrimSpace(ret)
+			} else {
+				ret = ""
+			}
 			endLine := findBraceEnd(lines, i)
 			body := extractBody(lines, i, endLine)
 			sig := params
@@ -590,24 +730,51 @@ func (e *Extractor) extractRust(source string, filePath string) ([]ExtractedNode
 				IsExported:    exported,
 				ReturnType:    retType,
 			})
-			// calls inside body
-			seen := map[string]bool{name: true}
-			for _, m := range rustCallRe.FindAllStringSubmatch(body, -1) {
-				if len(m) < 2 || seen[m[1]] || isRustKeyword(m[1]) {
-					continue
-				}
-				seen[m[1]] = true
-				edges = append(edges, ExtractedEdge{
-					SourceName: name,
-					TargetName: m[1],
-					Kind:       "calls",
-					File:       filePath,
-					Line:       lineNum,
-				})
-			}
+			// calls inside body — call-site line numbers (fallback path parity
+			// with the tree-sitter extractor).
+			appendCallEdges(&edges, filePath, name, lines, i, endLine, rustCallRe, map[string]bool{name: true}, isRustKeyword)
 		}
 	}
 	return nodes, edges
+}
+
+// readParenGroup scans s from its first '(' to the matching ')' (depth-aware,
+// honoring string literals) and returns the full parenthesized group plus the
+// remainder after it. Returns ("", "") when no group starts in s.
+func readParenGroup(s string) (group, rest string) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return "", ""
+	}
+	depth := 0
+	inString := byte(0)
+	for i := open; i < len(s); i++ {
+		ch := s[i]
+		if inString != 0 {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == inString {
+				inString = 0
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inString = ch
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[open : i+1], s[i+1:]
+			}
+		}
+	}
+	return "", ""
 }
 
 // splitRustUsePaths expands `use a::{b, c::d}` / `use a::b` into import specs.
@@ -756,64 +923,224 @@ func (e *Extractor) extractGeneric(source string, filePath string) ([]ExtractedN
 
 // ---------- helpers ----------
 
-// findBraceEnd finds the line where the matching closing brace is.
-func findBraceEnd(lines []string, start int) int {
-	depth := 0
-	inString := false
-	stringChar := byte(0)
+// maxBraceScanLines caps findBraceEnd's forward scan: an unterminated '{'
+// must not force a scan to EOF for every symbol of a pathological file
+// (CPU amplification). Past the budget the declaration line alone is
+// returned, like an unterminated block.
+const maxBraceScanLines = 20000
 
-	for i := start; i < len(lines) && i < start+500; i++ {
-		for j := 0; j < len(lines[i]); j++ {
-			ch := lines[i][j]
-			if inString {
-				if ch == '\\' {
-					j++ // skip escaped char
-					continue
-				}
-				if ch == stringChar {
-					inString = false
+// braceScanner is the shared line scanner behind findBraceEnd and
+// extractJSClassMethods: it tracks brace depth while ignoring braces inside
+// strings, comments and JS regex literals.
+type braceScanner struct {
+	depth          int
+	inString       bool
+	stringChar     byte
+	triple         bool // Python """ / ''' string
+	inLineComment  bool
+	inBlockComment bool
+}
+
+// scan advances the scanner over one line and reports whether the brace
+// depth dropped to zero inside it (i.e. the tracked block closed).
+func (s *braceScanner) scan(line string) bool {
+	s.inLineComment = false // comment state is per-line
+	for j := 0; j < len(line); j++ {
+		ch := line[j]
+		if s.inLineComment {
+			break // rest of the line is comment
+		}
+		if s.inBlockComment {
+			if ch == '*' && j+1 < len(line) && line[j+1] == '/' {
+				s.inBlockComment = false
+				j++
+			}
+			continue
+		}
+		if s.inString {
+			if s.triple {
+				if ch == s.stringChar && j+2 < len(line) && line[j+1] == s.stringChar && line[j+2] == s.stringChar {
+					s.inString = false
+					s.triple = false
+					j += 2
 				}
 				continue
 			}
-			if ch == '"' || ch == '\'' || ch == '`' {
-				inString = true
-				stringChar = ch
+			// Go raw strings (backticks) do not treat '\' as an escape:
+			// skipping the next char could swallow the closing backtick and
+			// leave the string open until EOF (must-fix).
+			if ch == '\\' && j+1 < len(line) && s.stringChar != '`' {
+				j++ // skip escaped char
 				continue
 			}
-			if ch == '{' {
-				depth++
-			} else if ch == '}' {
-				depth--
-				if depth == 0 {
-					return i + 1
-				}
+			if ch == s.stringChar {
+				s.inString = false
 			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			// Python triple-quoted strings: braces inside """...""" must
+			// not count as block braces (must-fix).
+			if j+2 < len(line) && line[j+1] == ch && line[j+2] == ch {
+				s.inString = true
+				s.stringChar = ch
+				s.triple = true
+				j += 2
+				continue
+			}
+			s.inString = true
+			s.stringChar = ch
+			s.triple = false
+			continue
+		}
+		if ch == '`' {
+			s.inString = true
+			s.stringChar = ch
+			s.triple = false
+			continue
+		}
+		if ch == '/' && j+1 < len(line) {
+			if line[j+1] == '/' {
+				s.inLineComment = true
+				j++
+				continue
+			}
+			if line[j+1] == '*' {
+				s.inBlockComment = true
+				j++
+				continue
+			}
+			// JS regex literal: braces inside /.../ are not block braces
+			// (must-fix). Division '/' is preceded by an operand and is not
+			// treated as a regex start.
+			if isRegexStart(line, j) {
+				j = scanRegexLiteral(line, j)
+				continue
+			}
+		}
+		if ch == '{' {
+			s.depth++
+		} else if ch == '}' && s.depth > 0 {
+			s.depth--
+			if s.depth == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isRegexStart reports whether the '/' at line[j] starts a JS regex literal
+// rather than a division. Heuristic: a '/' directly after an operand
+// (identifier, number, closing bracket/quote, or a ++/-- prefix) is division;
+// after operators, openers or at line start it is a regex literal.
+func isRegexStart(line string, j int) bool {
+	k := j - 1
+	for k >= 0 && (line[k] == ' ' || line[k] == '\t') {
+		k--
+	}
+	if k < 0 {
+		return true // start of line: regex
+	}
+	prev := line[k]
+	switch {
+	case prev >= 'a' && prev <= 'z', prev >= 'A' && prev <= 'Z', prev >= '0' && prev <= '9',
+		prev == '_', prev == '$', prev == ')', prev == ']', prev == '}',
+		prev == '\'', prev == '"', prev == '`':
+		return false // after an operand: division
+	case prev == '+' || prev == '-':
+		// a++ / b is division; + /re/ after an operator is a regex.
+		k2 := k - 1
+		for k2 >= 0 && (line[k2] == ' ' || line[k2] == '\t') {
+			k2--
+		}
+		if k2 >= 0 && (line[k2] == '+' || line[k2] == '-') {
+			return false // ++ / -- prefix: operand, so division
+		}
+		return true
+	}
+	return true
+}
+
+// scanRegexLiteral scans a JS regex literal starting at the '/' in line[j]
+// and returns the index of its closing '/'. Escapes and character classes
+// are honored; an unterminated regex consumes the rest of the line.
+func scanRegexLiteral(line string, j int) int {
+	inClass := false
+	for j++; j < len(line); j++ {
+		c := line[j]
+		if c == '\\' {
+			j++
+			continue
+		}
+		if c == '[' {
+			inClass = true
+			continue
+		}
+		if c == ']' {
+			inClass = false
+			continue
+		}
+		if c == '/' && !inClass {
+			return j
+		}
+	}
+	return j // unterminated: consume to end of line
+}
+
+// findBraceEnd finds the line where the matching closing brace is (returned
+// as the 1-based line of the closing brace, i.e. an exclusive end index).
+// Braces inside strings, char literals, line comments (//), block comments
+// (/* */) and JS regex literals are ignored, so a comment/string/regex
+// containing '{' or '}' can no longer truncate or stretch a symbol's range.
+// The forward scan is capped at maxBraceScanLines: an unterminated block
+// returns start+1 (the declaration line only) instead of scanning a
+// pathological file to EOF.
+func findBraceEnd(lines []string, start int) int {
+	sc := braceScanner{}
+	limit := start + maxBraceScanLines
+	if limit > len(lines) {
+		limit = len(lines)
+	}
+	for i := start; i < limit; i++ {
+		if sc.scan(lines[i]) {
+			return i + 1
 		}
 	}
 	return start + 1
 }
 
-// findIndentEnd finds the end of an indented block (Python).
+// findIndentEnd finds the end of an indented block (Python). Blank lines and
+// comment-only lines after the header are skipped when measuring the block's
+// base indent, so `def f():` followed by an empty line (or a docstring/comment
+// line) no longer collapses the body to a single line.
 func findIndentEnd(lines []string, start int) int {
 	if start+1 >= len(lines) {
 		return start + 1
 	}
 
-	baseIndent := countIndent(lines[start+1])
-	if baseIndent == 0 {
-		return start + 1
-	}
-
-	for i := start + 2; i < len(lines); i++ {
+	baseIndent := -1
+	for i := start + 1; i < len(lines); i++ {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if countIndent(lines[i]) < baseIndent {
-			return i
+		baseIndent = countIndent(lines[i])
+		if baseIndent == 0 {
+			return start + 1 // next statement is dedented — empty body
 		}
+		for j := i + 1; j < len(lines); j++ {
+			t := strings.TrimSpace(lines[j])
+			if t == "" || strings.HasPrefix(t, "#") {
+				continue
+			}
+			if countIndent(lines[j]) < baseIndent {
+				return j
+			}
+		}
+		return len(lines)
 	}
-	return len(lines)
+	return start + 1
 }
 
 func countIndent(line string) int {

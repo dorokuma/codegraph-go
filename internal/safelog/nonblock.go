@@ -1,6 +1,25 @@
 // Package safelog provides a non-blocking log writer and a slog-based logger
 // setup. The non-blocking writer prevents the process from freezing when
 // stderr is a pipe that nobody reads.
+//
+// Secret redaction (H1): SetupLogger wires two layers —
+//  1. a slog.ReplaceAttr that blanks whole values under sensitive keys
+//     (token/key/password/secret/authorization/cookie/api_key/session id/…,
+//     case-insensitive) and masks known secret shapes inside string values,
+//     error messages and the record message;
+//  2. a writer-level scrub so legacy log.Printf lines get the same shape
+//     masking.
+//
+// Known shapes: Bearer tokens, Basic auth, JWT (eyJ…), sk-/ghp_/github_pat_/
+// xoxb-/AKIA/AIza/stripe keys, PEM private key blocks, and key=value pairs
+// with sensitive names (db_password=…).
+//
+// Capability boundary: this is best-effort, not a guarantee. A secret that
+// matches no known shape AND appears under a non-sensitive key (e.g. a
+// random-looking 32-char string under "msg"), a purely numeric secret, or a
+// multi-line private key split across several legacy log writes can still
+// reach the log. Callers must not rely on safelog as the only line of
+// defense: avoid logging secrets at the source.
 package safelog
 
 import (

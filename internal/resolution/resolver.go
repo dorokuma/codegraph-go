@@ -42,7 +42,17 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 	for _, r := range batch {
 		ok, err := resolveOne(database, workdir, r)
 		if err != nil {
+			// A per-ref resolution error is a failure for THIS ref this pass:
+			// count it and park the ref as failed (failed rows are retried by
+			// later passes whenever a candidate name exists, so retry
+			// semantics are preserved and stats no longer under-report).
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
+			st.Failed++
+			tail := r.NameTail
+			if tail == "" {
+				tail = nameTail(r.ReferenceName)
+			}
+			_ = database.MarkUnresolvedFailed(r.ID, tail)
 			continue
 		}
 		if ok {
@@ -116,7 +126,8 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 			}
 			if len(callables) == 1 {
 				// Only accept a unique callable when supported by import closure,
-				// same-directory, or sibling-directory (same parent) proximity.
+				// same-directory, or direct-subdirectory proximity (the candidate
+				// lives inside a subdirectory of the caller's directory).
 				cdir := filepath.Dir(callables[0].File)
 				fromDir := filepath.Dir(fromFile)
 				if _, ok := FilterByImports(database, workdir, fromFile, lang, []db.Node{callables[0]}); ok {
@@ -249,6 +260,14 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		ok, err := resolveOne(database, workdir, r)
 		if err != nil {
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
+			st.Failed++
+			if r.Status == "pending" || r.Status == "" {
+				tail := r.NameTail
+				if tail == "" {
+					tail = nameTail(r.ReferenceName)
+				}
+				_ = database.MarkUnresolvedFailed(r.ID, tail)
+			}
 			continue
 		}
 		if ok {

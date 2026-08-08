@@ -2,10 +2,12 @@ package extraction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -89,10 +91,33 @@ func NewTreeSitterExtractor(language string) *TreeSitterExtractor {
 	return &TreeSitterExtractor{language: language, lang: lang}
 }
 
+// tsParseTimeout bounds a single tree-sitter parse so pathological/generated
+// files cannot pin a worker indefinitely (files are capped at maxIndexFileSize
+// but still CPU-heavy to parse). On timeout the error propagates to the caller
+// (orchestrator), which falls back to the regex extractor and, when that is
+// also empty, keeps the previous index (ErrKeepOldIndex) instead of wiping it.
+const tsParseTimeout = 30 * time.Second
+
+// ErrTSParseTimeout marks a tree-sitter parse that exceeded tsParseTimeout.
+// It is deliberately NOT a parse verdict: the regex fallback may yield
+// partial/noisy results, and the orchestrator keeps a good old index instead
+// of overwriting it with them (only files with no prior index get the weak
+// fallback written).
+var ErrTSParseTimeout = errors.New("tree-sitter parse timed out")
+
 // Extract parses the source code and returns nodes and edges using tree-sitter.
 // A parse failure returns a non-nil error so callers can fall back to the
 // regex extractor and/or keep the previous index instead of wiping it.
+//
+// The parse runs on a watchdog goroutine with a select timeout: smacker's
+// ParseCtx spawns its own goroutine that arms the parser's cancellation flag
+// when the passed context is done, and a deferred cancel() racing that
+// goroutine left the flag set on pooled parsers, corrupting subsequent parses
+// (node byte ranges beyond the source). The watchdog avoids a cancellable
+// context entirely; on timeout the parser is abandoned (never returned to the
+// pool — it may still be mid-parse) and the finalizers free it.
 func (e *TreeSitterExtractor) Extract(source string, filePath string) (ExtractResult, error) {
+	source = normalizeSource(source)
 	if e.lang == nil {
 		return ExtractResult{}, fmt.Errorf("tree-sitter: no grammar for language %q", e.language)
 	}
@@ -101,14 +126,33 @@ func (e *TreeSitterExtractor) Extract(source string, filePath string) (ExtractRe
 		return ExtractResult{}, fmt.Errorf("tree-sitter: no parser pool for language %q", e.language)
 	}
 	parser := pool.Get().(*sitter.Parser)
-	defer pool.Put(parser)
 
 	sourceBytes := []byte(source)
-	tree, err := parser.ParseCtx(context.Background(), nil, sourceBytes)
-	if err != nil {
-		return ExtractResult{}, fmt.Errorf("tree-sitter parse %s: %w", e.language, err)
+	type parseResult struct {
+		tree *sitter.Tree
+		err  error
 	}
-	defer tree.Close()
+	ch := make(chan parseResult, 1)
+	go func() {
+		t, err := parser.ParseCtx(context.Background(), nil, sourceBytes)
+		ch <- parseResult{tree: t, err: err}
+	}()
+
+	var tree *sitter.Tree
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			pool.Put(parser) // parse finished; parser is idle again
+			return ExtractResult{}, fmt.Errorf("tree-sitter parse %s: %w", e.language, r.err)
+		}
+		tree = r.tree
+	case <-time.After(tsParseTimeout):
+		// The parse goroutine still owns the parser: abandon it (never return
+		// it to the pool) and let the finalizers free parser and tree when the
+		// goroutine finishes. Callers fall back to the regex extractor / keep
+		// the old index.
+		return ExtractResult{}, fmt.Errorf("%w: %s after %s", ErrTSParseTimeout, e.language, tsParseTimeout)
+	}
 
 	root := tree.RootNode()
 
@@ -134,8 +178,15 @@ func (e *TreeSitterExtractor) Extract(source string, filePath string) (ExtractRe
 	case "lua":
 		nodes, edges = e.extractLua(root, sourceBytes, filePath)
 	default:
+		tree.Close() // free the C tree before the parser goes back to the pool
+		pool.Put(parser)
 		return ExtractResult{}, fmt.Errorf("tree-sitter: unsupported language %q", e.language)
 	}
+	// The parse goroutine finished (we received from ch), so the parser is
+	// idle and safe to return to the pool; the tree is closed first so the C
+	// tree memory is freed before its parser is reused.
+	tree.Close()
+	pool.Put(parser)
 	return promoteCallsToRefs(nodes, edges, filePath, e.language), nil
 }
 
@@ -368,6 +419,53 @@ func (e *TreeSitterExtractor) processGoTypeDecl(node *sitter.Node, source []byte
 			StartColumn:   int(spec.StartPoint().Column),
 			EndColumn:     int(spec.EndPoint().Column),
 		})
+		// Interface method signatures become first-class signature nodes so
+		// interface contracts are searchable and visible in the graph. They
+		// are NOT call targets (a bare method call must resolve to an
+		// implementation, never to the interface declaration).
+		if typeNode := spec.ChildByFieldName("type"); typeNode != nil && typeNode.Type() == "interface_type" {
+			e.processGoInterfaceMethods(typeNode, name, source, filePath, nodes)
+		}
+	}
+}
+
+// processGoInterfaceMethods extracts each method_elem of an interface_type as
+// a "signature" node (interface contracts have no body to call).
+func (e *TreeSitterExtractor) processGoInterfaceMethods(iface *sitter.Node, ifaceName string, source []byte, filePath string, nodes *[]ExtractedNode) {
+	for i := 0; i < int(iface.NamedChildCount()); i++ {
+		m := iface.NamedChild(i)
+		if m == nil || m.Type() != "method_elem" {
+			continue
+		}
+		nameNode := m.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(source)
+		if name == "" {
+			continue
+		}
+		sig := ""
+		if params := m.ChildByFieldName("parameters"); params != nil {
+			sig = params.Content(source)
+		}
+		if result := m.ChildByFieldName("result"); result != nil {
+			sig = strings.TrimSpace(sig + " " + result.Content(source))
+		}
+		*nodes = append(*nodes, ExtractedNode{
+			Kind:          "signature",
+			Name:          name,
+			File:          filePath,
+			Line:          int(m.StartPoint().Row) + 1,
+			EndLine:       int(m.EndPoint().Row) + 1,
+			Language:      "go",
+			QualifiedName: ifaceName + "." + name,
+			Signature:     sig,
+			Visibility:    goVisibility(name),
+			IsExported:    goIsExported(name),
+			StartColumn:   int(m.StartPoint().Column),
+			EndColumn:     int(m.EndPoint().Column),
+		})
 	}
 }
 
@@ -425,37 +523,47 @@ func (e *TreeSitterExtractor) findCalls(node *sitter.Node, source []byte, filePa
 }
 
 func (e *TreeSitterExtractor) processImport(node *sitter.Node, source []byte, filePath string, edges *[]ExtractedEdge) {
-	// Go import_declaration has an import_spec child with a string literal
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "import_spec" {
-			// Get the path string literal
-			pathNode := child.ChildByFieldName("path")
-			if pathNode == nil {
-				// Try first child
-				for j := 0; j < int(child.ChildCount()); j++ {
-					c := child.Child(j)
-					if c.Type() == "interpreted_string_literal" {
-						pathNode = c
-						break
+	// Go import_declaration has an import_spec child with a string literal for
+	// single-line imports (`import "fmt"`). Multi-line import blocks nest the
+	// specs under import_spec_list (`import ( ... )`), so walk the subtree
+	// recursively to cover both forms.
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			switch child.Type() {
+			case "import_spec":
+				// Get the path string literal
+				pathNode := child.ChildByFieldName("path")
+				if pathNode == nil {
+					// Try first child
+					for j := 0; j < int(child.ChildCount()); j++ {
+						c := child.Child(j)
+						if c.Type() == "interpreted_string_literal" {
+							pathNode = c
+							break
+						}
 					}
 				}
-			}
-			if pathNode != nil {
-				importPath := pathNode.Content(source)
-				importPath = strings.Trim(importPath, "\"")
-				if importPath != "" {
-					*edges = append(*edges, ExtractedEdge{
-						SourceName: filePath,
-						TargetName: importPath,
-						Kind:       "imports",
-						File:       filePath,
-						Line:       int(node.StartPoint().Row) + 1,
-					})
+				if pathNode != nil {
+					importPath := pathNode.Content(source)
+					importPath = strings.Trim(importPath, "\"")
+					if importPath != "" {
+						*edges = append(*edges, ExtractedEdge{
+							SourceName: filePath,
+							TargetName: importPath,
+							Kind:       "imports",
+							File:       filePath,
+							Line:       int(node.StartPoint().Row) + 1,
+						})
+					}
 				}
+			case "import_spec_list":
+				walk(child)
 			}
 		}
 	}
+	walk(node)
 }
 
 // ---------- TypeScript/JavaScript extraction ----------
@@ -501,6 +609,11 @@ func (e *TreeSitterExtractor) walkJS(node *sitter.Node, source []byte, filePath 
 	case "import_statement":
 		e.processJSImport(node, source, filePath, edges)
 		return
+	case "call_expression":
+		// CommonJS require("x") / dynamic import("x") → imports edge.
+		e.processJSCallImport(node, source, filePath, edges)
+		// Fall through to the generic walk: calls inside the arguments (e.g.
+		// require(foo(…))) are still traversed below.
 	}
 
 	for i := 0; i < int(node.ChildCount()); i++ {
@@ -801,6 +914,46 @@ func (e *TreeSitterExtractor) processJSImport(node *sitter.Node, source []byte, 
 		File:       filePath,
 		Line:       int(node.StartPoint().Row) + 1,
 	})
+}
+
+// processJSCallImport records require("x") / import("x") as imports edges so
+// CommonJS projects (and dynamic-import call sites) get import closure even
+// though they are not import_statement nodes.
+func (e *TreeSitterExtractor) processJSCallImport(node *sitter.Node, source []byte, filePath string, edges *[]ExtractedEdge) {
+	funcNode := node.ChildByFieldName("function")
+	if funcNode == nil {
+		funcNode = node.Child(0)
+	}
+	if funcNode == nil {
+		return
+	}
+	isRequire := funcNode.Type() == "identifier" && funcNode.Content(source) == "require"
+	isDynamicImport := funcNode.Type() == "import"
+	if !isRequire && !isDynamicImport {
+		return
+	}
+	args := node.ChildByFieldName("arguments")
+	if args == nil {
+		return
+	}
+	for i := 0; i < int(args.ChildCount()); i++ {
+		ch := args.Child(i)
+		if ch.Type() != "string" && ch.Type() != "template_string" {
+			continue
+		}
+		importPath := strings.Trim(ch.Content(source), "\"'`")
+		if importPath == "" {
+			continue
+		}
+		*edges = append(*edges, ExtractedEdge{
+			SourceName: filePath,
+			TargetName: importPath,
+			Kind:       "imports",
+			File:       filePath,
+			Line:       int(node.StartPoint().Row) + 1,
+		})
+		return
+	}
 }
 
 // ---------- Python extraction ----------

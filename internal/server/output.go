@@ -23,6 +23,60 @@ const (
 	defaultSymbolMax = 40
 )
 
+// Server-side hard ceilings for client-supplied max/max_results arguments.
+// Pi/other hosts clamp on their side, but direct MCP clients bypass that, so
+// the server must bound every limit itself: an unbounded limit means an
+// unbounded SQL LIMIT, an unbounded rg buffer, or an unbounded JSON payload
+// (memory/CPU amplification, audit H2). Values are conservative — far above
+// any normal usage (a single tool result is truncated to defaultOutputChars
+// anyway) but small enough that a hostile request cannot drive the daemon's
+// RSS.
+const (
+	// search: global match cap (per-file cap is defaultSearchPerFile).
+	maxSearchResults = 500
+
+	// files: path listing cap.
+	maxFilesResults = 2000
+
+	// callers / callees / impact: symbol result cap.
+	maxSymbolResults = 200
+
+	// search_facts: result row cap.
+	maxFactsResults = 100
+
+	// communities: reported community cap (Louvain output).
+	maxCommunities = 100
+
+	// store_fact: maximum fact content bytes accepted for insert.
+	maxFactContentLen = 64 * 1024
+
+	// Facts echoed back in store_fact/search_facts responses: at most this
+	// many rows per target, and each row's content is truncated to
+	// maxFactContentShown bytes before marshaling (read-back LIMIT + cap).
+	maxFactsReadback    = 50
+	maxFactContentShown = 2000
+
+	// rg streaming: stop reading stdout after this many total bytes
+	// (line cap is per-action). Bounds the intermediate buffer before
+	// truncateOutput cuts the final payload.
+	rgMaxOutputBytes = 512 * 1024
+)
+
+// clampLimit normalizes a client-supplied limit: <=0 falls back to the
+// action default, values above the hard ceiling are cut to the ceiling.
+// Every action routes its max through this before use, so a negative or
+// absurdly large argument can never panic (negative slice index) or amplify
+// memory/CPU (audit critical #2, high H2).
+func clampLimit(v, def, hard int) int {
+	if v <= 0 {
+		return def
+	}
+	if v > hard {
+		return hard
+	}
+	return v
+}
+
 // truncateOutput cuts text to max bytes on a UTF-8 boundary and appends a hint.
 func truncateOutput(text string, max int) string {
 	if max <= 0 {

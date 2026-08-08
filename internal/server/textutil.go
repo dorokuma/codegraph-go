@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -114,6 +117,113 @@ func relativizeRgOutput(out string, projRoot string) string {
 		fmt.Fprintf(&b, "%s:%s\n", rel, parts[1])
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// rgOutputLines runs cmd (an rg invocation) with stdout piped and returns up
+// to maxLines lines / maxBytes bytes of output, reading streamingly so a
+// huge rg result never lands in memory whole (audit high: rg.Output() loads
+// everything before limitLines cuts it). Reading stops as soon as either cap
+// is hit and the process is killed; a killed process is reported as
+// truncated, not as an error.
+//
+// rg's exit code 1 (no matches) is not an error: it returns whatever lines
+// were read and a nil error. Any other exit (spawn failure, rg error, e.g.
+// a bad pattern on exit 2) is returned as err, matching the semantics the
+// callers previously got from Cmd.Output.
+//
+// Cleanup: after Start, every return path reaps the child via the deferred
+// Kill+Wait — a panic inside the read loop can no longer leave a zombie.
+// Kill runs before Wait: waiting on a child that is still writing into a
+// full stdout pipe would otherwise hang past the caller's ctx deadline
+// (CommandContext only kills on ctx cancel; a plain read error has no such
+// backstop).
+func rgOutputLines(cmd *exec.Cmd, maxLines, maxBytes int) (lines []string, truncated bool, err error) {
+	if maxLines <= 0 {
+		maxLines = 1 << 30
+	}
+	if maxBytes <= 0 {
+		maxBytes = 1 << 30
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, false, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, false, err
+	}
+	defer func() {
+		// Kill first: a child still blocked writing into a full pipe would
+		// make Wait hang until the caller's ctx kills it (or forever on a
+		// ctx-less call). Wait reaps, so no zombie is left even if the read
+		// loop above panicked. Both calls are no-ops when the child already
+		// exited and was waited on — errors are ignored.
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	br := bufio.NewReader(stdout)
+	var total int
+	for len(lines) < maxLines && total < maxBytes {
+		var line []byte
+		for {
+			frag, ferr := br.ReadSlice('\n')
+			line = append(line, frag...)
+			if len(line) > maxBytes {
+				// Pathological single line: over budget, stop entirely.
+				total += len(line)
+				truncated = true
+				break
+			}
+			if ferr == nil {
+				break
+			}
+			if ferr == bufio.ErrBufferFull {
+				continue // line longer than the read buffer; keep reading fragments
+			}
+			if len(line) > 0 {
+				s := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+				lines = append(lines, s)
+			}
+			if ferr == io.EOF {
+				goto done
+			}
+			// Read error (e.g. killed by context): kill the child first so
+			// Wait below cannot hang on a still-writing process, then surface
+			// the exit status.
+			_ = cmd.Process.Kill()
+			goto wait
+		}
+		if truncated {
+			break
+		}
+		total += len(line)
+		if len(line) > 0 {
+			s := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+			lines = append(lines, s)
+		}
+	}
+	if len(lines) >= maxLines || total >= maxBytes {
+		truncated = true
+	}
+done:
+	if truncated {
+		// We stopped early on purpose (line/byte cap): the deferred cleanup
+		// kills the child so it cannot keep writing into the pipe and reaps
+		// it; the exit status of a killed child is irrelevant here.
+		return lines, true, nil
+	}
+wait:
+	werr := cmd.Wait()
+	if werr != nil {
+		if ee, ok := werr.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			// rg's "no matches" exit: not an error.
+			return lines, false, nil
+		}
+		return lines, false, werr
+	}
+	return lines, false, nil
 }
 
 // countIndexedUnder returns the number of indexed files whose path is under the given root.

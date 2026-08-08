@@ -1,8 +1,9 @@
 module github.com/dorokuma/codegraph-go
 
-go 1.25.12
-
-toolchain go1.26.5
+// L4: go 降到依赖要求下限（现代 cgo-free sqlite / MCP go-sdk / x/sys 均要求
+// go 1.25.0，见 go list -m GoVersion），并去掉 toolchain go1.26.5 钉死：
+// 本机 1.26.5 继续直接用，低版本但 ≥1.25.0 的工具链无需再强制下载 1.26.5。
+go 1.25.0
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0

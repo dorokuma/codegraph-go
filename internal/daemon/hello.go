@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +25,10 @@ type ClientHello struct {
 	CodegraphClient int  `json:"codegraph_client"`
 	PID             int  `json:"pid"`
 	HostPID         *int `json:"hostPid"`
+	// Token carries the optional socket-auth token (audit high): when the
+	// daemon has CODEGRAPH_MCP_TOKEN set, a session without the matching
+	// token is dropped before it can issue any tool call. Never logged.
+	Token string `json:"token,omitempty"`
 }
 
 const (
@@ -69,12 +75,24 @@ func WriteClientHello(w io.Writer) error {
 		CodegraphClient: 1,
 		PID:             os.Getpid(),
 	}
+	if tok := MCPToken(); tok != "" {
+		ch.Token = tok
+	}
 	b, err := json.Marshal(ch)
 	if err != nil {
 		return err
 	}
 	_, err = w.Write(append(b, '\n'))
 	return err
+}
+
+// constantTimeTokenEqual compares two socket tokens without leaking content
+// through timing. Both sides are hashed first so even the length comparison
+// is constant-time over fixed-size digests.
+func constantTimeTokenEqual(a, b string) bool {
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
 // TryReadClientHello waits briefly (via conn read deadline) for a client-hello.

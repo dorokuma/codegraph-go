@@ -539,8 +539,15 @@ func TestToolStoreFactRejectsEscapes(t *testing.T) {
 	}
 
 	// Absolute path outside the project root.
-	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: outsideFile, Content: "c1"}); err == nil {
+	_, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: outsideFile, Content: "c1"})
+	if err == nil {
 		t.Fatal("expected error for absolute targetFile outside the project root")
+	}
+	// The error must not leak the project root (displayRoot renders it as a
+	// basename/relative form); echoing the client's own targetFile back is
+	// fine — that is their input, not host layout.
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("escape error leaked the absolute project root: %v", err)
 	}
 	// Relative ../ escape.
 	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "../outside.go", Content: "c2"}); err == nil {
@@ -549,8 +556,12 @@ func TestToolStoreFactRejectsEscapes(t *testing.T) {
 	// Symlink inside the root pointing outside (existing target file).
 	evil := filepath.Join(dir, "evil")
 	if err := os.Symlink(outsideDir, evil); err == nil {
-		if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "evil/secret.go", Content: "c3"}); err == nil {
+		_, _, serr := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "evil/secret.go", Content: "c3"})
+		if serr == nil {
 			t.Fatal("expected error for symlink escape (existing target)")
+		}
+		if strings.Contains(serr.Error(), dir) || strings.Contains(serr.Error(), outsideDir) {
+			t.Fatalf("symlink-escape error leaked an absolute path: %v", serr)
 		}
 		// Missing tail under the escaping symlink (future file) too.
 		if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{TargetFile: "evil/notyet.go", Content: "c4"}); err == nil {

@@ -68,13 +68,21 @@ func LoadConfig() Config {
 			if err := yaml.Unmarshal(data, &yamlCfg); err != nil {
 				log.Printf("config: parse %s: %v (ignoring file)", configPath, err)
 			} else if len(yamlCfg.Workdirs) > 0 {
-				cfg.Workdirs = yamlCfg.Workdirs
+				// L2: expand ~ and $VAR in config workdirs so `~/proj` and
+				// $PROJECT_ROOT resolve the way users expect.
+				cfg.Workdirs = make([]string, 0, len(yamlCfg.Workdirs))
+				for _, wd := range yamlCfg.Workdirs {
+					if wd = expandPath(wd); wd != "" {
+						cfg.Workdirs = append(cfg.Workdirs, wd)
+					}
+				}
 			}
 		}
 	}
 
 	// -workdir flag overrides: prepend to the list if not already present.
 	if cfg.Workdir != "" {
+		cfg.Workdir = expandPath(cfg.Workdir)
 		found := false
 		for _, wd := range cfg.Workdirs {
 			if wd == cfg.Workdir {
@@ -103,14 +111,43 @@ func LoadConfig() Config {
 	return cfg
 }
 
+// expandPath expands a leading "~" (or a bare "~") to $HOME and expands
+// environment variables ($VAR / ${VAR}) in config-supplied paths, so
+// `workdirs: [~/proj]` and $PROJECT_ROOT resolve the way users expect.
+// When $HOME is unresolvable the tilde is left as-is; unknown env vars
+// expand to "".
+func expandPath(p string) string {
+	if p == "" {
+		return p
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				p = home
+			} else {
+				p = filepath.Join(home, p[2:])
+			}
+		}
+	}
+	return os.ExpandEnv(p)
+}
+
 // ConfigPath resolves the config file path in the standard lookup order:
 // $CODEGRAPH_CONFIG, then ./codegraph-config.yaml, then
 // ~/.config/codegraph/config.yaml. It returns "" when no config file exists.
+// A $CODEGRAPH_CONFIG pointing at a missing file is skipped (L1) instead of
+// being returned as-is, so callers never chase a dead path.
 // An explicit -config flag is handled by LoadConfig; pass its value through
 // when non-empty (see WorkdirAllowlist).
 func ConfigPath() string {
 	if p := os.Getenv("CODEGRAPH_CONFIG"); p != "" {
-		return p
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		// L1: used to be returned as-is, so every caller logged a read error
+		// and fell back anyway — misleading when troubleshooting. Skip it and
+		// continue the default lookup.
+		log.Printf("config: $CODEGRAPH_CONFIG=%s does not exist; skipping and continuing the default lookup", p)
 	}
 	if _, err := os.Stat("./codegraph-config.yaml"); err == nil {
 		return "./codegraph-config.yaml"
@@ -126,10 +163,10 @@ func ConfigPath() string {
 
 // WorkdirAllowlist returns the authority roots for workdir validation. The
 // config file is authoritative: when it exists and parses to a non-empty
-// workdirs list, those roots are returned as-is (they are canonicalized by
-// ValidateWorkdirs). Otherwise — no config file, unreadable or unparsable
-// file, or an empty workdirs list — the allowlist falls back to $HOME
-// (canonicalized), so workdirs outside $HOME are refused even without a
+// workdirs list, those roots are returned (expanded for ~ and $VAR, then
+// canonicalized by ValidateWorkdirs). Otherwise — no config file, unreadable
+// or unparsable file, or an empty workdirs list — the allowlist falls back to
+// $HOME (canonicalized), so workdirs outside $HOME are refused even without a
 // config file. When $HOME itself cannot be resolved the result is an empty
 // allowlist, whose semantics are "reject everything" (fail closed — see
 // ValidateWorkdirs).
@@ -146,7 +183,17 @@ func WorkdirAllowlist(configFile string) []string {
 				Workdirs []string `yaml:"workdirs"`
 			}
 			if err := yaml.Unmarshal(data, &yamlCfg); err == nil && len(yamlCfg.Workdirs) > 0 {
-				return yamlCfg.Workdirs
+				// L2: expand ~ and $VAR exactly like LoadConfig does, so the
+				// allowlist matches the expanded workdirs.
+				roots := make([]string, 0, len(yamlCfg.Workdirs))
+				for _, wd := range yamlCfg.Workdirs {
+					if wd = expandPath(wd); wd != "" {
+						roots = append(roots, wd)
+					}
+				}
+				if len(roots) > 0 {
+					return roots
+				}
 			}
 		}
 	}

@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,8 +78,15 @@ func (d *Daemon) Start() error {
 			}
 			continue
 		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			log.Printf("chmod socket %s: %v", path, err)
+		if err := chmodSocket(path, 0o600); err != nil {
+			// Audit medium: a socket left with broader permissions than 0600
+			// would let other users connect to a full-privilege MCP endpoint
+			// (read source, write facts). Failing the bind is safer than
+			// accepting on a mis-permissioned socket — the caller exits
+			// non-zero instead of continuing to Accept.
+			_ = ln.Close()
+			_ = os.Remove(path)
+			return fmt.Errorf("chmod socket %s: %w", path, err)
 		}
 		d.listener = ln
 		d.socketPath = path
@@ -202,19 +211,51 @@ func (d *Daemon) acceptLoop() {
 func (d *Daemon) serveConn(conn net.Conn) {
 	defer d.wg.Done()
 	defer conn.Close()
+	// Audit critical: an unrecovered panic in a session goroutine exits the
+	// whole process — every other session's MCP connection dies with it and
+	// the index writer disappears. Recover here so a panicking session (or
+	// transport hiccup) costs only that connection; the tool-dispatch layer
+	// (server.toolCodegraph) additionally converts per-tool panics into
+	// single-call errors so the session itself survives.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("daemon session panic (pid %d): %v\n%s", os.Getpid(), r, debug.Stack())
+		}
+	}()
 
 	if err := WriteHello(conn, d.socketPath); err != nil {
 		return
 	}
 
 	br := bufio.NewReader(conn)
-	_, leftover, _ := TryReadClientHello(conn, br)
+	chlo, leftover, ok := TryReadClientHello(conn, br)
+
+	// Optional socket token auth (audit high): when CODEGRAPH_MCP_TOKEN is
+	// set on the daemon, a session must present the matching token in its
+	// client hello. A session that never sent a hello (ok=false) cannot be
+	// authenticated and is dropped. The token itself never appears in any
+	// log line.
+	if tok := MCPToken(); tok != "" {
+		if !ok || !constantTimeTokenEqual(chlo.Token, tok) {
+			log.Printf("daemon: rejected connection on %s: missing or invalid socket token (pid %d)", d.socketPath, os.Getpid())
+			return
+		}
+	}
+
+	// Bound concurrent sessions: a local flood of connections must not
+	// exhaust fds/goroutines, and a pile of hung sessions must not block
+	// idle exit forever (audit medium). Reject beyond the cap before the
+	// session is counted.
+	if d.ClientCount() >= maxSessions {
+		log.Printf("daemon: rejected connection on %s: %d sessions active (max %d)", d.socketPath, d.ClientCount(), maxSessions)
+		return
+	}
 
 	var r io.Reader = br
 	if len(leftover) > 0 {
 		r = io.MultiReader(bytes.NewReader(leftover), br)
 	}
-	rwc := &sessionRWC{r: r, conn: conn}
+	rwc := &sessionRWC{r: r, conn: conn, idle: sessionIdleTimeout}
 
 	d.addClient(conn)
 	defer d.dropClient(conn)
@@ -284,15 +325,45 @@ func (d *Daemon) cleanupArtifacts() {
 	Deregister(d.root)
 }
 
+// chmodSocket applies the socket permission mask. A var so tests can inject
+// failures (audit medium: a chmod failure must abort Start, never accept on
+// an over-permissive socket).
+var chmodSocket = os.Chmod
+
+// maxSessions caps concurrent MCP sessions per daemon. Generous for real
+// use (one client per host agent); bounds fd/goroutine growth from a
+// connection flood and keeps idle-exit reachable (audit medium: no max
+// connection count before).
+const maxSessions = 64
+
+// sessionIdleTimeout is the per-session read/write idle deadline, refreshed
+// on every read/write. A client that goes silent (hung connection, no
+// traffic) is disconnected after this, dropping the session count so the
+// daemon's idle timer can eventually stop the process. Generous enough that
+// a legitimately idle MCP session is never cut: real sessions exchange
+// requests whenever the agent works.
+const sessionIdleTimeout = 30 * time.Minute
+
 // sessionRWC presents a net.Conn (+ optional pushed reader head) as ReadWriteCloser.
 type sessionRWC struct {
 	r    io.Reader
 	conn net.Conn
+	idle time.Duration
 }
 
-func (s *sessionRWC) Read(p []byte) (int, error)  { return s.r.Read(p) }
-func (s *sessionRWC) Write(p []byte) (int, error) { return s.conn.Write(p) }
-func (s *sessionRWC) Close() error                { return s.conn.Close() }
+func (s *sessionRWC) Read(p []byte) (int, error) {
+	if s.idle > 0 {
+		_ = s.conn.SetReadDeadline(time.Now().Add(s.idle))
+	}
+	return s.r.Read(p)
+}
+func (s *sessionRWC) Write(p []byte) (int, error) {
+	if s.idle > 0 {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.idle))
+	}
+	return s.conn.Write(p)
+}
+func (s *sessionRWC) Close() error { return s.conn.Close() }
 
 // RunAsDaemon is the CODEGRAPH_DAEMON_INTERNAL entry: acquire lock, start, wait.
 // onReady is called once the socket is listening (index/watcher start here).

@@ -50,7 +50,17 @@ func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir
 		b.WriteByte('\n')
 	}
 
-	b.WriteString(fmt.Sprintf("DB: %s (schema=%s)\n", database.Path(), db.SchemaRevision()))
+	// Show the DB path relative to the workdir — never the absolute path,
+	// which would leak host directory layout into agent-visible output
+	// (audit medium). Falls back to the basename when the DB lives outside
+	// the workdir.
+	dbPath := database.Path()
+	if rel := db.RelPath(workdir, dbPath); rel != "" && rel != dbPath && !filepath.IsAbs(rel) {
+		dbPath = rel
+	} else {
+		dbPath = filepath.Base(dbPath)
+	}
+	b.WriteString(fmt.Sprintf("DB: %s (schema=%s)\n", dbPath, db.SchemaRevision()))
 	need, old, rebuildErr := database.NeedsRebuildContext(ctx)
 	if rebuildErr != nil {
 		b.WriteString(fmt.Sprintf("Rebuild check failed: %v\n", rebuildErr))
