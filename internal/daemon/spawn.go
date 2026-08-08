@@ -23,20 +23,69 @@ var spawnDetachedFn = SpawnDetached
 // SpawnDetached launches this binary as the shared daemon for root.
 // Stdio goes to .codegraph/daemon.log; the child is in its own session.
 // opts may be nil.
-func SpawnDetached(root string, opts *SpawnOpts) error {
+// resolveDaemonBinary returns the path of this binary to spawn as the
+// detached daemon. It prefers os.Executable() — the real, resolved path of
+// the running client — so the daemon is always the same binary (same
+// version) as the client.
+//
+// The only exception is `go run` (and `go test`): there os.Executable()
+// points into a temporary build directory (/tmp/go-buildNNN/... on Linux,
+// the TMPDIR equivalent on macOS) that is removed when the run exits. A
+// daemon spawned from such a path would re-execute a dead file, so in that
+// dev scenario alone we fall back to the path the process was invoked with
+// (os.Args[0]).
+//
+// We must NOT unconditionally trust argv[0]. A workspace often contains a
+// stale build artifact named after the binary (e.g. ./codegraph-go left in
+// the repo root). When the client is started with a relative argv[0] from
+// such a directory, filepath.Abs(argv[0]) resolves to that stale artifact;
+// spawning it as the daemon splits daemon version from client version, the
+// MCP handshake version check fails forever, and the kill-stale-respawn
+// loop re-executes the same stale binary on every attempt.
+func resolveDaemonBinary() (string, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve executable: %w", err)
+		return "", fmt.Errorf("resolve executable: %w", err)
 	}
-	// Prefer the path we were invoked with when it's absolute (dev `go run` etc.).
+	argv0 := ""
 	if len(os.Args) > 0 {
-		if abs, aerr := filepath.Abs(os.Args[0]); aerr == nil {
+		argv0 = os.Args[0]
+	}
+	return resolveDaemonBinaryFrom(self, argv0), nil
+}
+
+// resolveDaemonBinaryFrom implements the binary selection policy given the
+// resolved executable path and the argv[0] the process was invoked with.
+// Split out so tests can exercise the policy without re-executing a binary.
+func resolveDaemonBinaryFrom(executable, argv0 string) string {
+	self := executable
+	if isGoRunTempPath(self) && argv0 != "" {
+		if abs, aerr := filepath.Abs(argv0); aerr == nil {
 			if st, serr := os.Stat(abs); serr == nil && !st.IsDir() {
 				self = abs
 			}
 		}
 	}
+	return self
+}
 
+// isGoRunTempPath reports whether p is the temporary build path `go run`
+// (or `go test`) uses for the binary, e.g.
+// /tmp/go-build1234567890/b001/exe/codegraph-go on Linux or the equivalent
+// under TMPDIR (like /var/folders/.../T/go-build...) on macOS. Such paths
+// are deleted when the run exits and must never be used to spawn a daemon.
+func isGoRunTempPath(p string) bool {
+	dir := filepath.Dir(p)
+	// go run places the binary at <tmp>/go-build<NNN>/<id>/exe/<name>.
+	return strings.HasSuffix(dir, string(filepath.Separator)+"exe") &&
+		strings.Contains(dir, string(filepath.Separator)+"go-build")
+}
+
+func SpawnDetached(root string, opts *SpawnOpts) error {
+	self, err := resolveDaemonBinary()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(CodeGraphDir(root), 0o700); err != nil {
 		return err
 	}
