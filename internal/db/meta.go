@@ -18,7 +18,12 @@ func stringsContainsNoSuchTable(err error) bool {
 // Bumped 16→17: index stores workdir-relative paths (portable; fixes affected).
 // Bumped 17→18: edges uniqueness now includes line+col (multi call-site edges);
 // old single-edge-per-pair indexes are stale and need wipe+rebuild.
-const IndexSchemaRevision = "18"
+// Bumped 18→19: 0.9.0 extractor semantics — Go interface methods as
+// kind=signature nodes, Go multi-line import edges, JS require() calls,
+// call-site line-number fixes, same-name disambiguation. Old rows are
+// wrong/incomplete under the new extractor, and content_hash skips
+// re-extraction of unchanged files, so the wipe+rebuild must be forced.
+const IndexSchemaRevision = "19"
 
 const metaSchemaKey = "index_schema_revision"
 

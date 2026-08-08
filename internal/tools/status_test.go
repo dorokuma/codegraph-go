@@ -18,7 +18,7 @@ func TestToolStatus(t *testing.T) {
 	database.UpsertFile("/a.go", 100, 1000.0)
 	database.UpsertFile("/b.go", 200, 2000.0)
 
-	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestToolStatusWithPendingFiles(t *testing.T) {
 	defer cleanup()
 
 	pending := []string{"/a.go", "/b.go"}
-	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, pending)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, pending, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -59,13 +59,44 @@ func TestToolStatusWithPendingFiles(t *testing.T) {
 	}
 }
 
+func TestToolStatusWithDroppedFiles(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil, 3)
+	if err != nil {
+		t.Fatalf("tool status: %v", err)
+	}
+
+	text := result.Content[0].Text
+	if !contains(text, "Dropped") {
+		t.Error("expected Dropped in output")
+	}
+	if !contains(text, "3 files") {
+		t.Error("expected 3 files in dropped")
+	}
+}
+
+func TestToolStatusZeroDroppedOmitsLine(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil, 0)
+	if err != nil {
+		t.Fatalf("tool status: %v", err)
+	}
+	if contains(result.Content[0].Text, "Dropped") {
+		t.Error("zero drops must not print a Dropped line")
+	}
+}
+
 func TestToolStatusWithFileCheck(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	database.UpsertFile("/workdir/main.go", 100, 1000.0)
 
-	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "main.go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "main.go"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -80,7 +111,7 @@ func TestToolStatusWithNonexistentFile(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "nonexistent.go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{Path: "nonexistent.go"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -108,7 +139,7 @@ func TestToolStatusPerRootWorkdirSelfReference(t *testing.T) {
 	workdir := "/repo/codegraph-go"
 
 	// Basename query (the real per-root failure case).
-	result, err := ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "codegraph-go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "codegraph-go"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -118,7 +149,7 @@ func TestToolStatusPerRootWorkdirSelfReference(t *testing.T) {
 
 	// The workdir itself, addressed absolutely or as ".", also indexed.
 	for _, p := range []string{workdir, "."} {
-		result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: p}, nil)
+		result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: p}, nil, 0)
 		if err != nil {
 			t.Fatalf("tool status(%q): %v", p, err)
 		}
@@ -128,7 +159,7 @@ func TestToolStatusPerRootWorkdirSelfReference(t *testing.T) {
 	}
 
 	// A path that is neither the workdir nor a stored key stays not indexed.
-	result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "nowhere"}, nil)
+	result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "nowhere"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -148,7 +179,7 @@ func TestToolStatusMainLibProjectPrefix(t *testing.T) {
 	database.UpsertFile("codegraph-go/internal/tools/status.go", 200, 2000.0)
 
 	workdir := "/root"
-	result, err := ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "codegraph-go"}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "codegraph-go"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}
@@ -157,7 +188,7 @@ func TestToolStatusMainLibProjectPrefix(t *testing.T) {
 	}
 
 	// Unrelated query still reports not indexed.
-	result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "somewhere-else"}, nil)
+	result, err = ToolStatus(context.Background(), database, []string{workdir}, workdir, StatusArgs{Path: "somewhere-else"}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}

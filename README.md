@@ -4,13 +4,13 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.9.0**. Index logic version **18**.
+Current version: **0.9.0**. Index logic version **19**.
 
-Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Logic bumps trigger a full rebuild.
+Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Extractor logic bumps raise the index schema revision: the daemon's first start after an upgrade detects the mismatch and automatically wipes + fully rebuilds the index (no manual step; see [Indexing](#indexing)).
 
 ## Features
 
-Alignment: steps **1–9** done incl. 7.5 (logic **18**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
+Alignment: steps **1–9** done incl. 7.5 (logic **19**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
 
 - **1 MCP tool `codegraph` (action router):** `action=explore` (PRIMARY), `node`, `search`, `callers`/`callees`/`impact`, `files`, `status`, `affected`/`communities`, `store_fact`/`search_facts`. Same capabilities as 0.7 multi-tool surface; one schema for lower prompt cost.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
@@ -47,7 +47,7 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 | Item | Value |
 |------|-------|
 | Display version | 0.9.0 |
-| Index logic | 18 |
+| Index logic | 19 |
 | Feature parity | **not claimed** (step 10 open) |
 
 Single source of truth: `/root/codegraph-go-comparison.md`.
@@ -119,6 +119,23 @@ On first run, codegraph-go indexes the entire project. The index includes:
 - **Edges:** calls, imports, extends, implements
 
 The file watcher automatically re-indexes changed files within 2 seconds.
+
+### Rebuilds
+
+Extractor logic changes (new node kinds, edge fixes, call-site corrections, …)
+make old rows wrong or incomplete, so they raise the index schema revision.
+On startup the daemon compares the on-disk revision against the binary's
+constant: a mismatch wipes the symbol index and rebuilds it in full, with no
+manual step. Upgrading to a release with new extraction semantics therefore
+rebuilds automatically on the first start after the upgrade — the rebuild
+runs inside the daemon while it holds the index lock, takes as long as the
+initial index, and queries may return partial results while it runs
+(`status` shows the pending rebuild).
+
+Incremental re-indexing only applies to files added or changed *after* that
+rebuild: the content_hash gate skips re-extraction of unchanged files, so an
+index built by older logic is never "self-healed" by incremental sync — only
+files whose content changes get re-extracted under the new semantics.
 
 ### Tree-sitter vs Regex
 

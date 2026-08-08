@@ -58,7 +58,7 @@ func TestToolStatusNoAbsoluteDBPath(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil)
+	result, err := ToolStatus(context.Background(), database, []string{"/workdir"}, "/workdir", StatusArgs{}, nil, 0)
 	if err != nil {
 		t.Fatalf("tool status: %v", err)
 	}

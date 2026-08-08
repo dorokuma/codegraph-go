@@ -9,9 +9,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestSchemaRevisionIs18(t *testing.T) {
-	if SchemaRevision() != "18" {
-		t.Fatalf("IndexSchemaRevision = %q, want 18", SchemaRevision())
+func TestSchemaRevisionIs19(t *testing.T) {
+	if SchemaRevision() != "19" {
+		t.Fatalf("IndexSchemaRevision = %q, want 19", SchemaRevision())
 	}
 }
 

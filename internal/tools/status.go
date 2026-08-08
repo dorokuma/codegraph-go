@@ -31,7 +31,10 @@ type ContentItem struct {
 // DB reads now accept context via Context variants; cancellation is supported.
 // workdirs is the full list of workspace roots (for broad-workdir detection);
 // workdir is the specific project root for this call.
-func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir string, args StatusArgs, pendingFiles []string) (*StatusResult, error) {
+// dropped is the watcher's permanent-drop count (paths discarded after the
+// sync retry budget was exhausted); surfaced here so silent index gaps are
+// observable (see Watcher.DroppedCount).
+func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir string, args StatusArgs, pendingFiles []string, dropped uint64) (*StatusResult, error) {
 	stats, err := database.GetStatsContext(ctx)
 	if err != nil {
 		return nil, err
@@ -70,6 +73,9 @@ func ToolStatus(ctx context.Context, database *db.DB, workdirs []string, workdir
 
 	if len(pendingFiles) > 0 {
 		b.WriteString(fmt.Sprintf("Pending: %d files\n", len(pendingFiles)))
+	}
+	if dropped > 0 {
+		b.WriteString(fmt.Sprintf("Dropped: %d files (sync retries exhausted; touch or re-index to re-enqueue)\n", dropped))
 	}
 
 	// Home-mode: list which projects are indexed under any workdir.

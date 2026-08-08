@@ -28,6 +28,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
   （./codegraph-config.yaml → ~/.config/codegraph/config.yaml），调用方
   不再追死路径；Pi 适配器同步该查找语义。
 - Display / daemon wire version **0.9.0**。
+- Index schema revision **18 → 19**：0.9.0 提取语义变更强制全量重建（见
+  Migration）。
 
 ### Fixed
 - Go 多行 import 在 tree-sitter 主路径丢失 imports 边。
@@ -48,7 +50,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Migration
 - `search` 迁移：需要正则匹配时显式传 `regex=true`；需要扫忽略文件时传
   `no_ignore=true`。
-- 提取器修复后建议重建索引以获得完整收益（增量索引会逐步自愈）。
+- **自动全量重建（schema rev 18 → 19，必须）**：0.9.0 的提取语义变更（Go
+  接口方法 `kind=signature` 节点、Go 多行 import 边、JS `require()` 调用、
+  调用边行号修正、同名符号跨文件消歧）使旧索引的节点/边过时；`content_hash`
+  增量门会跳过未变文件，旧语义不会随增量索引逐步自愈。本版本把 index
+  schema revision 从 18 抬到 19，升级到 0.9.0 后 daemon 首次启动检测到
+  revision 不匹配，自动清空符号索引并全量重建——无需任何手动操作。重建在
+  daemon 内持锁执行（期间查询可能返回部分结果），耗时与库规模相关（相当于
+  一次完整初始索引）；重建完成后 `status` 的 schema 显示为 19。
 
 ## [0.8.10] - 2026-08-07
 

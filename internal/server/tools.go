@@ -805,16 +805,19 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 	}
 	defer s.releaseProject(root)
 	var pendingFiles []string
-	// Pending files only apply to the default session watcher.
+	var dropped uint64
+	// Pending files and the permanent-drop count only apply to the default
+	// session watcher.
 	if root == s.Workdir {
 		if w := s.Watcher.Load(); w != nil {
 			pendingFiles = w.PendingFiles()
+			dropped = w.DroppedCount()
 		}
 	}
 
 	result, err := tools.ToolStatus(ctx, database, s.Workdirs, root, tools.StatusArgs{
 		Path: args.Path,
-	}, pendingFiles)
+	}, pendingFiles, dropped)
 	if err != nil {
 		return nil, nil, err
 	}

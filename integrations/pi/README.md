@@ -19,7 +19,11 @@ install -m 755 codegraph-go ~/.local/bin/codegraph-go
 install -m 644 integrations/pi/codegraph-go.ts ~/.pi/agent/extensions/codegraph-go.ts
 ```
 
-Restart Pi or `/reload`. **Requires codegraph-go ≥ 0.8.0** (MCP only exposes `codegraph`).
+Restart Pi or `/reload`. **Requires codegraph-go ≥ 0.9.0** (MCP only exposes
+`codegraph`; 0.9.0 changed `search` defaults — literal matching and
+`.gitignore`-aware by default, with `regex` / `no_ignore` opt-in flags — so
+older binaries cannot express the adapter's search semantics). Use the
+matching old adapter with 0.8.x binaries.
 
 ## Runtime configuration
 

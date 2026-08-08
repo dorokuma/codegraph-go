@@ -75,6 +75,18 @@ daemon_matches() {
   return 0
 }
 
+# Kill-state recorded at kill time, consumed by the artifact cleanup and
+# the daemons-registry cleanup below:
+#   KILLED_PID — last daemon pid this deploy killed (registry record match);
+#   KILLED_WDS  — every workdir whose daemon this deploy actually killed.
+# Artifact cleanup is scoped to exactly KILLED_WDS: never an unconditional
+# rm across both $ROOT/.codegraph and $CODEGRAPH_HOME — that deleted the
+# pidfile/socket of a LIVE daemon of an unrelated workdir when a client
+# respawned it concurrently during the deploy (the invisible-holder wedge,
+# see internal/daemon/recovery.go).
+KILLED_PID=""
+KILLED_WDS=""
+
 # Legacy known-pid stop: SIGTERM the pid recorded in the CODEGRAPH_HOME
 # pidfile, then a short window for it to exit. The pid is verified against
 # the FULL daemon predicate (daemon_matches) with the workdir implied by
@@ -89,7 +101,14 @@ PID=$(cat "$CODEGRAPH_HOME/daemon.pid" 2>/dev/null | grep -oE '"pid"[[:space:]]*
 if [ -n "$PID" ]; then
   LEGACY_WD="$(cd "$(dirname "$(dirname "$CODEGRAPH_HOME/daemon.pid")")" && pwd 2>/dev/null)"
   if daemon_matches "$PID" "$LEGACY_WD"; then
-    kill "$PID" 2>/dev/null && echo "killed daemon pid $PID" || echo "daemon already stopped"
+    if kill "$PID" 2>/dev/null; then
+      echo "killed daemon pid $PID"
+      # Record the workdir of the daemon this deploy killed; the artifact
+      # cleanup below removes pidfile/socket for exactly these workdirs.
+      KILLED_WDS="$KILLED_WDS $LEGACY_WD"
+    else
+      echo "daemon already stopped"
+    fi
   else
     echo "pid $PID does not match daemon predicate, skipping kill"
   fi
@@ -148,7 +167,6 @@ echo "=== 升级后强制重启 daemon ==="
 # WORKDIR was resolved in the stop section above (first existing pidfile
 # among the two candidate locations, else the repo root). It drives the
 # kill scan, the flock wait, the artifact cleanup, and the pre-warm spawn.
-KILLED_PID=""
 # Collect every daemon-mode codegraph process targeting WORKDIR, not just
 # the pidfile-recorded one: a deploy race can leave a live daemon whose
 # pidfile and socket dentry were already removed ("invisible flock holder")
@@ -214,6 +232,10 @@ for entry in $PIDS; do
       echo "daemon pid $PID exited"
     fi
     KILLED_PID="$PID"
+    # Record the workdir of this killed daemon — the artifact cleanup below
+    # is scoped to exactly these workdirs, never an unconditional rm of
+    # other locations (see cleanup block).
+    KILLED_WDS="$KILLED_WDS $PIDWD"
   else
     echo "pid $PID does not match daemon predicate (expected workdir $PIDWD), skipping kill"
   fi
@@ -221,7 +243,7 @@ done
 
 # Only now, after every target is dead, wait for the DB flock to be
 # released and confirm no daemon-mode process for WORKDIR remains BEFORE
-# removing artifacts. The unconditional rm here was the trigger of the
+# removing artifacts. The rm here used to be the trigger of the
 # invisible-holder wedge: deleting the pidfile/socket of a daemon that is
 # still running (mid-spawn, or not yet dead) makes it unreachable forever
 # while it keeps holding the flock.
@@ -240,10 +262,20 @@ if [ -z "$REMAINING" ]; then
   if [ "$flock_free" = "1" ]; then
     echo "daemon flock released"
   else
-    echo "WARN: flock still held after 10s (by a non-daemon process); removing daemon artifacts anyway — no daemon processes remain"
+    echo "WARN: flock still held after 10s (by a non-daemon process); removing killed daemons' artifacts anyway — no daemon processes remain"
   fi
-  rm -f "$ROOT/.codegraph/daemon.pid" "$ROOT/.codegraph/daemon.sock" \
-        "$CODEGRAPH_HOME/daemon.pid" "$CODEGRAPH_HOME/daemon.sock" 2>/dev/null || true
+  # Artifact cleanup is scoped to the workdirs of the daemons THIS deploy
+  # actually killed (KILLED_WDS, recorded at kill time) — never the old
+  # unconditional rm of both $ROOT/.codegraph and $CODEGRAPH_HOME, which
+  # deleted the pidfile/socket of a LIVE daemon of an unrelated workdir
+  # when a client respawned it concurrently during the deploy (the
+  # invisible-holder wedge). A workdir whose daemon was not killed keeps
+  # its files. A dead daemon's leftover files are stale and self-heal on
+  # the next spawn (RunAsDaemon: ClearStaleLock + socket rebind), and the
+  # pre-warm below writes fresh ones for WORKDIR.
+  for wd in $KILLED_WDS; do
+    rm -f "$wd/.codegraph/daemon.pid" "$wd/.codegraph/daemon.sock" 2>/dev/null || true
+  done
   # Project-scoped tmp socket cleanup: only THIS project's tmp-fallback
   # socket is removed (TMP_SOCK mirrors the Go-side projectHash for WORKDIR,
   # sha256(Clean(root))[:16]). Other projects' tmp sockets are left intact.
@@ -279,9 +311,12 @@ mkdir -p "$WORKDIR/.codegraph"
 # config.yaml），显式传入后 daemon 的完整 workdirs 列表不再依赖其 cwd（Go
 # spawn 的 daemon cwd 是 workdir 本身，裸 ./codegraph-config.yaml 查找会静默
 # 指向别的文件）。CODEGRAPH_CONFIG 本身也会经环境变量继承给 daemon。
+# $CODEGRAPH_CONFIG 指向不存在的文件时跳过（与 Go 端 ConfigPath 的 L1 行为
+# 对齐），继续默认候选查找——绝不把死路径传进 -config（否则预热 daemon 的
+# workdirs 列表与普通 client 的解析结果不一致）。
 # 故意不传 -no-sync：部署要的是默认同步 daemon，与普通 client 的 SpawnOpts 一致。
 DEPLOY_CFG=""
-if [ -n "${CODEGRAPH_CONFIG:-}" ]; then
+if [ -n "${CODEGRAPH_CONFIG:-}" ] && [ -f "$CODEGRAPH_CONFIG" ]; then
   DEPLOY_CFG="$CODEGRAPH_CONFIG"
 elif [ -f "$ROOT/codegraph-config.yaml" ]; then
   DEPLOY_CFG="$ROOT/codegraph-config.yaml"

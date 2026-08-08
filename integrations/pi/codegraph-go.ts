@@ -165,10 +165,22 @@ export type WorkdirDecision =
 
 /**
  * Pick indexing root.
- * - CODEGRAPH_GO_WORKDIR 优先
+ * - CODEGRAPH_GO_WORKDIR 强制覆盖最优先
+ * - config 文件 workdirs[0] 为「主 workdir」（统一决议，见下）
  * - 人在某个仓库里 → 用该仓库（更准）
  * - 人在 $HOME//root → 允许，cg-go home-mode 只扫项目目录
  * - 裸 /、/home、/Users → 拒绝（除非 ALLOW_BROAD）
+ *
+ * 统一 workdir 决议（方案 2）：config 文件 workdirs 非空时，所有会话无论
+ * cwd 在哪都决议到同一个 workdir（config 声明的第一个授权根），不再按 cwd
+ * 各自 spawn per-root daemon。原因：
+ * - 双 daemon flock 冲突：cwd=/root/codegraph-go 的会话会 spawn 独立的
+ *   per-root daemon，持有 /root/codegraph-go/.codegraph/codegraph.db 的
+ *   flock；主 daemon（workdir=/root）跨项目查询 path=codegraph-go 时要
+ *   打开子项目 db，撞锁报 "codegraph.db in use by another process"。
+ * - 索引数据单源：同一 workdir 决议 = 同一 daemon = 同一份索引，避免同一
+ *   目录被两个进程各建一份索引（.codegraph/ 互踩）。
+ * config 找不到/解析失败/列表为空时，才回退 cwd→git root→项目标记决议。
  */
 export function resolveWorkdir(cwd: string): WorkdirDecision {
 	const allowBroad = envFlag("CODEGRAPH_GO_ALLOW_BROAD")
@@ -185,6 +197,30 @@ export function resolveWorkdir(cwd: string): WorkdirDecision {
 			? "CODEGRAPH_GO_WORKDIR（家目录模式：只索引像项目的一级目录）"
 			: "CODEGRAPH_GO_WORKDIR"
 		return { ok: true, workdir: w, note }
+	}
+
+	// config 主 workdir（方案 2）：config workdirs 非空时统一决议到第一个
+	// 授权根，不再按 cwd 决议（消除 per-root daemon 与主 daemon 的双 daemon
+	// flock 冲突，索引数据单源）。expandPath 语义与 allowedRoots 一致：展开
+	// 为空（如 $UNSET_VAR）的项跳过，取第一个可用的。
+	const cfg = configFilePath()
+	if (cfg) {
+		const cfgWorkdirs = parseConfigWorkdirs(cfg)
+		for (const raw of cfgWorkdirs) {
+			const e = expandPath(raw)
+			if (!e) continue
+			const w = normPath(e)
+			if (!allowBroad && isFilesystemRoot(w)) {
+				return {
+					ok: false,
+					reason: `拒绝 workdir=${w}（系统根）。请用家目录或项目路径。`,
+				}
+			}
+			const note = isHomeDir(w)
+				? "config workdirs[0]（家目录模式：只索引像项目的一级目录）"
+				: "config workdirs[0]"
+			return { ok: true, workdir: w, note }
+		}
 	}
 
 	const start = normPath(cwd)
