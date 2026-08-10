@@ -14,7 +14,8 @@ Any MCP client (Grok, Pi, others) should call the Go server’s single tool **`c
 ```bash
 go build -o codegraph-go ./cmd/codegraph-go
 install -m 755 codegraph-go ~/.local/bin/codegraph-go
-# or /usr/local/bin/codegraph-go
+# Recommended: run ./deploy.sh from the repo root instead of manual install —
+# it installs to $HOME/.local/bin/codegraph-go and avoids stray copies elsewhere.
 
 install -m 644 integrations/pi/codegraph-go.ts ~/.pi/agent/extensions/codegraph-go.ts
 ```

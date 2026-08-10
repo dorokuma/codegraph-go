@@ -64,7 +64,8 @@ cd codegraph-go
 go build -o codegraph-go ./cmd/codegraph-go
 
 # Install
-cp codegraph-go /usr/local/bin/codegraph-go
+# Recommended: run ./deploy.sh — it installs to $HOME/.local/bin/codegraph-go.
+cp codegraph-go ~/.local/bin/codegraph-go
 ```
 
 ## Pi integration
