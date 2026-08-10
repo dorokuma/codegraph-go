@@ -3,6 +3,11 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Pi extension** (`integrations/pi/codegraph-go.ts`): child process lifecycle diagnostics no longer use `console.error`/`console.warn` on the host process (those writes corrupt Pi's TUI input row). Logs go to `~/.pi/agent/logs/codegraph-go.log` unless `CODEGRAPH_GO_DEBUG` is set; intentional stop and clean exit 0 stay quiet; unexpected non-zero exits still dump filtered stderr.
+
 ## [0.9.0] - 2026-08-08
 
 ### Added

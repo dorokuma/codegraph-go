@@ -22,8 +22,41 @@ import path from "node:path"
 
 const START_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_START_TIMEOUT_MS || 30000)
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEGRAPH_GO_REQUEST_TIMEOUT_MS || 120000)
-// 非 DEBUG 时保留最近多少行 stderr，进程退出时打出来排查（仍照常 drain 防管道阻塞）。
+// 非 DEBUG 时保留最近多少行 stderr，异常退出时写入日志文件（仍照常 drain 防管道阻塞）。
 const STDERR_KEEP_LINES = 20
+const DIAG_TAG = "codegraph-go"
+const DIAG_LOG_FILE = "codegraph-go.log"
+/** Cache log dir path after first successful ensure (avoids mkdir per line). */
+let diagLogPath: string | null = null
+
+/**
+ * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG may print.
+ * Otherwise append to ~/.pi/agent/logs/codegraph-go.log.
+ */
+function diagLog(msg: string): void {
+	const line = `[${DIAG_TAG}] ${msg}`
+	if (process.env.CODEGRAPH_GO_DEBUG) {
+		console.error(line)
+		return
+	}
+	try {
+		if (!diagLogPath) {
+			const dir = path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+			fs.mkdirSync(dir, { recursive: true })
+			diagLogPath = path.join(dir, DIAG_LOG_FILE)
+		}
+		fs.appendFileSync(diagLogPath, `${new Date().toISOString()} ${line}\n`)
+	} catch {
+		diagLogPath = null
+	}
+}
+
+/** Drop slog INFO/DEBUG; keep ERROR/WARN and unknown lines. */
+function isInterestingStderrLine(line: string): boolean {
+	if (/\blevel=INFO\b/i.test(line) || /"level"\s*:\s*"INFO"/i.test(line)) return false
+	if (/\blevel=DEBUG\b/i.test(line) || /"level"\s*:\s*"DEBUG"/i.test(line)) return false
+	return true
+}
 
 // ---- Output budget ---------------------------------------------------------
 // 目标：日常一次调用够用；真遇到超大结果才裁。
@@ -268,8 +301,8 @@ function configFilePath(): string | null {
 		// 时跳过，继续查本地/全局候选——env 指向死路径时仍能读到真实 config
 		// 的 workdirs，授权根不会被错误收窄成 $HOME。
 		if (fs.existsSync(env)) return env
-		console.warn(
-			`[codegraph-go] $CODEGRAPH_CONFIG=${env} 不存在，跳过并继续默认查找（与二进制 ConfigPath 一致）`,
+		diagLog(
+			`$CODEGRAPH_CONFIG=${env} 不存在，跳过并继续默认查找（与二进制 ConfigPath 一致）`,
 		)
 	}
 	const local = path.resolve("./codegraph-config.yaml")
@@ -306,8 +339,8 @@ function parseConfigWorkdirs(filePath: string): string[] {
 			/^---\s*$/m.test(data) || // 多文档分隔
 			/^[ \t]*[|>][-+]?\s*$/m.test(data) // 块标量指示符
 		) {
-			console.warn(
-				`[codegraph-go] config ${filePath} 含轻量解析器无法处理的 YAML 构造` +
+			diagLog(
+				`config ${filePath} 含轻量解析器无法处理的 YAML 构造` +
 					`（锚点/别名/多文档/块标量），授权根按「config 不可解析」回退到 $HOME` +
 					`（与二进制 WorkdirAllowlist 语义一致）`,
 			)
@@ -324,8 +357,8 @@ function parseConfigWorkdirs(filePath: string): string[] {
 					if (/[{}]/.test(flow[1])) {
 						// flow mapping 嵌在列表里（workdirs: [/a, {b: c}]）——无法解析，
 						// 整体回退，不猜子集。
-						console.warn(
-							`[codegraph-go] config ${filePath} 的 workdirs 含 flow mapping` +
+						diagLog(
+							`config ${filePath} 的 workdirs 含 flow mapping` +
 								`（{…}），轻量解析器不支持，回退到 $HOME`,
 						)
 						return []
@@ -353,7 +386,7 @@ function parseConfigWorkdirs(filePath: string): string[] {
 		}
 		return roots
 	} catch (e) {
-		console.warn(`[codegraph-go] 无法读取 config ${filePath}（${e}），授权根回退到 $HOME`)
+		diagLog(`无法读取 config ${filePath}（${e}），授权根回退到 $HOME`)
 		return []
 	}
 }
@@ -387,8 +420,8 @@ export function allowedRoots(): string[] {
 		// 与二进制 WorkdirAllowlist 完全一致地回退到 $HOME（Go 对「不可解析 /
 		// 空列表」的 config 文件同样是 $HOME 兜底），不静默放行、也不擅自收窄。
 		// 二进制侧的 ValidateWorkdirs 才是真正的授权校验。
-		console.warn(
-			`[codegraph-go] config ${cfg} 未解析出 workdirs，授权根回退到 $HOME（与二进制语义一致）`,
+		diagLog(
+			`config ${cfg} 未解析出 workdirs，授权根回退到 $HOME（与二进制语义一致）`,
 		)
 	}
 	const home = normPath(os.homedir())
@@ -614,10 +647,12 @@ class CodeGraphClient {
 	/** Server-provided instructions from the MCP initialize handshake (may be null). */
 	private serverInstructions: string | null = null
 	private starting: Promise<void> | null = null
-	/** 最近 N 行 stderr（固定容量缓冲），进程退出时用于排查。 */
+	/** 最近 N 行 stderr（固定容量缓冲），异常退出时写入诊断日志。 */
 	private stderrBuffer: string[] = []
 	/** 未以换行结尾的半行，等下一 chunk 拼上（chunk 边界可能切断一行）。 */
 	private stderrCarry = ""
+	/** stop()/替换旧进程时置 true，避免 exit 监听把预期关闭当成故障。 */
+	private intentionalClose = false
 	readonly workdir: string
 	readonly workdirNote: string
 
@@ -635,54 +670,95 @@ class CodeGraphClient {
 		return this.starting
 	}
 
-	private async doStart(): Promise<void> {
-		if (this.proc) {
-			try {
-				this.proc.kill()
-			} catch {
-				/* ignore */
-			}
-			this.proc = null
+	/** 摘监听后 kill；配合 shutDownProc 先 cleanup，避免 pending 悬挂。 */
+	private disposeProc(proc: ChildProcess): void {
+		this.intentionalClose = true
+		try {
+			proc.removeAllListeners("exit")
+			proc.removeAllListeners("error")
+		} catch {
+			/* ignore */
 		}
+		try {
+			proc.stdin?.end()
+		} catch {
+			/* ignore */
+		}
+		try {
+			proc.kill()
+		} catch {
+			/* ignore */
+		}
+	}
+
+	/** dispose + 清 stderr + reject pending（doStart 换进程 / stop 共用）。 */
+	private shutDownProc(): void {
+		if (!this.proc) return
+		this.disposeProc(this.proc)
+		this.clearStderrBuffer()
+		this.cleanup()
+	}
+
+	private pushStderrLine(line: string): void {
+		if (!line) return
+		this.stderrBuffer.push(line)
+		if (this.stderrBuffer.length > STDERR_KEEP_LINES) this.stderrBuffer.shift()
+	}
+
+	private async doStart(): Promise<void> {
+		if (this.proc) this.shutDownProc()
 
 		const bin = process.env.CODEGRAPH_GO_BIN || "codegraph-go"
+		this.intentionalClose = false
 		this.proc = spawn(bin, ["-workdir", this.workdir], {
 			stdio: ["pipe", "pipe", "pipe"],
 		})
 
-		// 按需模型：异常退出不做定时重启，只打印 stderr + cleanup；
-		// 下一次工具调用由 callTool 的「未初始化则 start()」自动拉起。
+		// 按需模型：异常退出只记诊断日志 + cleanup；下次 callTool 再 start。
+		// 禁止 console.*（污染 Pi TUI 输入行）。
 		this.proc.on("error", (err) => {
-			console.error(`[codegraph-go] process error: ${err.message}`)
-			this.dumpStderrBuffer()
+			if (!this.intentionalClose) {
+				diagLog(`process error: ${err.message}`)
+				this.dumpStderrBuffer(true)
+			} else {
+				this.clearStderrBuffer()
+			}
 			this.cleanup()
 		})
 
-		this.proc.on("exit", (code) => {
-			console.error(`[codegraph-go] process exited with code ${code}`)
-			this.dumpStderrBuffer()
+		this.proc.on("exit", (code, signal) => {
+			const intentional = this.intentionalClose
+			this.intentionalClose = false
+			if (intentional) {
+				this.clearStderrBuffer()
+				this.cleanup()
+				return
+			}
+			// 意外退出写文件一行（仍不 console）。0/null：proxy 断连或信号。
+			const clean = code === 0 || code === null
+			if (clean) {
+				diagLog(
+					`unexpected exit code=${code} signal=${signal ?? ""} (silent to TUI; next call will restart)`,
+				)
+				this.clearStderrBuffer()
+			} else {
+				diagLog(`process exited abnormally code=${code} signal=${signal ?? ""}`)
+				this.dumpStderrBuffer(true)
+			}
 			this.cleanup()
 		})
 
-		// Drain stderr so the child never blocks on a full pipe.
-		// DEBUG 模式直接透传；否则保留最近 N 行，进程退出时打印排查。
+		// Drain stderr（防管道堵）；DEBUG 透传，否则入环缓冲。
 		if (this.proc.stderr) {
 			this.proc.stderr.on("data", (chunk: Buffer | string) => {
 				const text = typeof chunk === "string" ? chunk : chunk.toString("utf8")
 				if (process.env.CODEGRAPH_GO_DEBUG) {
-					console.error(`[codegraph-go] ${text.trimEnd()}`)
+					diagLog(text.trimEnd())
 					return
 				}
 				const lines = (this.stderrCarry + text).split("\n")
 				this.stderrCarry = lines.pop() || ""
-				for (const line of lines) {
-					const trimmed = line.trimEnd()
-					if (!trimmed) continue
-					this.stderrBuffer.push(trimmed)
-					if (this.stderrBuffer.length > STDERR_KEEP_LINES) {
-						this.stderrBuffer.shift()
-					}
-				}
+				for (const line of lines) this.pushStderrLine(line.trimEnd())
 			})
 		}
 
@@ -718,8 +794,8 @@ class CodeGraphClient {
 		this.tools = listResult.tools || []
 		this.initialized = true
 
-		console.error(
-			`[codegraph-go] started workdir=${this.workdir} (${this.workdirNote}), ` +
+		diagLog(
+			`started workdir=${this.workdir} (${this.workdirNote}), ` +
 				`${this.tools.length} tools, out≤${OUTPUT_CHAR_CAP}c/${OUTPUT_LINE_CAP}L`,
 		)
 	}
@@ -783,23 +859,28 @@ class CodeGraphClient {
 		return this.serverInstructions
 	}
 
-	/** 打印最近 stderr（若有）并清空缓冲；error+exit 双触发不重复打印。 */
-	private dumpStderrBuffer(): void {
+	private flushStderrCarry(): void {
 		const tail = this.stderrCarry.trimEnd()
-		if (tail) {
-			this.stderrBuffer.push(tail)
-			if (this.stderrBuffer.length > STDERR_KEEP_LINES) {
-				this.stderrBuffer = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
-			}
-		}
+		if (tail) this.pushStderrLine(tail)
 		this.stderrCarry = ""
-		if (this.stderrBuffer.length === 0) return
-		const lines = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
-		console.warn(`[codegraph-go] last stderr before exit (${lines.length} lines):`)
-		for (const line of lines) {
-			console.warn(`[codegraph-go]   ${line}`)
-		}
+	}
+
+	private clearStderrBuffer(): void {
+		this.flushStderrCarry()
 		this.stderrBuffer = []
+	}
+
+	/** 异常退出写最近 stderr（滤 INFO/DEBUG）；force 时过滤空则回退末 5 行。 */
+	private dumpStderrBuffer(force = false): void {
+		this.flushStderrCarry()
+		if (this.stderrBuffer.length === 0) return
+		const all = this.stderrBuffer.slice(-STDERR_KEEP_LINES)
+		this.stderrBuffer = []
+		let lines = all.filter(isInterestingStderrLine)
+		if (lines.length === 0 && force) lines = all.slice(-5)
+		if (lines.length === 0) return
+		diagLog(`last stderr before exit (${lines.length} lines):`)
+		for (const line of lines) diagLog(`  ${line}`)
 	}
 
 	cleanup() {
@@ -813,11 +894,7 @@ class CodeGraphClient {
 	}
 
 	stop() {
-		if (this.proc) {
-			this.proc.stdin?.end()
-			this.proc.kill()
-			this.cleanup()
-		}
+		this.shutDownProc()
 	}
 }
 
@@ -837,7 +914,7 @@ async function startClientAt(
 		return { client }
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err)
-		console.error(`[codegraph-go] failed to start: ${msg}`)
+		diagLog(`failed to start: ${msg}`)
 		return { error: msg }
 	}
 }
@@ -890,7 +967,7 @@ export default function (pi: ExtensionAPI) {
 			return c
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err)
-			console.error(`[codegraph-go] on-demand start failed: ${msg}`)
+			diagLog(`on-demand start failed: ${msg}`)
 			return `codegraph-go 启动失败: ${msg}`
 		} finally {
 			lazyStartPromise = null
