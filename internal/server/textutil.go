@@ -14,6 +14,22 @@ import (
 	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
+// matchLineInNode returns the file line of the first pattern occurrence in the
+// indexed body. Name-only FTS hits keep the symbol start line.
+func matchLineInNode(n db.Node, pattern string) int {
+	if n.Line <= 0 {
+		n.Line = 1
+	}
+	if pattern == "" || n.Body == "" {
+		return n.Line
+	}
+	idx := strings.Index(n.Body, pattern)
+	if idx < 0 {
+		return n.Line
+	}
+	return n.Line + strings.Count(n.Body[:idx], "\n")
+}
+
 // isSimpleIdent reports whether s looks like a bare symbol name (no regex).
 func isSimpleIdent(s string) bool {
 	if s == "" {

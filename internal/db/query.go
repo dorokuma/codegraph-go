@@ -200,6 +200,21 @@ func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 	return scanFact(row)
 }
 
+// GetFactByHashAndTarget looks up a fact by content hash pinned to one
+// target. Same text on a different file/symbol is a different fact.
+func (d *DB) GetFactByHashAndTarget(hash, file, symbol string) (*Fact, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	row := d.conn.QueryRow(`
+		SELECT id, target_file, target_symbol, target_line, content, content_hash,
+			author, status, COALESCE(superseded_by,0), created_at, updated_at
+		FROM facts
+		WHERE content_hash = ? AND target_file = ? AND IFNULL(target_symbol, '') = IFNULL(?, '')
+	`, hash, file, nullString(symbol))
+	return scanFact(row)
+}
+
 // maxFactsByTarget caps GetFactsByTarget rows. A target can accumulate a
 // large pile of agent facts, each with content; loading all of them just to
 // show a few would balloon memory (the display layer caps separately). A var
@@ -1108,13 +1123,15 @@ func (d *DB) GetCallersWithKindContext(ctx context.Context, nodeID int64) ([]Nod
 	defer d.mu.RUnlock()
 
 	rows, err := d.conn.QueryContext(ctx, `
-		SELECT n.id, n.kind, n.name, n.file, n.line, n.end_line, n.body, n.language,
+		SELECT n.id, n.kind, n.name, n.file,
+			CASE WHEN e.line > 0 THEN e.line ELSE n.line END,
+			n.end_line, n.body, n.language,
 			n.qualified_name, n.signature, n.docstring, n.start_column, n.end_column,
 			n.visibility, n.is_exported, n.return_type, e.kind
 		FROM edges e
 		JOIN nodes n ON n.id = e.source_id
 		WHERE e.target_id = ? AND e.kind IN `+structuralEdgeSQL+`
-		ORDER BY n.id LIMIT ?
+		ORDER BY n.id, e.line LIMIT ?
 	`, nodeID, graphQueryRowLimit)
 	if err != nil {
 		return nil, err

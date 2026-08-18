@@ -170,6 +170,21 @@ func TestGetCallersWithKind(t *testing.T) {
 	}
 }
 
+func TestGetCallersWithKindCallSiteLine(t *testing.T) {
+	database, _ := setupGraphDB(t)
+	nodes, _ := database.GetNodeByName("B")
+	callers, err := database.GetCallersWithKind(nodes[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 1 {
+		t.Fatalf("want 1 caller of B, got %d", len(callers))
+	}
+	if callers[0].Line != 5 {
+		t.Fatalf("want call-site line 5, got %d", callers[0].Line)
+	}
+}
+
 func TestGetCalleesWithKind(t *testing.T) {
 	db, _ := setupGraphDB(t)
 	nodes, _ := db.GetNodeByName("A")

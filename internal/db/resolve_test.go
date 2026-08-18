@@ -79,6 +79,23 @@ func TestStoragePathAndAbsPathRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPathUnderRootRelativeKeyVsAbsFilter(t *testing.T) {
+	wd := "/proj/root"
+	// Production index keys are workdir-relative.
+	if !PathUnderRoot("internal/server/tools.go", wd, filepath.Join(wd, "internal", "server")) {
+		t.Fatal("abs path= filter must match relative stored key")
+	}
+	if !PathUnderRoot("internal/server/tools.go", wd, "internal/server") {
+		t.Fatal("relative path= filter must match relative stored key")
+	}
+	if PathUnderRoot("internal/db/query.go", wd, "internal/server") {
+		t.Fatal("sibling dir must not match")
+	}
+	if !PathUnderRoot("internal/server/tools.go", wd, wd) {
+		t.Fatal("root==workdir is the whole tree")
+	}
+}
+
 // TestAbsPathJailsEscapes: relative storage keys that would escape workdir
 // (hand-crafted or malicious index rows) must be rejected with "" so callers
 // doing disk reads through AbsPath cannot be tricked out of the workspace.

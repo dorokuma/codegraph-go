@@ -89,7 +89,7 @@ func tokenSegments(token string) []string {
 //   - ambiguous simple names kept only when a co-named container matches
 //   - chain of ≥2 nodes renders a Flow block (acceptance: two related symbols)
 //   - root subtree filter (ExploreArgs.Path) applies to named seeds and spine hops
-func buildFlowFromNamedSymbols(ctx context.Context, database *db.DB, workdir, root, query string) flowResult {
+func buildFlowFromNamedSymbols(ctx context.Context, database *db.DB, workdir, root, query string, skipCode bool) flowResult {
 	empty := emptyFlow()
 	tokens := tokenizeExploreQuery(query)
 	if len(tokens) < 2 {
@@ -286,7 +286,11 @@ func buildFlowFromNamedSymbols(ctx context.Context, database *db.DB, workdir, ro
 		fmt.Fprintf(&b, "%d. %s (%s:%d)\n", i+1, step.node.Name, rel, step.node.Line)
 	}
 	b.WriteByte('\n')
-	b.WriteString("> Full source for these symbols is below — treat as already read; no need for external Read.\n\n")
+	if skipCode {
+		b.WriteString("> Locations and call trail only (skipCode); use node includeCode=true for a body.\n\n")
+	} else {
+		b.WriteString("> Full source for these symbols is below — treat as already read; no need for external Read.\n\n")
+	}
 
 	return flowResult{
 		Text:               b.String(),
@@ -381,14 +385,7 @@ func lastSegment(token string) string {
 
 // inExploreRoot reports whether file sits under root (or root is the whole workdir).
 func inExploreRoot(file, workdir, root string) bool {
-	if root == "" || root == workdir {
-		return true
-	}
-	prefix := root
-	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
-		prefix += string(filepath.Separator)
-	}
-	return file == root || strings.HasPrefix(file, prefix)
+	return db.PathUnderRoot(file, workdir, root)
 }
 
 // isLowValueExploreFile reports test/spec/generated noise for tiny-tier filtering.

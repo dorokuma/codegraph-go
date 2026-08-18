@@ -4,7 +4,7 @@ A Go MCP server for code intelligence with SQLite indexing and auto-sync.
 
 Based on [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) — official 8 MCP tools + `affected` extension.
 
-Current version: **0.9.0**. Index logic version **19**.
+Current version: **0.9.1**. Index logic version **19**.
 
 Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise failed refs → `SynthesizeAll` (callback / React / JSX / bridge / C fn-pointer / GoFrame). Nodes carry qualified_name / signature / visibility / is_exported / return_type. Vue/Svelte/Astro SFCs get a file component + script/frontmatter + template component refs. IndexAll uses a file-level worker pool (`CODEGRAPH_INDEX_WORKERS`). Optional shared daemon (one writer per project, N thin stdio proxies). Extractor logic bumps raise the index schema revision: the daemon's first start after an upgrade detects the mismatch and automatically wipes + fully rebuilds the index (no manual step; see [Indexing](#indexing)).
 
@@ -46,7 +46,7 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 
 | Item | Value |
 |------|-------|
-| Display version | 0.9.0 |
+| Display version | 0.9.1 |
 | Index logic | 19 |
 | Feature parity | **not claimed** (step 10 open) |
 

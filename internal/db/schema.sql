@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS facts (
     target_symbol TEXT,
     target_line INTEGER,
     content TEXT NOT NULL,
-    content_hash TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
     author TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     superseded_by INTEGER REFERENCES facts(id),
@@ -122,3 +122,6 @@ CREATE TABLE IF NOT EXISTS facts (
     CHECK(status IN ('active', 'superseded', 'retracted'))
 );
 CREATE INDEX IF NOT EXISTS idx_facts_target ON facts(target_file, target_symbol);
+-- Same note may hang on more than one symbol; uniqueness is per target.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_hash_target
+    ON facts(content_hash, target_file, IFNULL(target_symbol, ''));

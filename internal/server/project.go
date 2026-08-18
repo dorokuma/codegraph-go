@@ -65,7 +65,9 @@ func (s *Server) detectProject(queries ...string) string {
 
 	// Exact match against the base name.
 	for _, q := range queries {
-		q = strings.ToLower(strings.TrimSpace(q))
+		q = strings.ToLower(strings.TrimSpace(filepath.ToSlash(q)))
+		q = strings.TrimPrefix(q, "./")
+		q = strings.TrimRight(q, "/")
 		if q == "" {
 			continue
 		}
@@ -77,20 +79,70 @@ func (s *Server) detectProject(queries ...string) string {
 		}
 	}
 
-	// Fuzzy: check if any project name appears as a word in the query.
+	// Path prefix only: "myrepo/pkg" selects myrepo. A project name appearing
+	// as a word in a sentence ("compare this with prism") must not switch DBs.
 	for _, q := range queries {
-		q = strings.ToLower(strings.TrimSpace(q))
+		q = strings.ToLower(strings.TrimSpace(filepath.ToSlash(q)))
+		q = strings.TrimPrefix(q, "./")
+		q = strings.TrimRight(q, "/")
 		if q == "" {
 			continue
 		}
 		for _, fullPath := range dirs {
 			base := strings.ToLower(filepath.Base(fullPath))
-			if isWordIn(base, q) {
+			if strings.HasPrefix(q, base+"/") {
 				return fullPath
 			}
 		}
 	}
 	return ""
+}
+
+// stripDetectedProjectPrefix drops a leading project directory name from path
+// after detectProject consumed it as a home-mode selector (path=myrepo or
+// path=myrepo/pkg → "" / "pkg").
+func stripDetectedProjectPrefix(path, projectDir string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || projectDir == "" {
+		return path
+	}
+	base := filepath.Base(projectDir)
+	slash := strings.TrimPrefix(filepath.ToSlash(path), "./")
+	slash = strings.TrimRight(slash, "/")
+	if strings.EqualFold(slash, base) {
+		return ""
+	}
+	pref := base + "/"
+	if len(slash) > len(pref) && strings.EqualFold(slash[:len(pref)], pref) {
+		return slash[len(pref):]
+	}
+	return path
+}
+
+// adoptDetectedProject sets projectPath from home-mode path/selectors, then
+// strips the project name off any path-like fields so they are not re-parsed
+// as a subdirectory of that project (path=myrepo must not become myrepo/myrepo).
+func (s *Server) adoptDetectedProject(projectPath *string, strip []*string, extra ...string) {
+	if projectPath == nil || strings.TrimSpace(*projectPath) != "" {
+		return
+	}
+	var qs []string
+	for _, p := range strip {
+		if p != nil {
+			qs = append(qs, *p)
+		}
+	}
+	qs = append(qs, extra...)
+	found := s.detectProject(qs...)
+	if found == "" {
+		return
+	}
+	*projectPath = found
+	for _, p := range strip {
+		if p != nil {
+			*p = stripDetectedProjectPrefix(*p, found)
+		}
+	}
 }
 
 // resetDetect clears the detect cache so the next detectProject call rescans

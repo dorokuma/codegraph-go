@@ -616,11 +616,18 @@ func TestInsertFact(t *testing.T) {
 		t.Fatal("expected non-zero id")
 	}
 
-	// Duplicate hash should fail (UNIQUE constraint)
+	// Duplicate hash on the same target should fail (UNIQUE constraint)
 	f2 := *f
 	_, err = database.InsertFact(&f2)
 	if err == nil {
-		t.Fatal("expected error on duplicate hash")
+		t.Fatal("expected error on duplicate hash+target")
+	}
+	// Same text on a different symbol is allowed.
+	f3 := *f
+	f3.TargetFile = "beta.go"
+	f3.TargetSymbol = "Beta"
+	if _, err = database.InsertFact(&f3); err != nil {
+		t.Fatalf("same hash different target: %v", err)
 	}
 }
 

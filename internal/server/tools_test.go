@@ -458,6 +458,105 @@ func TestToolExplorePath(t *testing.T) {
 	}
 }
 
+func TestToolExploreQueryPathSubdir(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolExplore(context.Background(), nil, exploreArgs{
+		Query: "Delta",
+		Path:  "sub",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if strings.Contains(text, "no indexed symbols") {
+		t.Fatalf("query+path=sub must find relative-key Delta:\n%s", text)
+	}
+	if !strings.Contains(text, "Delta") {
+		t.Fatalf("expected Delta:\n%s", text)
+	}
+}
+
+func TestToolSearchMatchLine(t *testing.T) {
+	s, dir := setupToolServer(t)
+	body := "func Wrapper() {\n" + strings.Repeat("// pad\n", 13) + "\tneedle()\n}\n"
+	if _, err := s.Database.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "Wrapper", File: "wrap.go", Line: 1,
+		Body: body, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wrap.go"), []byte("package p\n"+body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "needle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "wrap.go:15") && !strings.Contains(text, "wrap.go:16") {
+		t.Fatalf("FTS search must print the body match line, got:\n%s", text)
+	}
+	if strings.TrimSpace(text) == "wrap.go:1" {
+		t.Fatal("printed definition line instead of match line")
+	}
+}
+
+func TestToolCallersCallSiteLine(t *testing.T) {
+	s, _ := setupToolServer(t)
+	result, _, err := s.toolCallers(context.Background(), nil, nameArgs{Name: "Beta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "alpha.go:3") {
+		t.Fatalf("callers must print call-site line 3, got:\n%s", text)
+	}
+}
+
+func TestToolExploreHomePathProject(t *testing.T) {
+	base := t.TempDir()
+	broadHome(t, base)
+	proj := filepath.Join(base, "myrepo")
+	writeProjectDir(t, proj)
+	if err := os.WriteFile(filepath.Join(proj, "alpha.go"), []byte("package p\nfunc Alpha() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	projDB, err := db.Open(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projDB.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "Alpha", File: "alpha.go", Line: 2,
+		Body: "func Alpha() {}", Language: "go",
+	}); err != nil {
+		projDB.Close()
+		t.Fatal(err)
+	}
+	if err := projDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	homeDB, err := db.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { homeDB.Close() })
+	s := &Server{Workdir: base, Workdirs: []string{base}, Database: homeDB}
+	result, _, err := s.toolExplore(context.Background(), nil, exploreArgs{
+		Query: "Alpha",
+		Path:  "myrepo",
+	})
+	if err != nil {
+		t.Fatalf("path=myrepo must not 404 after detectProject: %v", err)
+	}
+	text := textContent(result)
+	if strings.Contains(text, "no indexed symbols") {
+		t.Fatalf("expected Alpha under myrepo:\n%s", text)
+	}
+	if !strings.Contains(text, "Alpha") {
+		t.Fatalf("expected Alpha:\n%s", text)
+	}
+}
+
 func TestToolStoreFactHappyPath(t *testing.T) {
 	s, _ := setupToolServer(t)
 	result, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
@@ -483,22 +582,39 @@ func TestToolStoreFactDuplicate(t *testing.T) {
 	s, _ := setupToolServer(t)
 	// Store once
 	s.toolStoreFact(context.Background(), nil, storeFactArgs{
-		TargetFile: "alpha.go",
-		Content:    "Same content",
-		Author:     "agent1",
+		TargetFile:   "alpha.go",
+		TargetSymbol: "Alpha",
+		Content:      "Same content",
+		Author:       "agent1",
 	})
-	// Store same content again
+	// Same text on a different symbol is a new fact.
 	result, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
-		TargetFile: "beta.go",
-		Content:    "Same content",
-		Author:     "agent2",
+		TargetFile:   "beta.go",
+		TargetSymbol: "Beta",
+		Content:      "Same content",
+		Author:       "agent2",
 	})
 	if err != nil {
 		t.Fatalf("second store_fact: %v", err)
 	}
 	text := textContent(result)
-	if !strings.Contains(text, `"duplicate":true`) {
-		t.Fatalf("expected duplicate=true in response:\n%s", text)
+	if strings.Contains(text, `"duplicate":true`) {
+		t.Fatalf("same text on another target must not be duplicate:\n%s", text)
+	}
+	if !strings.Contains(text, "beta.go") {
+		t.Fatalf("expected beta.go fact:\n%s", text)
+	}
+	// Same target + same text is still a duplicate.
+	again, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile:   "alpha.go",
+		TargetSymbol: "Alpha",
+		Content:      "Same content",
+	})
+	if err != nil {
+		t.Fatalf("third store_fact: %v", err)
+	}
+	if !strings.Contains(textContent(again), `"duplicate":true`) {
+		t.Fatalf("expected duplicate=true for same target:\n%s", textContent(again))
 	}
 }
 

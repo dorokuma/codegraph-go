@@ -43,9 +43,13 @@ func TestDetectProjectBasic(t *testing.T) {
 	if got := s.detectProject("myrepo"); got != proj {
 		t.Fatalf("detectProject(myrepo) = %q, want %q", got, proj)
 	}
-	// Fuzzy word match.
-	if got := s.detectProject("please look at myrepo now"); got != proj {
-		t.Fatalf("detectProject fuzzy = %q, want %q", got, proj)
+	// Sentence mention must not switch projects (home-mode footgun).
+	if got := s.detectProject("please look at myrepo now"); got != "" {
+		t.Fatalf("detectProject sentence = %q, want empty", got)
+	}
+	// Path prefix still selects the project.
+	if got := s.detectProject("myrepo/internal"); got != proj {
+		t.Fatalf("detectProject path prefix = %q, want %q", got, proj)
 	}
 	// Case-insensitive exact match.
 	if got := s.detectProject("MyRepo"); got != proj {
@@ -54,6 +58,15 @@ func TestDetectProjectBasic(t *testing.T) {
 	// Non-project directory: no detection.
 	if got := s.detectProject("plain"); got != "" {
 		t.Fatalf("detectProject(plain) = %q, want empty", got)
+	}
+	if got := stripDetectedProjectPrefix("myrepo", proj); got != "" {
+		t.Fatalf("strip myrepo = %q, want empty", got)
+	}
+	if got := stripDetectedProjectPrefix("myrepo/internal", proj); got != "internal" {
+		t.Fatalf("strip myrepo/internal = %q, want internal", got)
+	}
+	if got := stripDetectedProjectPrefix("myrepo/", proj); got != "" {
+		t.Fatalf("strip myrepo/ = %q, want empty", got)
 	}
 
 	// Cache semantics: after the first scan (DetectDone), removing the marker

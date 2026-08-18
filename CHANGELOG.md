@@ -5,8 +5,20 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-18
+
 ### Fixed
 - **Pi extension** (`integrations/pi/codegraph-go.ts`): child process lifecycle diagnostics no longer use `console.error`/`console.warn` on the host process (those writes corrupt Pi's TUI input row). Logs go to `~/.pi/agent/logs/codegraph-go.log` unless `CODEGRAPH_GO_DEBUG` is set; intentional stop and clean exit 0 stay quiet; unexpected non-zero exits still dump filtered stderr.
+- `path=` 过滤按 `StoragePath` 比较，生产相对 key 能对上绝对/相对子目录；home-mode `path=项目名`（含末尾 `/`）先选项目再剥前缀，不再 404。
+- `resolveDefs` 的 FTS 回退只留名字精确匹配，正文命中不再被当成定义走调用图。
+- 简单标识符 `search` 输出正文命中行，不再总是符号起点。
+- `callers` 打印边上的调用点行（`e.line`）；`callees` 仍用定义行。
+- 默认 `skipCode=true` 时不再声称「源码已包含 / 当 Read 过」；说明书同步。
+- `detectProject` 只认精确目录名或 `项目/子路径`，句子里出现项目名不再切库。
+- `store_fact` 去重改为 `(content_hash, target_file, symbol)`；同一句话可挂两个符号。旧库在 `ensureSchema` 迁唯一键，不抬 schema revision、不强制全量重建。
+
+### Changed
+- Display / daemon wire version **0.9.1**。
 
 ## [0.9.0] - 2026-08-08
 

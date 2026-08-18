@@ -209,6 +209,59 @@ func TestTrimExploreBody(t *testing.T) {
 	}
 }
 
+func TestResolveDefsRelativePathFilter(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	rel := "internal/server/tools.go"
+	if _, err := database.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "ToolExplore", File: rel, Line: 2,
+		Body: "func ToolExplore() {}", Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	defs, err := resolveDefs(ctx, database, "ToolExplore", "internal/server", "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 {
+		t.Fatalf("relative path filter: got %d defs", len(defs))
+	}
+	defs, err = resolveDefs(ctx, database, "ToolExplore", filepath.Join(dir, "internal", "server"), "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 {
+		t.Fatalf("abs path filter vs relative key: got %d defs", len(defs))
+	}
+}
+
+func TestResolveDefsFTSBodyNotDef(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	if _, err := database.UpsertNode(&db.Node{
+		Kind: db.KindFunction, Name: "toolSearch", File: "tools.go", Line: 10,
+		Body: "func toolSearch() {\n\tSearch()\n}\n", Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defs, err := resolveDefs(context.Background(), database, "Search", "", "", "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("body FTS hit must not become a def, got %v", defs)
+	}
+}
+
 func TestContainerMatches(t *testing.T) {
 	database, _, cleanup := seedGraph(t)
 	defer cleanup()

@@ -146,6 +146,24 @@ func StoragePath(workdir, path string) string {
 	return filepath.ToSlash(rel)
 }
 
+// PathUnderRoot reports whether file sits at root or in a descendant directory.
+// Both sides are compared as StoragePath keys so an absolute path= filter
+// matches workdir-relative index keys (and the reverse).
+func PathUnderRoot(file, workdir, root string) bool {
+	if root == "" || root == workdir {
+		return true
+	}
+	fileKey := StoragePath(workdir, file)
+	rootKey := StoragePath(workdir, root)
+	if rootKey == "" || rootKey == "." {
+		return true
+	}
+	if fileKey == rootKey {
+		return true
+	}
+	return strings.HasPrefix(fileKey, rootKey+"/")
+}
+
 // AbsPath joins a storage key (relative or absolute) under workdir for disk I/O.
 //
 // Relative keys are jailed inside workdir: a key that would escape (e.g. a

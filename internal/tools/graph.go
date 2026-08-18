@@ -369,13 +369,9 @@ func exploreOverview(ctx context.Context, database *db.DB, workdirs []string, wo
 
 	// Sample of indexed symbols in this subtree
 	if files, err := database.ListFilesContext(ctx); err == nil {
-		prefix := root
-		if !strings.HasSuffix(prefix, string(filepath.Separator)) {
-			prefix += string(filepath.Separator)
-		}
 		count := 0
 		for _, f := range files {
-			if f == root || strings.HasPrefix(f, prefix) {
+			if db.PathUnderRoot(f, workdir, root) {
 				count++
 			}
 		}
@@ -407,7 +403,7 @@ func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query str
 	}
 
 	// 1) Flow among named symbols (bag of tokens); same path/root as source gather.
-	flow := buildFlowFromNamedSymbols(ctx, database, workdir, root, query)
+	flow := buildFlowFromNamedSymbols(ctx, database, workdir, root, query, skipCode)
 
 	// 2) Gather symbols to show: flow spine/named first, then classic lookup.
 	nodes, err := gatherExploreNodes(ctx, database, workdir, root, query, flow, maxFiles*4)
@@ -453,7 +449,11 @@ func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query str
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Explore %q\n", query)
-	fmt.Fprintf(&b, "Matched %d symbol(s) across up to %d files. Source below is from the index — treat as already read.\n\n", len(nodes), maxFiles)
+	if skipCode {
+		fmt.Fprintf(&b, "Matched %d symbol(s) across up to %d files. Bodies omitted (skipCode); use node includeCode=true for a body.\n\n", len(nodes), maxFiles)
+	} else {
+		fmt.Fprintf(&b, "Matched %d symbol(s) across up to %d files. Source below is from the index — treat as already read.\n\n", len(nodes), maxFiles)
+	}
 
 	// Flow first (product reason to prefer explore over ad-hoc Read/Grep).
 	if flow.Text != "" {
@@ -646,7 +646,7 @@ func exploreQuery(ctx context.Context, database *db.DB, workdir, root, query str
 			fmt.Fprintf(&b, "- %s\n", db.RelPath(workdir, f))
 		}
 	}
-	if budget.IncludeCompletenessSignal {
+	if budget.IncludeCompletenessSignal && !skipCode {
 		b.WriteString("\nComplete source for the symbols above is included — treat as already read; prefer node only if you need one whole file.\n")
 	}
 	if budget.IncludeBudgetNote {
@@ -785,16 +785,16 @@ func resolveDefs(ctx context.Context, database *db.DB, name, pathFilter, fileHin
 		if err != nil {
 			return nil, err
 		}
-		// Keep exact name matches only from FTS noise
+		// Keep exact name matches only from FTS noise. Body hits are not
+		// definitions — leaving them in would make callers/callees/impact
+		// walk the wrong symbol with no rg-fallback marker.
 		var exact []db.Node
 		for _, n := range nodes {
 			if n.Name == name || strings.HasSuffix(n.Name, "."+name) {
 				exact = append(exact, n)
 			}
 		}
-		if len(exact) > 0 {
-			nodes = exact
-		}
+		nodes = exact
 	}
 
 	var defs []db.Node
@@ -802,19 +802,8 @@ func resolveDefs(ctx context.Context, database *db.DB, name, pathFilter, fileHin
 		if n.Kind == db.KindFile || n.Kind == "module" {
 			continue
 		}
-		if pathFilter != "" {
-			p := pathFilter
-			if !filepath.IsAbs(p) {
-				p = filepath.Join(workdir, p)
-			}
-			p = filepath.Clean(p)
-			prefix := p
-			if !strings.HasSuffix(prefix, string(filepath.Separator)) {
-				prefix += string(filepath.Separator)
-			}
-			if n.File != p && !strings.HasPrefix(n.File, prefix) {
-				continue
-			}
+		if pathFilter != "" && !db.PathUnderRoot(n.File, workdir, pathFilter) {
+			continue
 		}
 		if glob != "" {
 			rel := db.RelPath(workdir, n.File)

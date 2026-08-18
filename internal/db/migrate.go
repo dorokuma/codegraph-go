@@ -36,6 +36,11 @@ func (d *DB) ensureSchema() error {
 	if err := d.rebuildEdgesUniqueKey(); err != nil {
 		return err
 	}
+	// Same fact text may attach to more than one symbol; old DBs have a
+	// table-level UNIQUE(content_hash) that blocks that.
+	if err := d.rebuildFactsHashKey(); err != nil {
+		return err
+	}
 	if err := d.addMissingColumns("files", []colDef{
 		{"content_hash", "TEXT"},
 		{"language", "TEXT"},
@@ -387,6 +392,133 @@ func (d *DB) rebuildEdgesUniqueKey() (retErr error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return abort(fmt.Errorf("edges rebuild: commit: %w", err))
+	}
+	return nil
+}
+
+// uniqueIndexColumnSets returns the column list of every unique index on table.
+func (d *DB) uniqueIndexColumnSets(table string) ([][]string, error) {
+	rows, err := d.conn.Query(`PRAGMA index_list("` + table + `")`)
+	if err != nil {
+		return nil, fmt.Errorf("pragma index_list(%s): %w", table, err)
+	}
+	var uniq []string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("pragma index_list(%s): %w", table, err)
+		}
+		if unique != 0 {
+			uniq = append(uniq, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	var out [][]string
+	for _, name := range uniq {
+		cols, err := d.indexColumns(name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cols)
+	}
+	return out, nil
+}
+
+// rebuildFactsHashKey drops the old table-level UNIQUE(content_hash) and
+// installs UNIQUE(content_hash, target_file, IFNULL(target_symbol,”)) so the
+// same note can hang on more than one symbol. Idempotent: a DB that already
+// has idx_facts_hash_target is left alone.
+func (d *DB) rebuildFactsHashKey() (retErr error) {
+	exists, err := d.tableExists("facts")
+	if err != nil {
+		return fmt.Errorf("facts rebuild: probe table: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	sets, err := d.uniqueIndexColumnSets("facts")
+	if err != nil {
+		return fmt.Errorf("facts rebuild: probe unique indexes: %w", err)
+	}
+	globalHash := false
+	for _, cols := range sets {
+		if len(cols) == 1 && cols[0] == "content_hash" {
+			globalHash = true
+			break
+		}
+	}
+	if !globalHash {
+		// Fresh schema or already migrated. Make sure the per-target index exists.
+		if _, err := d.conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_hash_target
+			ON facts(content_hash, target_file, IFNULL(target_symbol, ''))`); err != nil {
+			return fmt.Errorf("facts rebuild: ensure idx_facts_hash_target: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := d.conn.Exec(`DROP TABLE IF EXISTS facts_new`); err != nil {
+		return fmt.Errorf("facts rebuild: drop stale facts_new: %w", err)
+	}
+	if _, err := d.conn.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("facts rebuild: disable foreign_keys: %w", err)
+	}
+	defer func() {
+		if _, err := d.conn.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%v (additionally failed to re-enable foreign_keys: %w)", retErr, err)
+			} else {
+				retErr = fmt.Errorf("facts rebuild: re-enable foreign_keys: %w", err)
+			}
+		}
+	}()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("facts rebuild: begin tx: %w", err)
+	}
+	abort := func(cause error) error {
+		_ = tx.Rollback()
+		_, _ = d.conn.Exec(`DROP TABLE IF EXISTS facts_new`)
+		return cause
+	}
+	for _, q := range []string{
+		`CREATE TABLE facts_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			target_file TEXT NOT NULL,
+			target_symbol TEXT,
+			target_line INTEGER,
+			content TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			author TEXT,
+			status TEXT NOT NULL DEFAULT 'active',
+			superseded_by INTEGER REFERENCES facts_new(id),
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			CHECK(status IN ('active', 'superseded', 'retracted'))
+		)`,
+		`INSERT INTO facts_new (id, target_file, target_symbol, target_line, content, content_hash,
+			author, status, superseded_by, created_at, updated_at)
+		 SELECT id, target_file, target_symbol, target_line, content, content_hash,
+			author, status, superseded_by, created_at, updated_at
+		 FROM facts`,
+		`DROP TABLE facts`,
+		`ALTER TABLE facts_new RENAME TO facts`,
+		`CREATE INDEX IF NOT EXISTS idx_facts_target ON facts(target_file, target_symbol)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_hash_target
+			ON facts(content_hash, target_file, IFNULL(target_symbol, ''))`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return abort(fmt.Errorf("facts rebuild: %w", err))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return abort(fmt.Errorf("facts rebuild: commit: %w", err))
 	}
 	return nil
 }

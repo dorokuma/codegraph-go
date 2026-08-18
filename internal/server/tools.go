@@ -174,7 +174,7 @@ func NewMCPServer(s *Server) *mcp.Server {
 			"Actions: explore, search(pattern), files(pattern), node(file|name), callers/callees/impact(name), " +
 			"status, affected(files), communities, store_fact, search_facts. " +
 			"Common: path (home-mode project), projectPath (absolute), max, glob. " +
-			"Treat explore/node source as already Read.",
+			"explore skipCode defaults true (no bodies); set skipCode=false or node includeCode=true to read source.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -321,11 +321,7 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	// operations, absurd values would amplify memory/CPU (audit critical #2,
 	// H2). The final payload is truncated to defaultOutputChars regardless.
 	args.MaxResults = clampLimit(args.MaxResults, defaultSearchGlobal, maxSearchResults)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Pattern, args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	projRoot, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -335,11 +331,11 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	// Official CodeGraph search is symbol-first. For a plain identifier with no
 	// path/glob/regex metacharacters, hit FTS before spawning rg.
 	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && !args.Regex && isSimpleIdent(args.Pattern) {
-		nodes, err := database.FullTextSearchRefsContext(ctx, args.Pattern, args.MaxResults)
+		nodes, err := database.FullTextSearchContext(ctx, args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
 			for _, n := range nodes {
-				fmt.Fprintf(&b, "%s:%d\n", db.RelPath(projRoot, n.File), n.Line)
+				fmt.Fprintf(&b, "%s:%d\n", db.RelPath(projRoot, n.File), matchLineInNode(n, args.Pattern))
 			}
 			text := truncateOutput(b.String(), defaultOutputChars)
 			text = s.addStalenessWarning(text)
@@ -416,11 +412,7 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	// Clamp: a negative max previously reached lines[:args.Max] and panicked
 	// (audit critical #2); an unbounded max would load the whole rg output.
 	args.Max = clampLimit(args.Max, defaultFilesMax, maxFilesResults)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	root, _, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -540,11 +532,7 @@ func (s *Server) toolExplore(ctx context.Context, _ *mcp.CallToolRequest, args e
 	if args.SkipCode != nil {
 		skipCode = *args.SkipCode
 	}
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Query, args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -582,11 +570,7 @@ func (s *Server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name, args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -615,11 +599,7 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name, args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -702,11 +682,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		return nil, nil, fmt.Errorf("name is required")
 	}
 	args.MaxResults = clampLimit(args.MaxResults, defaultSymbolMax, maxSymbolResults)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name, args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	projRoot, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -747,11 +723,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 func (s *Server) toolNode(ctx context.Context, _ *mcp.CallToolRequest, args nodeArgs) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Name, args.File); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.File})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -874,11 +846,7 @@ func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, ar
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	args.Max = clampLimit(args.Max, 20, maxCommunities)
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Path); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -921,11 +889,7 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		return nil, nil, fmt.Errorf("content too large: %d bytes (max %d)", len(args.Content), maxFactContentLen)
 	}
 
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Path, args.TargetFile); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path, &args.TargetFile})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
@@ -968,8 +932,8 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	h := sha256.Sum256([]byte(args.Content))
 	hash := hex.EncodeToString(h[:])
 
-	// Check duplicate by hash
-	existing, err := database.GetFactByHash(hash)
+	// Duplicate only when this exact target already has the same text.
+	existing, err := database.GetFactByHashAndTarget(hash, targetFile, args.TargetSymbol)
 	if err != nil {
 		return nil, nil, fmt.Errorf("check hash: %w", err)
 	}
@@ -1004,7 +968,7 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		}
 	}
 
-	inserted, _ := database.GetFactByHash(hash)
+	inserted, _ := database.GetFactByHashAndTarget(hash, targetFile, args.TargetSymbol)
 	sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
 
 	resp := map[string]interface{}{
@@ -1076,11 +1040,7 @@ func truncateFactContent(content string) string {
 func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, args searchFactsArgs) (*mcp.CallToolResult, any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if args.ProjectPath == "" {
-		if p := s.detectProject(args.Path, args.TargetFile); p != "" {
-			args.ProjectPath = p
-		}
-	}
+	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path, &args.TargetFile})
 	root, database, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)

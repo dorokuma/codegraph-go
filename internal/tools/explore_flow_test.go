@@ -188,6 +188,31 @@ func TestExploreSingleSymbolStillHasSource(t *testing.T) {
 	}
 }
 
+func TestExploreSkipCodeDoesNotClaimSourceIncluded(t *testing.T) {
+	database, dir, cleanup := seedGraph(t)
+	defer cleanup()
+	for i := 0; i < 500; i++ {
+		if err := database.UpsertFile(fmt.Sprintf("pad/%d.go", i), 1, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	text, err := ToolExplore(context.Background(), database, []string{dir}, dir, ExploreArgs{
+		Query: "foo", SkipCode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "Complete source") {
+		t.Fatalf("skipCode must not claim complete source:\n%s", text)
+	}
+	if strings.Contains(text, "Source below is from the index") {
+		t.Fatalf("skipCode must not say source is included:\n%s", text)
+	}
+	if !strings.Contains(text, "Bodies omitted") && !strings.Contains(text, "skipCode") {
+		t.Fatalf("expected skipCode notice:\n%s", text)
+	}
+}
+
 func TestExploreFlowRespectsPath(t *testing.T) {
 	dir := t.TempDir()
 	database, err := db.Open(dir)
