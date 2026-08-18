@@ -187,6 +187,68 @@ func (d *DB) InsertFact(f *Fact) (int64, error) {
 	return result.LastInsertId()
 }
 
+// InsertFactSuperseding inserts f and, when supersedes != 0, marks that
+// existing fact superseded by the new row. Both writes share one transaction
+// so a failed supersede does not leave an orphan insert.
+func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
+	if f == nil {
+		return 0, fmt.Errorf("insert fact: nil fact")
+	}
+	if supersedes == 0 {
+		return d.InsertFact(f)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("insert fact superseding: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	result, err := tx.Exec(`
+		INSERT INTO facts (target_file, target_symbol, target_line, content, content_hash,
+			author, status, superseded_by, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, f.TargetFile, nullString(f.TargetSymbol), nullInt(f.TargetLine),
+		f.Content, f.ContentHash, nullString(f.Author),
+		statusOrDefault(f.Status), nullInt64(f.SupersededBy), now, now)
+	if err != nil {
+		return 0, fmt.Errorf("insert fact: %w", err)
+	}
+	newID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("insert fact id: %w", err)
+	}
+
+	var newStatus string
+	err = tx.QueryRow(`SELECT status FROM facts WHERE id = ?`, newID).Scan(&newStatus)
+	if err != nil {
+		return 0, fmt.Errorf("insert fact superseding: lookup new fact %d: %w", newID, err)
+	}
+	if newStatus != "active" {
+		return 0, fmt.Errorf("insert fact superseding: new fact %d is not active (status %q)", newID, newStatus)
+	}
+
+	upd, err := tx.Exec(`
+		UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
+		WHERE id = ? AND status = 'active'
+	`, newID, now, supersedes)
+	if err != nil {
+		return 0, fmt.Errorf("supersede fact: %w", err)
+	}
+	n, _ := upd.RowsAffected()
+	if n == 0 {
+		return 0, fmt.Errorf("fact %d not found or not active", supersedes)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("insert fact superseding: commit: %w", err)
+	}
+	return newID, nil
+}
+
 // GetFactByHash looks up a fact by its content hash. Returns nil when not found.
 func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 	d.mu.RLock()
@@ -531,6 +593,74 @@ func (d *DB) InsertUnresolvedRef(r *UnresolvedRef) (int64, error) {
 		return 0, fmt.Errorf("insert unresolved_ref: %w", err)
 	}
 	return result.LastInsertId()
+}
+
+// inboundParkKinds are symbol-level edges that CASCADE-delete when the
+// callee node is replaced. Structural kinds (contains, imports) are rebuilt
+// by the owning file and are not parked.
+var inboundParkKinds = []string{EdgeCalls, EdgeReferences, EdgeBridge, EdgeExtends, EdgeImplements}
+
+// refNameTail matches extraction.NameTail (last segment after . / # @).
+func refNameTail(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if i := strings.LastIndexAny(name, "./#@"); i >= 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return name
+}
+
+// ParkInboundRefsForFile writes pending unresolved_refs for edges that point
+// at nodes in file from a different file. Call this before ReplaceFileIndex
+// so CASCADE-deleted inbound edges can be rebuilt by ResolveForFiles.
+// Do not call this on a deleted file: the callee is gone, inbound edges
+// should disappear.
+func (d *DB) ParkInboundRefsForFile(file string) error {
+	if file == "" {
+		return nil
+	}
+	nodes, err := d.GetNodesByFile(file)
+	if err != nil {
+		return err
+	}
+	for _, target := range nodes {
+		if target.Kind == KindFile || target.Kind == "module" {
+			continue
+		}
+		incoming, err := d.GetIncomingEdges(target.ID, inboundParkKinds)
+		if err != nil {
+			return err
+		}
+		for _, e := range incoming {
+			src, err := d.GetNodeByID(e.SourceID)
+			if err != nil {
+				return err
+			}
+			if src == nil || src.File == file {
+				continue
+			}
+			refFile := e.File
+			if refFile == "" {
+				refFile = src.File
+			}
+			if _, err := d.InsertUnresolvedRef(&UnresolvedRef{
+				FromNode:      e.SourceID,
+				ReferenceName: target.Name,
+				ReferenceKind: e.Kind,
+				Line:          e.Line,
+				Col:           e.Col,
+				FilePath:      refFile,
+				Language:      src.Language,
+				Status:        "pending",
+				NameTail:      refNameTail(target.Name),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // CountUnresolvedRefs returns how many unresolved_refs rows match status
@@ -1831,6 +1961,25 @@ func escapeFTS5Query(query string) string {
 	return strings.Join(parts, " ")
 }
 
+// ftsNameOrBodyQuery wraps escapeFTS5Query tokens so MATCH only hits the
+// name and body columns, not language (searching "go" must not match every
+// Go node). Each token becomes (name:tok OR body:tok); multiple tokens AND.
+func ftsNameOrBodyQuery(escaped string) string {
+	escaped = strings.TrimSpace(escaped)
+	if escaped == "" {
+		return ""
+	}
+	fields := strings.Fields(escaped)
+	if len(fields) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		parts = append(parts, "(name:"+f+" OR body:"+f+")")
+	}
+	return strings.Join(parts, " AND ")
+}
+
 // FullTextSearch performs a full-text search using FTS5.
 func (d *DB) FullTextSearch(query string, limit int) ([]Node, error) {
 	return d.FullTextSearchContext(context.Background(), query, limit)
@@ -1844,7 +1993,7 @@ func (d *DB) FullTextSearchContext(ctx context.Context, query string, limit int)
 	if limit <= 0 {
 		limit = 50
 	}
-	safe := escapeFTS5Query(query)
+	safe := ftsNameOrBodyQuery(escapeFTS5Query(query))
 	if safe == "" {
 		return nil, nil
 	}
@@ -1883,7 +2032,7 @@ func (d *DB) FullTextSearchRefsContext(ctx context.Context, query string, limit 
 	if limit <= 0 {
 		limit = 50
 	}
-	safe := escapeFTS5Query(query)
+	safe := ftsNameOrBodyQuery(escapeFTS5Query(query))
 	if safe == "" {
 		return nil, nil
 	}

@@ -735,6 +735,151 @@ func TestToolStoreFactAcceptsLegitPaths(t *testing.T) {
 	}
 }
 
+func TestToolSearchFactsNormalizesTargetFile(t *testing.T) {
+	s, dir := setupToolServer(t)
+	abs := filepath.Join(dir, "alpha.go")
+	if _, _, err := s.toolStoreFact(context.Background(), nil, storeFactArgs{
+		TargetFile: abs,
+		Content:    "stored via absolute path",
+	}); err != nil {
+		t.Fatalf("store abs: %v", err)
+	}
+
+	// Search with the same absolute path.
+	res, _, err := s.toolSearchFacts(context.Background(), nil, searchFactsArgs{TargetFile: abs})
+	if err != nil {
+		t.Fatalf("search abs: %v", err)
+	}
+	if !strings.Contains(textContent(res), "stored via absolute path") {
+		t.Fatalf("absolute search missed fact:\n%s", textContent(res))
+	}
+
+	// Search with a relative / dirty path to the same file.
+	res, _, err = s.toolSearchFacts(context.Background(), nil, searchFactsArgs{TargetFile: "alpha.go"})
+	if err != nil {
+		t.Fatalf("search rel: %v", err)
+	}
+	if !strings.Contains(textContent(res), "stored via absolute path") {
+		t.Fatalf("relative search missed fact:\n%s", textContent(res))
+	}
+	res, _, err = s.toolSearchFacts(context.Background(), nil, searchFactsArgs{TargetFile: "./sub/../alpha.go"})
+	if err != nil {
+		t.Fatalf("search dirty: %v", err)
+	}
+	if !strings.Contains(textContent(res), "stored via absolute path") {
+		t.Fatalf("dirty relative search missed fact:\n%s", textContent(res))
+	}
+}
+
+func TestToolSearchHomeModeEmptyPathRefusesWholeHome(t *testing.T) {
+	base := t.TempDir()
+	broadHome(t, base)
+	if err := os.WriteFile(filepath.Join(base, "home_only.go"), []byte("func HomeOnlyToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	s := &Server{Workdir: base, Workdirs: []string{base}, Database: database}
+
+	res, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "HomeOnlyToken"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	text := textContent(res)
+	if strings.Contains(text, "home_only.go") {
+		t.Fatalf("home-mode empty path must not rg the home root:\n%s", text)
+	}
+	if !strings.Contains(text, homeModeRefuseRg) {
+		t.Fatalf("expected refuse hint, got:\n%s", text)
+	}
+}
+
+func TestToolSearchHomeModeEmptyPathRipsDetectedProjects(t *testing.T) {
+	base := t.TempDir()
+	broadHome(t, base)
+	proj := filepath.Join(base, "myrepo")
+	writeProjectDir(t, proj)
+	if err := os.WriteFile(filepath.Join(proj, "hit.go"), []byte("func ProjectToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "home_only.go"), []byte("func ProjectToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	s := &Server{Workdir: base, Workdirs: []string{base}, Database: database}
+
+	res, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "ProjectToken"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	text := textContent(res)
+	if !strings.Contains(text, "hit.go") {
+		t.Fatalf("expected hit inside detected project:\n%s", text)
+	}
+	if strings.Contains(text, "home_only.go") {
+		t.Fatalf("must not rg the home root:\n%s", text)
+	}
+}
+
+func TestToolSearchHomeModeExplicitSubdirStillSearches(t *testing.T) {
+	base := t.TempDir()
+	broadHome(t, base)
+	ssh := filepath.Join(base, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ssh, "note"), []byte("SshOnlyToken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	s := &Server{Workdir: base, Workdirs: []string{base}, Database: database}
+
+	res, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "SshOnlyToken", Path: ".ssh"})
+	if err != nil {
+		t.Fatalf("search path=.ssh: %v", err)
+	}
+	if !strings.Contains(textContent(res), "SshOnlyToken") && !strings.Contains(textContent(res), "note") {
+		t.Fatalf("explicit path=.ssh must still search:\n%s", textContent(res))
+	}
+}
+
+func TestToolCallersHomeModeEmptyPathDoesNotRgHome(t *testing.T) {
+	base := t.TempDir()
+	broadHome(t, base)
+	if err := os.WriteFile(filepath.Join(base, "decoy.go"), []byte("func NotInGraphXYZ() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	s := &Server{Workdir: base, Workdirs: []string{base}, Database: database}
+
+	res, _, err := s.toolCallers(context.Background(), nil, nameArgs{Name: "NotInGraphXYZ"})
+	if err != nil {
+		t.Fatalf("callers: %v", err)
+	}
+	text := textContent(res)
+	if strings.Contains(text, "decoy.go") {
+		t.Fatalf("callers fallback must not rg the home root:\n%s", text)
+	}
+	if !strings.Contains(text, homeModeRefuseRg) && !strings.Contains(text, "no call edges") {
+		t.Fatalf("expected graph-empty / refuse, got:\n%s", text)
+	}
+}
+
 func TestToolSearchFacts(t *testing.T) {
 	s, _ := setupToolServer(t)
 	// Insert a couple facts via DB directly

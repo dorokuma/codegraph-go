@@ -20,7 +20,10 @@ var callRe = regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
 
 // toolCalleesBodyFallback is the legacy rg + brace-matching path used when
 // the call graph has no edges for the symbol yet.
-func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, database *db.DB, args nameArgs) (*mcp.CallToolResult, any, error) {
+func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, database *db.DB, args nameArgs, rgRoots ...string) (*mcp.CallToolResult, any, error) {
+	if len(rgRoots) == 0 {
+		rgRoots = []string{root}
+	}
 	// Guard against rg hanging on large trees or named pipes.
 	rgCtx, rgCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer rgCancel()
@@ -31,7 +34,8 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 	rgDef := exec.CommandContext(rgCtx, "rg",
 		"--line-number", "--no-heading", "--color=never",
 		"--max-count=20",
-		"-e", defPattern, root)
+		"-e", defPattern)
+	rgDef.Args = append(rgDef.Args, rgRoots...)
 	// Streamed + capped: the old rg.Output() loaded the whole match set into
 	// memory before the per-definition loop (audit medium).
 	defLines, _, err := rgOutputLines(rgDef, 2000, 1<<20)
@@ -49,7 +53,8 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		rgDefFallback := exec.CommandContext(fallbackCtx, "rg",
 			"--line-number", "--no-heading", "--color=never",
 			"--max-count=20",
-			"-e", fallbackPattern, root)
+			"-e", fallbackPattern)
+		rgDefFallback.Args = append(rgDefFallback.Args, rgRoots...)
 		defLines, _, err = rgOutputLines(rgDefFallback, 2000, 1<<20)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rg definitions fallback: %w", err)

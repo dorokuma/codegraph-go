@@ -46,6 +46,7 @@ type pendingEntry struct {
 type indexer interface {
 	IndexChanges(files []string) (int, int, error)
 	DeleteFile(path string) error
+	DeleteTree(path string) error
 	PartialFailures() int
 	IndexFailedFiles() []string
 }
@@ -200,9 +201,10 @@ func (w *Watcher) loop() {
 				}
 			}
 
-			// Supported source files only
-			lang := extraction.DetectLanguage(path)
-			if lang == "" || !extraction.IsSupportedLanguage(lang) {
+			// Source files always queue. Remove/Rename also queues
+			// directories and extensionless paths so DeleteTree can
+			// drop the old prefix (DetectLanguage is empty for those).
+			if !shouldQueueWatchPath(path, event.Op) {
 				continue
 			}
 
@@ -421,6 +423,13 @@ func (w *Watcher) processPending() {
 		path := job.path
 		info, err := os.Lstat(path)
 		switch {
+		case err == nil && info.IsDir():
+			if derr := w.orchestrator.DeleteTree(path); derr != nil {
+				log.Printf("delete tree %s: %v", path, derr)
+				w.requeue(job, "delete failed")
+			} else {
+				w.settled(job)
+			}
 		case err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()):
 			if derr := w.orchestrator.DeleteFile(path); derr != nil {
 				log.Printf("delete index %s: %v", path, derr)
@@ -432,9 +441,10 @@ func (w *Watcher) processPending() {
 			existing = append(existing, path)
 			undecided = append(undecided, job)
 		case os.IsNotExist(err):
-			// File was deleted, remove from index
-			if derr := w.orchestrator.DeleteFile(path); derr != nil {
-				log.Printf("delete index %s: %v", path, derr)
+			// File or directory gone (delete / rename-away): drop the
+			// exact key and any children stored under path/.
+			if derr := w.orchestrator.DeleteTree(path); derr != nil {
+				log.Printf("delete tree %s: %v", path, derr)
 				w.requeue(job, "delete failed")
 			} else {
 				w.settled(job)
@@ -547,4 +557,17 @@ func (w *Watcher) RemoveDir(path string) error {
 func IsSupported(path string) bool {
 	lang := extraction.DetectLanguage(path)
 	return lang != "" && extraction.IsSupportedLanguage(lang)
+}
+
+// shouldQueueWatchPath reports whether an fsnotify event should enter pending.
+// Remove/Rename of dirs and extensionless paths must queue even when
+// DetectLanguage is empty; Create of a directory is handled separately.
+func shouldQueueWatchPath(path string, op fsnotify.Op) bool {
+	if op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
+		return false
+	}
+	if IsSupported(path) {
+		return true
+	}
+	return op&(fsnotify.Remove|fsnotify.Rename) != 0
 }

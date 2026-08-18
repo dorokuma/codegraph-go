@@ -1,6 +1,7 @@
 package db
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,6 +94,25 @@ func TestPathUnderRootRelativeKeyVsAbsFilter(t *testing.T) {
 	}
 	if !PathUnderRoot("internal/server/tools.go", wd, wd) {
 		t.Fatal("root==workdir is the whole tree")
+	}
+}
+
+func TestPathUnderRootSymlinkWorkdirRelativeKey(t *testing.T) {
+	real := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(real, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "ws")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	realKeep := filepath.Join(real, "keep")
+	if !PathUnderRoot("keep/a.go", link, realKeep) {
+		t.Fatal("relative index key must match EvalSymlinks path= under symlink workdir")
+	}
+	if PathUnderRoot("drop/a.go", link, realKeep) {
+		t.Fatal("sibling tree must not match")
 	}
 }
 

@@ -153,6 +153,36 @@ func relativizeRgOutput(out string, projRoot string) string {
 // full stdout pipe would otherwise hang past the caller's ctx deadline
 // (CommandContext only kills on ctx cancel; a plain read error has no such
 // backstop).
+// rgEachRoot runs rg once per root and merges lines, stopping at the same
+// line/byte caps as a single rgOutputLines call.
+func rgEachRoot(roots []string, maxLines, maxBytes int, build func(root string) *exec.Cmd) ([]string, error) {
+	var all []string
+	var firstErr error
+	remainLines := maxLines
+	remainBytes := maxBytes
+	for _, root := range roots {
+		if remainLines <= 0 || remainBytes <= 0 {
+			break
+		}
+		lines, _, err := rgOutputLines(build(root), remainLines, remainBytes)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		all = append(all, lines...)
+		remainLines -= len(lines)
+		for _, l := range lines {
+			remainBytes -= len(l) + 1
+		}
+	}
+	if len(all) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return all, nil
+}
+
 func rgOutputLines(cmd *exec.Cmd, maxLines, maxBytes int) (lines []string, truncated bool, err error) {
 	if maxLines <= 0 {
 		maxLines = 1 << 30

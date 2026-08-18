@@ -3,6 +3,8 @@ package resolution
 import (
 	"container/list"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +28,10 @@ const (
 	maxJSXChildren         = 30
 )
 
+// failSynthPass, when set by tests, injects an error after a named pass so
+// SynthesizeAll must not call ReplaceSynthesizedEdges with a partial set.
+var failSynthPass func(name string) error
+
 var (
 	registrarNameRe   = regexp.MustCompile(`^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$`)
 	dispatcherNameRe  = regexp.MustCompile(`(?i)(emit|trigger|notify|dispatch|fire|publish|flush)`)
@@ -48,7 +54,10 @@ var (
 func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 	st := SynthStats{ByPass: map[string]int{}}
 
-	ctx := newSynthCtx(database, workdir)
+	ctx, err := newSynthCtx(database, workdir)
+	if err != nil {
+		return st, err
+	}
 
 	type pass struct {
 		name string
@@ -67,10 +76,15 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 
 	seen := map[string]bool{}
 	var merged []synthEdge
+	var passErrs []error
 	for _, p := range passes {
 		edges, err := p.run(ctx)
+		if err == nil && failSynthPass != nil {
+			err = failSynthPass(p.name)
+		}
 		if err != nil {
 			log.Printf("synthesis %s: %v", p.name, err)
+			passErrs = append(passErrs, fmt.Errorf("%s: %w", p.name, err))
 			continue
 		}
 		n := 0
@@ -84,6 +98,10 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 			n++
 		}
 		st.ByPass[p.name] = n
+	}
+	if len(passErrs) > 0 {
+		// Do not ReplaceSynthesizedEdges with a partial pass set.
+		return st, errors.Join(passErrs...)
 	}
 
 	// Single atomic replace: delete stale synthesized edges + upsert the new
@@ -190,7 +208,7 @@ type synthCtx struct {
 	allFiles    []string
 }
 
-func newSynthCtx(database *db.DB, workdir string) *synthCtx {
+func newSynthCtx(database *db.DB, workdir string) (*synthCtx, error) {
 	ctx := &synthCtx{
 		db:          database,
 		workdir:     workdir,
@@ -199,9 +217,12 @@ func newSynthCtx(database *db.DB, workdir string) *synthCtx {
 		nodesInFile: map[string][]db.Node{},
 		nodesByKind: map[string][]db.Node{},
 	}
-	files, _ := database.ListFiles()
+	files, err := database.ListFiles()
+	if err != nil {
+		return nil, err
+	}
 	ctx.allFiles = files
-	return ctx
+	return ctx, nil
 }
 
 // nodesOfKind returns all nodes of kind, cached for the synthesis pass.
@@ -365,31 +386,46 @@ func callableProximityScore(c db.Node, callerFile, regFile string) int {
 	}
 }
 
-// pickCallableByProximity chooses among same-named function/method candidates
-// preferring proximity to the caller/registration files. On a tie the first
-// candidate in the input order wins (stable fallback).
-func pickCallableByProximity(nodes []db.Node, callerFile, regFile string) *db.Node {
-	var callables []db.Node
+// pickByProximity chooses among kind-filtered candidates using
+// callableProximityScore. On a tie the first candidate in input order wins.
+func pickByProximity(nodes []db.Node, callerFile, regFile string, kindOK func(string) bool) *db.Node {
+	var cand []db.Node
 	for _, n := range nodes {
-		if n.Kind == db.KindMethod || n.Kind == db.KindFunction {
-			callables = append(callables, n)
+		if kindOK != nil && !kindOK(n.Kind) {
+			continue
 		}
+		cand = append(cand, n)
 	}
-	if len(callables) == 0 {
+	if len(cand) == 0 {
 		return nil
 	}
-	if len(callables) == 1 {
-		return &callables[0]
+	if len(cand) == 1 {
+		return &cand[0]
 	}
-	best := callables[0]
+	best := cand[0]
 	bestScore := callableProximityScore(best, callerFile, regFile)
-	for _, c := range callables[1:] {
+	for _, c := range cand[1:] {
 		if sc := callableProximityScore(c, callerFile, regFile); sc < bestScore {
 			best = c
 			bestScore = sc
 		}
 	}
 	return &best
+}
+
+// pickCallableByProximity chooses among same-named function/method candidates
+// preferring proximity to the caller/registration files. On a tie the first
+// candidate in the input order wins (stable fallback).
+func pickCallableByProximity(nodes []db.Node, callerFile, regFile string) *db.Node {
+	return pickByProximity(nodes, callerFile, regFile, func(k string) bool {
+		return k == db.KindMethod || k == db.KindFunction
+	})
+}
+
+func pickJSXChildByProximity(nodes []db.Node, callerFile string) *db.Node {
+	return pickByProximity(nodes, callerFile, "", func(k string) bool {
+		return k == "component" || k == db.KindFunction || k == db.KindClass
+	})
 }
 
 // resolveCallbackTarget picks the best callable node named cbName in the context
@@ -770,14 +806,7 @@ func reactJSXChildEdges(ctx *synthCtx) ([]synthEdge, error) {
 				if added >= maxJSXChildren {
 					break
 				}
-				var child *db.Node
-				for _, n := range ctx.getNodesByName(name) {
-					if n.Kind == "component" || n.Kind == db.KindFunction || n.Kind == db.KindClass {
-						nn := n
-						child = &nn
-						break
-					}
-				}
+				child := pickJSXChildByProximity(ctx.getNodesByName(name), file)
 				if child == nil || child.ID == parent.ID {
 					continue
 				}

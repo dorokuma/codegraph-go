@@ -5,6 +5,27 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-18
+
+### Fixed
+- 重索引定义文件时先 `ParkInboundRefsForFile`，CASCADE 删节点后跨文件 `calls`/`references` 边能经 `ResolveForFiles` 接回。
+- 目录 `Remove`/`Rename` 走 `DeleteTree`；`IndexAll` 会 prune 盘上已消失的路径，不再留幽灵节点。
+- `ResolveAll` / `SynthesizeAll` 失败并入 `Index*` 返回值，不再标 schema 成功。
+- 合成某一 pass 失败时不调用 `ReplaceSynthesizedEdges`，避免用残缺集合整表覆盖。
+- JSX 同名组件按文件/目录远近选择，不再全局 first-wins。
+- `isGoToolchainPath` 只跳过 GOPATH 根（`/root/go`、`$HOME/go`、`/home/*/go`、`/Users/*/go`），`sdk/go`、`internal/go`、`clients/go` 会进索引。
+- FTS `MATCH` 只查 `name`/`body`，搜 `go` 不会因 `language` 列刷屏。
+- `store_fact` 的 insert 与 supersede 同一事务；失败整单回滚。
+- home-mode 空 `path` 不再对整棵 `$HOME` 跑 rg；显式 `path=` 仍允许。
+- `no_ignore=true` 不走 FTS 捷径，会落到带 `--no-ignore` 的 rg。
+- `search_facts` 与 `store_fact` 共用 `targetFile` 规范化，绝对路径能搜到刚存的 fact。
+- `affected` 输入全部被丢弃时写明原因，不再只报 `No affected test files found.`
+- explore 在 workdir 是 symlink 时仍按 `path=` 过滤；`PathUnderRoot` 对相对入库键也能对上。
+- Pi `skipCode=false` / `includeCode=true` 不再剥代码围栏和 `file:line:content`。
+
+### Changed
+- Display / daemon wire version **0.9.2**。
+
 ## [0.9.1] - 2026-08-18
 
 ### Fixed

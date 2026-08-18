@@ -245,6 +245,18 @@ func clampGraphMax(v int) int {
 	return v
 }
 
+// evalExistingSymlink returns the EvalSymlinks form of p when it exists,
+// otherwise the cleaned logical path (so a missing tail still compares).
+func evalExistingSymlink(p string) string {
+	if p == "" {
+		return p
+	}
+	if real, err := filepath.EvalSymlinks(p); err == nil && real != "" {
+		return real
+	}
+	return filepath.Clean(p)
+}
+
 // ToolExplore builds an overview or a symbol-centered context pack (official primary tool).
 // With a multi-symbol query it surfaces Flow (call path) first, then source under a size budget.
 // DB reads now accept context via Context variants; cancellation is supported.
@@ -256,8 +268,13 @@ func ToolExplore(ctx context.Context, database *db.DB, workdirs []string, workdi
 			p = filepath.Join(workdir, p)
 		}
 		p = filepath.Clean(p)
-		if p == workdir || strings.HasPrefix(p, workdir+string(filepath.Separator)) {
-			root = p
+		// workdir (and path, if still a logical path) may be a symlink to the
+		// real project root. Compare real paths so a path=subdir filter is
+		// not dropped and explore does not fall back to the whole tree.
+		wdReal := evalExistingSymlink(workdir)
+		pReal := evalExistingSymlink(p)
+		if pReal == wdReal || strings.HasPrefix(pReal, wdReal+string(filepath.Separator)) {
+			root = pReal
 		}
 	}
 

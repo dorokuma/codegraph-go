@@ -202,9 +202,10 @@ var ErrKeepOldIndex = errors.New("extraction failed, keeping old index")
 // visitIndexable walks the workspace once, applying the shared skip rules, and
 // invokes fn for each language-supported source file under the size limit.
 // Walk errors on individual paths are skipped so one bad path cannot abort the scan.
-func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lang string) error) error {
-	return filepath.Walk(o.workdir, func(path string, info os.FileInfo, err error) error {
+func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lang string) error) (walkErrs int, err error) {
+	err = filepath.Walk(o.workdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			walkErrs++
 			return nil
 		}
 		if o.interrupted() {
@@ -232,6 +233,7 @@ func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lan
 		}
 		return fn(path, info, lang)
 	})
+	return walkErrs, err
 }
 
 // storePath is the workdir-relative index key for a filesystem path.
@@ -420,13 +422,12 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 // An interrupted walk returns the partial job list wrapped in
 // ErrIndexInterrupted; the caller surfaces the sentinel instead of treating
 // the partial list as a complete pass.
-func (o *Orchestrator) collectIndexJobs() ([]indexJob, error) {
-	var jobs []indexJob
-	err := o.visitIndexable(func(path string, info os.FileInfo, lang string) error {
+func (o *Orchestrator) collectIndexJobs() (jobs []indexJob, walkErrs int, err error) {
+	walkErrs, err = o.visitIndexable(func(path string, info os.FileInfo, lang string) error {
 		jobs = append(jobs, indexJob{path: path, info: info, lang: lang})
 		return nil
 	})
-	return jobs, err
+	return jobs, walkErrs, err
 }
 
 // IndexAll indexes all files in the workspace (skips unchanged unless force).
@@ -438,12 +439,16 @@ func (o *Orchestrator) collectIndexJobs() ([]indexJob, error) {
 // tell "shutdown aborted the pass" from a clean partial success — and must
 // NOT mark the schema revision on it.
 func (o *Orchestrator) IndexAll() (int, int, error) {
-	jobs, err := o.collectIndexJobs()
+	jobs, walkErrs, err := o.collectIndexJobs()
 	if err != nil {
 		return 0, 0, err
 	}
 	if o.interrupted() {
 		return 0, 0, ErrIndexInterrupted
+	}
+	var pruneErr error
+	if walkErrs == 0 {
+		pruneErr = o.pruneMissingFiles(jobs)
 	}
 	// M7: the partial-failure count is per-pass; reset so a stale count from
 	// an earlier pass cannot trigger a warning on a clean pass.
@@ -456,6 +461,7 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 			log.Printf("indexed progress %d/%d candidates", done, total)
 		}
 	})
+	jerr = errors.Join(pruneErr, jerr)
 	if o.interrupted() {
 		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
@@ -463,6 +469,7 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	// Step 3: turn pending unresolved_refs into cross-file edges.
 	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
+		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 || st.Failed > 0 {
 		log.Printf("resolved %d edges (%d failed, %d retried)", st.Resolved, st.Failed, st.Retried)
 	}
@@ -470,7 +477,9 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
-	o.runSynthesis(nil)
+	if serr := o.runSynthesis(nil); serr != nil {
+		jerr = errors.Join(jerr, serr)
+	}
 	if n := o.PartialFailures(); n > 0 {
 		// Neutral per-pass report, same position as IndexAllWithProgress:
 		// whether the schema revision gets marked is the server's (caller's)
@@ -488,17 +497,18 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 // runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
 // When files is non-nil only refs related to those files are scrubbed;
 // nil means scrub all. SynthesizeAll is always full-table (its bottom pass).
-func (o *Orchestrator) runSynthesis(files []string) {
+func (o *Orchestrator) runSynthesis(files []string) error {
 	// Drop pure-noise failed/pending refs with no project symbol first.
 	o.scrubNoise(files)
 	st, err := resolution.SynthesizeAll(o.db, o.workdir)
 	if err != nil {
 		log.Printf("synthesize: %v", err)
-		return
+		return err
 	}
 	if st.Written > 0 {
 		log.Printf("synthesized %d edges %v", st.Written, st.ByPass)
 	}
+	return nil
 }
 
 // scrubNoise drops failed/pending pure-noise refs with no matching symbol.
@@ -568,17 +578,77 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 		return n, err
 	}
 	key := o.storePath(path)
+	var join error
 	if _, rerr := resolution.ResolveForFiles(o.db, o.workdir, []string{key}); rerr != nil {
 		log.Printf("resolve after index %s: %v", path, rerr)
+		join = errors.Join(join, rerr)
 	}
-	o.runSynthesis([]string{key})
-	return n, nil
+	if serr := o.runSynthesis([]string{key}); serr != nil {
+		join = errors.Join(join, serr)
+	}
+	return n, join
 }
 
 // DeleteFile removes a file from the index.
 // path may be absolute (watcher) or relative; both map to the storage key.
 func (o *Orchestrator) DeleteFile(path string) error {
 	return o.db.ClearFile(o.storePath(path))
+}
+
+// DeleteTree removes every indexed file whose storage key is path or lives
+// under path/ (directory rename/delete). ListFilesInDir only matches
+// direct children and cannot prune a whole tree.
+func (o *Orchestrator) DeleteTree(path string) error {
+	key := o.storePath(path)
+	if key == "" {
+		return nil
+	}
+	files, err := o.db.ListFiles()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	if key == "." {
+		for _, f := range files {
+			if cerr := o.db.ClearFile(f); cerr != nil {
+				errs = append(errs, cerr)
+			}
+		}
+		return errors.Join(errs...)
+	}
+	prefix := key + "/"
+	for _, f := range files {
+		if f == key || strings.HasPrefix(f, prefix) {
+			if cerr := o.db.ClearFile(f); cerr != nil {
+				errs = append(errs, cerr)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// pruneMissingFiles drops files-table rows (and their nodes) that are no
+// longer among this pass's walk jobs. Caller must not invoke this when
+// the walk itself failed — an incomplete job set would wipe the index.
+func (o *Orchestrator) pruneMissingFiles(jobs []indexJob) error {
+	keep := make(map[string]struct{}, len(jobs))
+	for _, j := range jobs {
+		keep[o.storePath(j.path)] = struct{}{}
+	}
+	listed, err := o.db.ListFiles()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, f := range listed {
+		if _, ok := keep[f]; ok {
+			continue
+		}
+		if cerr := o.db.ClearFile(f); cerr != nil {
+			errs = append(errs, fmt.Errorf("prune %s: %w", f, cerr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func hashContent(data []byte) string {
@@ -1028,6 +1098,12 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 	} else {
 		log.Printf("stat after index %s: %v", path, serr)
 	}
+	// Re-index deletes this file's nodes and CASCADE-drops inbound edges
+	// from other files. Park those edges as pending refs first so
+	// ResolveForFiles can rebuild them against the new node ids.
+	if perr := o.db.ParkInboundRefsForFile(store); perr != nil {
+		return 0, perr
+	}
 	if _, werr := o.db.ReplaceFileIndex(store, dbNodes, dbEdges, parks, &fr, moduleNodes...); werr != nil {
 		return 0, werr
 	}
@@ -1159,8 +1235,11 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	}
 	if _, err := resolution.ResolveForFiles(o.db, o.workdir, storeKeys); err != nil {
 		log.Printf("resolve changes: %v", err)
+		errs = append(errs, err)
 	}
-	o.runSynthesis(storeKeys)
+	if serr := o.runSynthesis(storeKeys); serr != nil {
+		errs = append(errs, serr)
+	}
 	return totalFiles, totalNodes, errors.Join(errs...)
 }
 
@@ -1174,12 +1253,16 @@ type ProgressFunc func(phase string, current, total int)
 // goroutines. Callers must ensure their implementation is thread-safe.
 func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, error) {
 	start := time.Now()
-	jobs, err := o.collectIndexJobs()
+	jobs, walkErrs, err := o.collectIndexJobs()
 	if err != nil {
 		return 0, 0, err
 	}
 	if o.interrupted() {
 		return 0, 0, ErrIndexInterrupted
+	}
+	var pruneErr error
+	if walkErrs == 0 {
+		pruneErr = o.pruneMissingFiles(jobs)
 	}
 	totalCandidates := len(jobs)
 	// M7: per-pass partial-failure count (see IndexAll).
@@ -1192,19 +1275,23 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 			onProgress("indexing", done, totalCandidates)
 		}
 	})
+	jerr = errors.Join(pruneErr, jerr)
 
 	if o.interrupted() {
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
+		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 {
 		log.Printf("resolved %d edges after index", st.Resolved)
 	}
 	if o.interrupted() {
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
-	o.runSynthesis(nil)
+	if serr := o.runSynthesis(nil); serr != nil {
+		jerr = errors.Join(jerr, serr)
+	}
 	if n := o.PartialFailures(); n > 0 {
 		// Neutral per-pass report, same wording as IndexAll: the schema-revision
 		// decision belongs to the server (caller); say only what happened here

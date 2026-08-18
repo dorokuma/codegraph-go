@@ -337,6 +337,47 @@ func TestToolSearchNoIgnoreOptIn(t *testing.T) {
 	}
 }
 
+// TestToolSearchNoIgnoreWithoutPath: empty Path + simple ident that FTS
+// can hit must still fall through to rg when no_ignore=true, so gitignored
+// files are searched.
+func TestToolSearchNoIgnoreWithoutPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	s, dir := setupToolServer(t)
+	if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init failed: %v %s", err, out)
+	}
+	_ = exec.Command("git", "-C", dir, "config", "user.email", "t@t").Run()
+	_ = exec.Command("git", "-C", dir, "config", "user.name", "t").Run()
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "secret.env"), []byte("Alpha hidden\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", dir, "add", ".gitignore").CombinedOutput(); err != nil {
+		t.Skipf("git add failed: %v %s", err, out)
+	}
+
+	// FTS shortcut (no Path, simple ident) still hits the indexed symbol.
+	res, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "Alpha"})
+	if err != nil {
+		t.Fatalf("fts search: %v", err)
+	}
+	if !strings.Contains(textContent(res), "alpha.go") {
+		t.Fatalf("FTS should hit Alpha in alpha.go, got:\n%s", textContent(res))
+	}
+
+	res, _, err = s.toolSearch(context.Background(), nil, searchArgs{Pattern: "Alpha", NoIgnore: true})
+	if err != nil {
+		t.Fatalf("search no_ignore without path: %v", err)
+	}
+	if !strings.Contains(textContent(res), "secret.env") {
+		t.Fatalf("no_ignore=true without Path must still search ignored files, got:\n%s", textContent(res))
+	}
+}
+
 // TestToolStoreFactContentTooLarge: content over the 64KiB cap must be
 // rejected before touching the DB (audit high M9).
 func TestToolStoreFactContentTooLarge(t *testing.T) {

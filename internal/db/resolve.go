@@ -149,12 +149,26 @@ func StoragePath(workdir, path string) string {
 // PathUnderRoot reports whether file sits at root or in a descendant directory.
 // Both sides are compared as StoragePath keys so an absolute path= filter
 // matches workdir-relative index keys (and the reverse).
+//
+// When workdir is a symlink, StoragePath against the logical workdir turns an
+// EvalSymlinks'd root into an out-of-tree absolute key, which would miss
+// relative index rows (keep/a.go). Retry against the real workdir so a
+// path=subdir filter still matches production keys.
 func PathUnderRoot(file, workdir, root string) bool {
 	if root == "" || root == workdir {
 		return true
 	}
-	fileKey := StoragePath(workdir, file)
-	rootKey := StoragePath(workdir, root)
+	if pathKeyUnderRoot(StoragePath(workdir, file), StoragePath(workdir, root)) {
+		return true
+	}
+	realWd, err := filepath.EvalSymlinks(workdir)
+	if err != nil || realWd == "" || realWd == filepath.Clean(workdir) {
+		return false
+	}
+	return pathKeyUnderRoot(StoragePath(realWd, file), StoragePath(realWd, root))
+}
+
+func pathKeyUnderRoot(fileKey, rootKey string) bool {
 	if rootKey == "" || rootKey == "." {
 		return true
 	}

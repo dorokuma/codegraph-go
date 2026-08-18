@@ -510,20 +510,33 @@ function compressToolText(text: string): string {
  * - 列表 `- xxx` 保留（结构信息）
  * - rg fallback `file:line:content` → 只留 file:line
  * - 多余空行收一下
+ * keepCode: skipCode=false / includeCode / 读代码的 action 时保留围栏和 file:line:content。
  */
-function formatCleanText(text: string): string {
+function wantsKeepCode(toolName: string, args: Record<string, unknown>): boolean {
+	if (args.skipCode === false) return true
+	if (args.includeCode === true) return true
+	const action = typeof args.action === "string" ? args.action : ""
+	const name = typeof args.name === "string" ? args.name : ""
+	if (action === "node" || action === "read") return true
+	const hint = (toolName || name).toLowerCase()
+	return hint === "node" || hint === "read"
+}
+
+function formatCleanText(text: string, opts?: { keepCode?: boolean }): string {
 	if (!text) return text
 	let t = text
-	// 1) 剥代码块 → 行数摘要（兜底，CG 侧已控制不输出代码）
-	t = t.replace(/```[\s\S]*?```/g, (block) => {
-		const inner = block.slice(3, -3)
-		const langEnd = inner.indexOf("\n")
-		const code = langEnd > 0 ? inner.slice(langEnd + 1) : inner
-		const lineCount = code.split("\n").filter((l) => l.trim().length > 0).length || 1
-		return `[ ${lineCount} 行代码已省略 ]`
-	})
-	// 2) rg fallback: file:line:matched_content → file:line
-	t = t.replace(/^([^:\n]+:\d+):.+$/gm, "$1")
+	if (!opts?.keepCode) {
+		// 1) 剥代码块 → 行数摘要（兜底，CG 侧已控制不输出代码）
+		t = t.replace(/```[\s\S]*?```/g, (block) => {
+			const inner = block.slice(3, -3)
+			const langEnd = inner.indexOf("\n")
+			const code = langEnd > 0 ? inner.slice(langEnd + 1) : inner
+			const lineCount = code.split("\n").filter((l) => l.trim().length > 0).length || 1
+			return `[ ${lineCount} 行代码已省略 ]`
+		})
+		// 2) rg fallback: file:line:matched_content → file:line
+		t = t.replace(/^([^:\n]+:\d+):.+$/gm, "$1")
+	}
 	// 3) markdown 标题 → 纯文本（去 #，加空行）
 	t = t.replace(/^#{1,6}\s+/gm, "")
 	// 4) bold / italic → 去标记
@@ -834,17 +847,18 @@ class CodeGraphClient {
 		}
 		if (!this.initialized) throw new Error("codegraph-go not initialized")
 		const bounded = withToolDefaults(args)
+		const cleanOpts = wantsKeepCode(name, bounded) ? { keepCode: true } : undefined
 		try {
 			const result = await this.sendRequest("tools/call", { name, arguments: bounded })
 			const text = result.content?.map((c) => c.text).join("\n") || "no result"
-			return formatCleanText(compressToolText(text))
+			return formatCleanText(compressToolText(text), cleanOpts)
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err)
 			if (/not running|disconnected|timed out/i.test(msg)) {
 				await this.start()
 				const result = await this.sendRequest("tools/call", { name, arguments: bounded })
 				const text = result.content?.map((c) => c.text).join("\n") || "no result"
-				return formatCleanText(compressToolText(text))
+				return formatCleanText(compressToolText(text), cleanOpts)
 			}
 			throw err
 		}

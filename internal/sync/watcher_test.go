@@ -238,12 +238,14 @@ func TestOverflowTriggersRescan(t *testing.T) {
 type fakeIndexer struct {
 	indexChanges func(files []string) (int, int, error)
 	deleteFile   func(path string) error
+	deleteTree   func(path string) error
 	partial      int
 	failedFiles  []string // reported by IndexFailedFiles
 
 	mu            sync.Mutex
 	indexCalls    []string
 	delCalls      []string
+	treeCalls     []string
 	recordedPanic string // set by blockedDBIndexChanges when the pass panics
 }
 
@@ -259,6 +261,19 @@ func (f *fakeIndexer) DeleteFile(path string) error {
 	f.delCalls = append(f.delCalls, path)
 	f.mu.Unlock()
 	return f.deleteFile(path)
+}
+
+func (f *fakeIndexer) DeleteTree(path string) error {
+	f.mu.Lock()
+	f.treeCalls = append(f.treeCalls, path)
+	f.mu.Unlock()
+	if f.deleteTree != nil {
+		return f.deleteTree(path)
+	}
+	if f.deleteFile != nil {
+		return f.deleteFile(path)
+	}
+	return nil
 }
 
 func (f *fakeIndexer) PartialFailures() int { return f.partial }
@@ -470,8 +485,8 @@ func TestProcessPendingNonRegularClearsIndex(t *testing.T) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.delCalls) != 1 || f.delCalls[0] != p {
-		t.Fatalf("expected DeleteFile(%s), got %v", p, f.delCalls)
+	if len(f.treeCalls) != 1 || f.treeCalls[0] != p {
+		t.Fatalf("expected DeleteTree(%s), got tree=%v del=%v", p, f.treeCalls, f.delCalls)
 	}
 }
 
@@ -783,5 +798,40 @@ func TestStopTimeoutCloseBeforePassDonePanics(t *testing.T) {
 
 	if got := f.gotPanic(); got == "" {
 		t.Fatal("expected the in-flight pass to panic on the closed DB connection (this is the race WaitIdle prevents)")
+	}
+}
+
+func TestShouldQueueWatchPath(t *testing.T) {
+	if !shouldQueueWatchPath("pkg/a.go", fsnotify.Write) {
+		t.Fatal("source write must queue")
+	}
+	if shouldQueueWatchPath("pkg", fsnotify.Write) {
+		t.Fatal("dir write without language must not queue")
+	}
+	if !shouldQueueWatchPath("pkg", fsnotify.Remove) {
+		t.Fatal("dir remove must queue")
+	}
+	if !shouldQueueWatchPath("pkg", fsnotify.Rename) {
+		t.Fatal("dir rename must queue")
+	}
+	if shouldQueueWatchPath("README", fsnotify.Create) {
+		t.Fatal("extensionless create must not queue")
+	}
+}
+
+func TestProcessPendingMissingPathDeleteTree(t *testing.T) {
+	dir := t.TempDir()
+	f := &fakeIndexer{
+		indexChanges: func([]string) (int, int, error) { return 0, 0, nil },
+		deleteFile:   func(string) error { return nil },
+	}
+	w := newTestWatcher(f, dir)
+	p := filepath.Join(dir, "pkg")
+	w.pending[p] = &pendingEntry{since: time.Now()}
+	w.processPending()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.treeCalls) != 1 || f.treeCalls[0] != p {
+		t.Fatalf("expected DeleteTree(%s), got %v", p, f.treeCalls)
 	}
 }

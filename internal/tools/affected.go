@@ -86,18 +86,21 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 	// symlinked prefixes that actually escape are rejected, and a deleted
 	// file inside the workspace is still accepted.
 	var absFiles []string
+	var skipped []skippedInput
 	wd := filepath.Clean(workdir)
 	realWd, err := filepath.EvalSymlinks(wd)
 	if err != nil || realWd == "" {
 		realWd = wd
 	}
-	for _, f := range files {
+	for _, raw := range files {
+		f := raw
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(wd, f)
 		}
 		f = filepath.Clean(f)
 		if f != wd && !strings.HasPrefix(f, wd+string(filepath.Separator)) {
-			continue // skip paths outside workspace (lexical)
+			skipped = append(skipped, skippedInput{path: raw, reason: "lexical jail: outside workspace"})
+			continue
 		}
 		realF, rerr := filepath.EvalSymlinks(f)
 		if rerr != nil {
@@ -106,13 +109,21 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 			// escapes rejected.
 			realF, rerr = resolveRealAncestor(f)
 			if rerr != nil {
+				skipped = append(skipped, skippedInput{path: raw, reason: "ancestor resolve failed: " + rerr.Error()})
 				continue
 			}
 		}
 		if _, ok := pathWithinRoot(realWd, realF); !ok {
-			continue // skip symlink escapes (path resolves outside workspace)
+			skipped = append(skipped, skippedInput{path: raw, reason: "symlink escape: resolves outside workspace"})
+			continue
 		}
 		absFiles = append(absFiles, f)
+	}
+
+	if len(absFiles) == 0 && len(skipped) > 0 {
+		return &AffectedResult{
+			Content: []ContentItem{{Type: "text", Text: formatAllInputsDiscarded(skipped)}},
+		}, nil
 	}
 
 	// Find all transitive dependencies
@@ -195,6 +206,9 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 		if importQueryFails > 0 {
 			text += fmt.Sprintf("\nnote: %d import-query failure(s); affected set may be incomplete", importQueryFails)
 		}
+		if note := formatSkippedInputs(skipped); note != "" {
+			text += "\n" + note
+		}
 		return &AffectedResult{
 			Content: []ContentItem{{Type: "text", Text: text}},
 		}, nil
@@ -208,10 +222,38 @@ func ToolAffected(ctx context.Context, database *db.DB, workdir string, args Aff
 		// M5: surface partial traversal failures instead of a silent gap.
 		fmt.Fprintf(&b, "note: %d import-query failure(s); affected set may be incomplete\n", importQueryFails)
 	}
+	if note := formatSkippedInputs(skipped); note != "" {
+		fmt.Fprintf(&b, "%s\n", note)
+	}
 
 	return &AffectedResult{
 		Content: []ContentItem{{Type: "text", Text: b.String()}},
 	}, nil
+}
+
+type skippedInput struct {
+	path   string
+	reason string
+}
+
+func formatAllInputsDiscarded(skipped []skippedInput) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "all %d input(s) discarded; no search performed.\n", len(skipped))
+	for _, s := range skipped {
+		fmt.Fprintf(&b, "- %s: %s\n", s.path, s.reason)
+	}
+	return b.String()
+}
+
+func formatSkippedInputs(skipped []skippedInput) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(skipped))
+	for _, s := range skipped {
+		parts = append(parts, fmt.Sprintf("%s (%s)", s.path, s.reason))
+	}
+	return fmt.Sprintf("skipped %d input(s): %s", len(skipped), strings.Join(parts, ", "))
 }
 
 // resolveRealAncestor resolves path to its canonical form, following symlinks

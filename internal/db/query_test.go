@@ -498,6 +498,29 @@ func TestFullTextSearch(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].Name != "foo_bar" {
 		t.Fatalf("expected foo_bar via FTS, got %d nodes", len(nodes))
 	}
+
+	// language=go must not match a query of "go" when name/body lack that token.
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Alpha", File: "/alpha.go", Line: 1,
+		Body: "func Alpha() {}", Language: "go",
+	}); err != nil {
+		t.Fatalf("upsert Alpha: %v", err)
+	}
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Runner", File: "/runner.py", Line: 1,
+		Body: "def Runner(): go_fast()", Language: "python",
+	}); err != nil {
+		t.Fatalf("upsert Runner: %v", err)
+	}
+	nodes, err = database.FullTextSearch("go", 20)
+	if err != nil {
+		t.Fatalf("fts go: %v", err)
+	}
+	for _, n := range nodes {
+		if n.Name == "Alpha" || n.Name == "UserService" || n.Name == "AuthHelper" || n.Name == "foo_bar" {
+			t.Fatalf("query go matched %s via language column", n.Name)
+		}
+	}
 }
 
 func TestEscapeFTS5Query(t *testing.T) {
@@ -873,6 +896,46 @@ func TestSupersedeFact(t *testing.T) {
 	// Re-superseding should fail (already inactive)
 	if err := database.SupersedeFact(id1, id2); err == nil {
 		t.Fatal("expected error on superseding inactive fact")
+	}
+}
+
+func TestInsertFactSuperseding(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	id1, err := database.InsertFactSuperseding(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo", Content: "old", ContentHash: "h1", Status: "active",
+	}, 0)
+	if err != nil || id1 == 0 {
+		t.Fatalf("insert only: id=%d err=%v", id1, err)
+	}
+
+	id2, err := database.InsertFactSuperseding(&Fact{
+		TargetFile: "a.go", TargetSymbol: "Foo", Content: "new", ContentHash: "h2", Status: "active",
+	}, id1)
+	if err != nil {
+		t.Fatalf("insert+supersede: %v", err)
+	}
+	old, err := database.GetFactByHash("h1")
+	if err != nil || old == nil {
+		t.Fatalf("get old: %v", err)
+	}
+	if old.Status != "superseded" || old.SupersededBy != id2 {
+		t.Fatalf("old status=%q superseded_by=%d want superseded/%d", old.Status, old.SupersededBy, id2)
+	}
+
+	// Failed supersede must roll back the insert (no orphan row).
+	if _, err := database.InsertFactSuperseding(&Fact{
+		TargetFile: "a.go", Content: "orphan", ContentHash: "h3", Status: "active",
+	}, id1); err == nil {
+		t.Fatal("expected error superseding inactive fact")
+	}
+	got, err := database.GetFactByHash("h3")
+	if err != nil {
+		t.Fatalf("get orphan: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("orphan fact inserted despite failed supersede: %+v", got)
 	}
 }
 

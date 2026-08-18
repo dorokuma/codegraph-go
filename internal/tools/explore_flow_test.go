@@ -275,6 +275,103 @@ func TestExploreFlowRespectsPath(t *testing.T) {
 	}
 }
 
+func TestExplorePathFilterWhenWorkdirIsSymlink(t *testing.T) {
+	real := t.TempDir()
+	keep := filepath.Join(real, "keep")
+	drop := filepath.Join(real, "drop")
+	if err := os.MkdirAll(keep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(drop, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	keepFile := filepath.Join(keep, "a.go")
+	dropFile := filepath.Join(drop, "a.go")
+	database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "KeepSym", File: keepFile, Line: 1, Body: "func KeepSym() { /*KEEP*/ }", Language: "go"})
+	database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "DropSym", File: dropFile, Line: 1, Body: "func DropSym() { /*DROP*/ }", Language: "go"})
+	database.UpsertFile(keepFile, 10, 1)
+	database.UpsertFile(dropFile, 10, 1)
+
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "ws")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	text, err := ToolExplore(context.Background(), database, []string{link}, link, ExploreArgs{
+		Query: "KeepSym DropSym",
+		Path:  "keep",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "/*DROP*/") || strings.Contains(text, filepath.Join("drop", "a.go")) {
+		t.Fatalf("path=keep under symlink workdir must not fall back to whole project:\n%s", text)
+	}
+	if !strings.Contains(text, "KeepSym") && !strings.Contains(text, "/*KEEP*/") {
+		t.Fatalf("expected keep subtree:\n%s", text)
+	}
+
+	textReal, err := ToolExplore(context.Background(), database, []string{link}, link, ExploreArgs{
+		Query: "KeepSym DropSym",
+		Path:  keep,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(textReal, "/*DROP*/") {
+		t.Fatalf("realpath path= under symlink workdir must still narrow:\n%s", textReal)
+	}
+}
+
+func TestExplorePathFilterSymlinkWorkdirRelativeIndexKeys(t *testing.T) {
+	real := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(real, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(real, "drop"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "KeepRel", File: "keep/a.go", Line: 1, Body: "func KeepRel() { /*KEEP*/ }", Language: "go"})
+	database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "DropRel", File: "drop/a.go", Line: 1, Body: "func DropRel() { /*DROP*/ }", Language: "go"})
+	database.UpsertFile("keep/a.go", 10, 1)
+	database.UpsertFile("drop/a.go", 10, 1)
+
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "ws")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	text, err := ToolExplore(context.Background(), database, []string{link}, link, ExploreArgs{
+		Query: "KeepRel DropRel",
+		Path:  "keep",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "/*DROP*/") || strings.Contains(text, "DropRel(function)") {
+		t.Fatalf("relative index keys under symlink workdir must still filter:\n%s", text)
+	}
+	if !strings.Contains(text, "KeepRel") && !strings.Contains(text, "/*KEEP*/") {
+		t.Fatalf("expected keep subtree with relative keys:\n%s", text)
+	}
+}
+
 func TestExploreMaxHonored(t *testing.T) {
 	database, dir, cleanup := seedGraph(t)
 	defer cleanup()

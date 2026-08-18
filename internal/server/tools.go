@@ -309,6 +309,37 @@ func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, ar
 	}
 }
 
+// homeModeRefuseRg is returned when a home-mode session would otherwise pass
+// the entire $HOME / workdir to rg. Explicit path= (including .ssh) still
+// searches that subdirectory via resolvePathIn.
+const homeModeRefuseRg = "home-mode: pass path= or projectPath= to search a tree; refusing to ripgrep the whole home"
+
+// rgSearchRoots chooses directories to pass to rg. An explicit path is always
+// resolved in-jail (intentional search of a subdirectory, including .ssh).
+// When path is empty and projRoot is a broad workdir, never return the home
+// itself: return cached DetectDirs, or refuse=true if none.
+func (s *Server) rgSearchRoots(projRoot, path string) (roots []string, refuse bool, err error) {
+	if path != "" {
+		r, err := s.resolvePathIn(projRoot, path)
+		if err != nil {
+			return nil, false, err
+		}
+		return []string{r}, false, nil
+	}
+	if extraction.IsBroadWorkdir(projRoot) {
+		dirs := s.detectedProjectDirs()
+		if len(dirs) == 0 {
+			return nil, true, nil
+		}
+		return dirs, false, nil
+	}
+	r, err := s.resolvePathIn(projRoot, "")
+	if err != nil {
+		return nil, false, err
+	}
+	return []string{r}, false, nil
+}
+
 // ---------- tool implementations ----------
 
 func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
@@ -330,7 +361,9 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 
 	// Official CodeGraph search is symbol-first. For a plain identifier with no
 	// path/glob/regex metacharacters, hit FTS before spawning rg.
-	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && !args.Regex && isSimpleIdent(args.Pattern) {
+	// no_ignore=true must not take this shortcut: FTS only sees indexed
+	// (non-ignored) files, so --no-ignore has to go through rg.
+	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && !args.Regex && !args.NoIgnore && isSimpleIdent(args.Pattern) {
 		nodes, err := database.FullTextSearchContext(ctx, args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
@@ -345,36 +378,43 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		}
 	}
 
-	root, err := s.resolvePathIn(projRoot, args.Path)
+	roots, refuse, err := s.rgSearchRoots(projRoot, args.Path)
 	if err != nil {
 		return nil, nil, err
 	}
+	if refuse {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: homeModeRefuseRg}},
+		}, nil, nil
+	}
 	perFile := searchPerFileCap(args.MaxResults)
-	rg := exec.CommandContext(ctx, "rg",
-		"--line-number", "--no-heading", "--color=never",
-		fmt.Sprintf("--max-count=%d", perFile),
-	)
-	if args.IgnoreCase {
-		rg.Args = append(rg.Args, "-i")
-	}
-	// Literal matching by default: a caller pattern like "a(b" must search
-	// for that text, not fail as an invalid regex or burn CPU on a crafted
-	// expression. Only the explicit regex=true flag enables regex semantics
-	// (audit M1).
-	if !args.Regex {
-		rg.Args = append(rg.Args, "--fixed-strings")
-	}
-	if args.Glob != "" {
-		rg.Args = append(rg.Args, "--glob", args.Glob)
-	}
-	// Respect .gitignore unless the caller explicitly opts out: ignoring a
-	// path's ignore rules would surface .env/private keys into the agent
-	// (audit M2). no_ignore=true re-enables the old sweep.
-	if args.NoIgnore {
-		rg.Args = append(rg.Args, "--no-ignore")
-	}
-	rg.Args = append(rg.Args, "--", args.Pattern, root)
-	outLines, _, err := rgOutputLines(rg, args.MaxResults, rgMaxOutputBytes)
+	outLines, err := rgEachRoot(roots, args.MaxResults, rgMaxOutputBytes, func(searchRoot string) *exec.Cmd {
+		rg := exec.CommandContext(ctx, "rg",
+			"--line-number", "--no-heading", "--color=never",
+			fmt.Sprintf("--max-count=%d", perFile),
+		)
+		if args.IgnoreCase {
+			rg.Args = append(rg.Args, "-i")
+		}
+		// Literal matching by default: a caller pattern like "a(b" must search
+		// for that text, not fail as an invalid regex or burn CPU on a crafted
+		// expression. Only the explicit regex=true flag enables regex semantics
+		// (audit M1).
+		if !args.Regex {
+			rg.Args = append(rg.Args, "--fixed-strings")
+		}
+		if args.Glob != "" {
+			rg.Args = append(rg.Args, "--glob", args.Glob)
+		}
+		// Respect .gitignore unless the caller explicitly opts out: ignoring a
+		// path's ignore rules would surface .env/private keys into the agent
+		// (audit M2). no_ignore=true re-enables the old sweep.
+		if args.NoIgnore {
+			rg.Args = append(rg.Args, "--no-ignore")
+		}
+		rg.Args = append(rg.Args, "--", args.Pattern, searchRoot)
+		return rg
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("rg search: %w", err)
 	}
@@ -383,10 +423,10 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		// an unindexed area. Check whether any files are indexed under root
 		// and include a hint so the agent knows to use built-in tools.
 		msg := "no matches"
-		if args.Path != "" {
-			indexed, cerr := countIndexedUnder(ctx, database, projRoot, root)
+		if args.Path != "" && len(roots) == 1 {
+			indexed, cerr := countIndexedUnder(ctx, database, projRoot, roots[0])
 			if cerr == nil && indexed == 0 {
-				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, db.RelPath(projRoot, root))
+				msg = fmt.Sprintf("no matches; path %q may not be indexed (0 indexed files under %s)", args.Path, db.RelPath(projRoot, roots[0]))
 			}
 		}
 		return &mcp.CallToolResult{
@@ -589,7 +629,17 @@ func (s *Server) toolCallees(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 
 	// Fallback: body-parse via rg (legacy path in callees_fallback.go).
-	return s.toolCalleesBodyFallback(ctx, root, database, args)
+	// Home-mode with empty path must not ripgrep the whole home.
+	rgRoots, refuse, rerr := s.rgSearchRoots(root, args.Path)
+	if rerr != nil {
+		return nil, nil, rerr
+	}
+	if refuse {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no call edges in the graph; " + homeModeRefuseRg}},
+		}, nil, nil
+	}
+	return s.toolCalleesBodyFallback(ctx, root, database, args, rgRoots...)
 }
 
 func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args nameArgs) (*mcp.CallToolResult, any, error) {
@@ -618,23 +668,31 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 	}
 
 	// Fallback: ripgrep references (labeled so the agent knows).
-	searchRoot, err := s.resolvePathIn(root, args.Path)
+	searchRoots, refuse, err := s.rgSearchRoots(root, args.Path)
 	if err != nil {
 		return nil, nil, err
+	}
+	if refuse {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no call edges in the graph; " + homeModeRefuseRg}},
+		}, nil, nil
 	}
 	rgCap := args.MaxResults * 3
 	if rgCap > 200 {
 		rgCap = 200
 	}
-	rg := exec.CommandContext(ctx, "rg",
-		"--line-number", "--no-heading", "--color=never",
-		"--fixed-strings",
-		fmt.Sprintf("--max-count=%d", rgCap),
-		"-w", args.Name, searchRoot)
-	if args.Glob != "" {
-		rg.Args = append(rg.Args, "--glob", args.Glob)
-	}
-	outLines, _, err := rgOutputLines(rg, rgCap, rgMaxOutputBytes)
+	outLines, err := rgEachRoot(searchRoots, rgCap, rgMaxOutputBytes, func(searchRoot string) *exec.Cmd {
+		rg := exec.CommandContext(ctx, "rg",
+			"--line-number", "--no-heading", "--color=never",
+			"--fixed-strings",
+			fmt.Sprintf("--max-count=%d", rgCap),
+			"-w", args.Name)
+		if args.Glob != "" {
+			rg.Args = append(rg.Args, "--glob", args.Glob)
+		}
+		rg.Args = append(rg.Args, searchRoot)
+		return rg
+	})
 	if err != nil {
 		if len(outLines) == 0 {
 			return nil, nil, fmt.Errorf("rg callers fallback: %w", err)
@@ -700,15 +758,21 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil, nil
 	}
 
-	root, err := s.resolvePathIn(projRoot, args.Path)
+	searchRoots, refuse, err := s.rgSearchRoots(projRoot, args.Path)
 	if err != nil {
 		return nil, nil, err
 	}
-	rg := exec.CommandContext(ctx, "rg",
-		"--line-number", "--no-heading", "--color=never",
-		"--fixed-strings",
-		"-c", "-w", args.Name, root)
-	outLines, _, err := rgOutputLines(rg, args.MaxResults, rgMaxOutputBytes)
+	if refuse {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "no call edges in the graph; " + homeModeRefuseRg}},
+		}, nil, nil
+	}
+	outLines, err := rgEachRoot(searchRoots, args.MaxResults, rgMaxOutputBytes, func(searchRoot string) *exec.Cmd {
+		return exec.CommandContext(ctx, "rg",
+			"--line-number", "--no-heading", "--color=never",
+			"--fixed-strings",
+			"-c", "-w", args.Name, searchRoot)
+	})
 	if err != nil {
 		if len(outLines) == 0 {
 			return nil, nil, fmt.Errorf("rg impact fallback: %w", err)
@@ -896,36 +960,9 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	}
 	defer s.releaseProject(root)
 
-	// Normalize targetFile and confine it to the project root. The check is
-	// two-layered, mirroring resolvePathIn: a lexical jail (absolute paths
-	// outside the root and relative ../ escapes are rejected — a fact must
-	// never target a file outside the project) and a real-path check (a
-	// symlink inside the project pointing outside is an escape too). Real
-	// path handling follows the deepest existing ancestor, so a not-yet-
-	// created target file (a legal future file) stays allowed as long as its
-	// existing prefix does not escape.
-	targetFile := filepath.Clean(args.TargetFile)
-	if !filepath.IsAbs(targetFile) {
-		targetFile = filepath.Clean(filepath.Join(root, targetFile))
-	}
-	if rel, rerr := filepath.Rel(root, targetFile); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, nil, fmt.Errorf("targetFile %q is outside the project root %q", args.TargetFile, s.displayRoot(root))
-	}
-	realTarget, rerr := filepath.EvalSymlinks(targetFile)
-	if rerr != nil {
-		realTarget, rerr = resolveExistingAncestor(targetFile)
-		if rerr != nil {
-			return nil, nil, fmt.Errorf("targetFile %q cannot be resolved: %v", args.TargetFile, rerr)
-		}
-	}
-	if !pathWithinRealRoot(s.realRoot(root), realTarget) {
-		return nil, nil, fmt.Errorf("targetFile %q resolves to %q outside the project root %q (symlink escape)", args.TargetFile, s.displayPath(realTarget), s.displayRoot(root))
-	}
-	// Store the workdir-relative key (portable, like the indexer's keys).
-	if rel, rerr := filepath.Rel(root, targetFile); rerr == nil && rel != "." {
-		targetFile = filepath.ToSlash(rel)
-	} else if rerr == nil {
-		targetFile = "."
+	targetFile, nerr := s.normalizeFactTargetFile(root, args.TargetFile)
+	if nerr != nil {
+		return nil, nil, nerr
 	}
 
 	// SHA-256 of content
@@ -955,17 +992,8 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		Author:       args.Author,
 		Status:       "active",
 	}
-	newID, err := database.InsertFact(f)
-	if err != nil {
+	if _, err := database.InsertFactSuperseding(f, args.Supersedes); err != nil {
 		return nil, nil, fmt.Errorf("insert fact: %w", err)
-	}
-
-	// Handle supersedes after insert so we can link the new ID
-	var supersedeErr string
-	if args.Supersedes > 0 {
-		if err := database.SupersedeFact(args.Supersedes, newID); err != nil {
-			supersedeErr = err.Error()
-		}
 	}
 
 	inserted, _ := database.GetFactByHashAndTarget(hash, targetFile, args.TargetSymbol)
@@ -974,11 +1002,44 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	resp := map[string]interface{}{
 		"duplicate": false,
 	}
-	if supersedeErr != "" {
-		resp["supersede_warning"] = supersedeErr
-	}
 
 	return s.storeFactResponse(inserted, sameTargetFacts, resp)
+}
+
+// normalizeFactTargetFile confines targetFile to root (lexical jail + realpath)
+// and returns the workdir-relative storage key used by facts. Store and search
+// must share this so an absolute or dirty path finds the same row.
+func (s *Server) normalizeFactTargetFile(root, raw string) (string, error) {
+	// Two-layered, mirroring resolvePathIn: a lexical jail (absolute paths
+	// outside the root and relative ../ escapes are rejected — a fact must
+	// never target a file outside the project) and a real-path check (a
+	// symlink inside the project pointing outside is an escape too). Real
+	// path handling follows the deepest existing ancestor, so a not-yet-
+	// created target file (a legal future file) stays allowed as long as its
+	// existing prefix does not escape.
+	targetFile := filepath.Clean(raw)
+	if !filepath.IsAbs(targetFile) {
+		targetFile = filepath.Clean(filepath.Join(root, targetFile))
+	}
+	if rel, rerr := filepath.Rel(root, targetFile); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("targetFile %q is outside the project root %q", raw, s.displayRoot(root))
+	}
+	realTarget, rerr := filepath.EvalSymlinks(targetFile)
+	if rerr != nil {
+		realTarget, rerr = resolveExistingAncestor(targetFile)
+		if rerr != nil {
+			return "", fmt.Errorf("targetFile %q cannot be resolved: %v", raw, rerr)
+		}
+	}
+	if !pathWithinRealRoot(s.realRoot(root), realTarget) {
+		return "", fmt.Errorf("targetFile %q resolves to %q outside the project root %q (symlink escape)", raw, s.displayPath(realTarget), s.displayRoot(root))
+	}
+	if rel, rerr := filepath.Rel(root, targetFile); rerr == nil && rel != "." {
+		return filepath.ToSlash(rel), nil
+	} else if rerr == nil {
+		return ".", nil
+	}
+	return filepath.ToSlash(targetFile), nil
 }
 
 // storeFactResponse marshals the store_fact JSON payload with hard bounds:
@@ -1055,7 +1116,16 @@ func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, ar
 		status = "active"
 	}
 
-	facts, err := database.SearchFacts(args.Query, args.TargetFile, args.TargetSymbol, status, max)
+	targetFile := args.TargetFile
+	if targetFile != "" {
+		norm, nerr := s.normalizeFactTargetFile(root, targetFile)
+		if nerr != nil {
+			return nil, nil, nerr
+		}
+		targetFile = norm
+	}
+
+	facts, err := database.SearchFacts(args.Query, targetFile, args.TargetSymbol, status, max)
 	if err != nil {
 		return nil, nil, fmt.Errorf("search facts: %w", err)
 	}

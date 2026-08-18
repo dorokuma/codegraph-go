@@ -89,13 +89,34 @@ func isGoToolchainPath(slash string) bool {
 			continue
 		}
 		if i+1 >= len(parts) {
-			// path ends at .../go — whole GOPATH root
-			return true
+			// path ends at .../go — skip only known GOPATH roots, not
+			// project dirs named "go" (sdk/go, internal/go, clients/go).
+			return isGopathRoot(slash)
 		}
 		next := parts[i+1]
 		if next == "pkg" || next == "bin" || next == "src" {
 			return true
 		}
+	}
+	return false
+}
+
+// isGopathRoot reports whether slash-normalized path is a GOPATH workspace
+// root: /root/go, $HOME/go, /home/<user>/go, or /Users/<user>/go.
+func isGopathRoot(slash string) bool {
+	slash = strings.TrimSuffix(slash, "/")
+	if slash == "/root/go" {
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if slash == filepath.ToSlash(filepath.Join(home, "go")) {
+			return true
+		}
+	}
+	parts := strings.Split(slash, "/")
+	// "/home/u/go" → ["", "home", "u", "go"]
+	if len(parts) == 4 && (parts[1] == "home" || parts[1] == "Users") && parts[2] != "" && parts[3] == "go" {
+		return true
 	}
 	return false
 }

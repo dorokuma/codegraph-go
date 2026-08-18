@@ -158,6 +158,7 @@ func TestSynthReactFullFlow(t *testing.T) {
 
 	assertSynthCall(t, database, "dirty", "render", "react-render")
 	assertSynthCall(t, database, "render", "StaticCanvas", "jsx-render")
+
 	assertGraphCall(t, database, "StaticCanvas", "renderStaticScene")
 
 	// explore Flow must walk the whole chain among named symbols.
@@ -441,3 +442,69 @@ func TestSynthGoFrameExploreFlow(t *testing.T) {
 		}
 	}
 }
+
+func TestJSXChildPicksSameDirectoryOverFirstWins(t *testing.T) {
+	dir := t.TempDir()
+	near := filepath.Join(dir, "ui")
+	far := filepath.Join(dir, "other")
+	if err := os.MkdirAll(near, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(far, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Insert the far Card first so first-wins would pick it.
+	if err := os.WriteFile(filepath.Join(far, "Card.tsx"), []byte(
+		"export function Card() { return <div>far</div>; }\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(near, "Card.tsx"), []byte(
+		"export function Card() { return <div>near</div>; }\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(near, "Page.tsx"), []byte(
+		"export function Page() { return <Card />; }\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	database := indexDir(t, dir)
+	pages, err := database.GetNodeByName("Page")
+	if err != nil || len(pages) == 0 {
+		t.Fatalf("Page missing: %v", err)
+	}
+	var page db.Node
+	for _, n := range pages {
+		if n.Kind == db.KindFunction || n.Kind == "component" {
+			page = n
+			break
+		}
+	}
+	if page.ID == 0 {
+		page = pages[0]
+	}
+	edges, err := database.GetOutgoingEdges(page.ID, []string{db.EdgeCalls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hit *db.Node
+	for _, e := range edges {
+		tgt, err := database.GetNodeByID(e.TargetID)
+		if err != nil || tgt == nil || tgt.Name != "Card" {
+			continue
+		}
+		hit = tgt
+		break
+	}
+	if hit == nil {
+		t.Fatalf("Page should synth-call a Card, outgoing=%+v", edges)
+	}
+	wantDir := filepath.ToSlash(filepath.Join("ui", "Card.tsx"))
+	if filepath.ToSlash(hit.File) != wantDir && !strings.HasSuffix(filepath.ToSlash(hit.File), "/"+wantDir) {
+		t.Fatalf("JSX child should pick same-dir Card (%s), got file=%q", wantDir, hit.File)
+	}
+}
+
+

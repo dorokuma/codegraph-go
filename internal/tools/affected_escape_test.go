@@ -63,11 +63,57 @@ func TestToolAffectedRejectsSymlinkEscape(t *testing.T) {
 	if res != nil && len(res.Content) > 0 {
 		text = res.Content[0].Text
 	}
-	if strings.Contains(text, "evil") {
+	head := text
+	if i := strings.Index(text, "skipped"); i >= 0 {
+		head = text[:i]
+	}
+	if strings.Contains(head, "evil") {
 		t.Fatalf("symlink-escape paths leaked into the affected set:\n%s", text)
 	}
 	if !strings.Contains(text, "pkg/a_test.go") {
 		t.Fatalf("legit same-package test missing from the result:\n%s", text)
+	}
+	if !strings.Contains(text, "skipped 2 input(s)") {
+		t.Fatalf("expected skipped-input note, got:\n%s", text)
+	}
+}
+
+func TestToolAffectedAllInputsDiscarded(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	base := t.TempDir()
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "ws")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(ws, "evil")
+	if err := os.Symlink(outside, evil); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	res, err := ToolAffected(context.Background(), database, ws, AffectedArgs{
+		Files: []string{"../outside/x.go", "evil/secret_test.go"},
+	})
+	if err != nil {
+		t.Fatalf("tool affected: %v", err)
+	}
+	text := ""
+	if res != nil && len(res.Content) > 0 {
+		text = res.Content[0].Text
+	}
+	if strings.Contains(text, "No affected test files found.") {
+		t.Fatalf("all-discarded must not look like an empty test set:\n%s", text)
+	}
+	if !strings.Contains(text, "discarded") {
+		t.Fatalf("expected discarded-inputs message, got:\n%s", text)
+	}
+	if !strings.Contains(text, "lexical") && !strings.Contains(text, "symlink") {
+		t.Fatalf("expected skip reasons, got:\n%s", text)
 	}
 }
 

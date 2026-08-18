@@ -35,33 +35,7 @@ func (s *Server) detectProject(queries ...string) string {
 		return ""
 	}
 
-	// Populate cached project directories from ALL workdirs.
-	s.DetectMu.Lock()
-	if !s.DetectDone {
-		for _, wd := range s.Workdirs {
-			entries, err := os.ReadDir(wd)
-			if err != nil {
-				continue
-			}
-			for _, e := range entries {
-				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-					continue
-				}
-				projectDir := filepath.Join(wd, e.Name())
-				if extraction.HasProjectMarker(projectDir) {
-					s.DetectDirs = append(s.DetectDirs, projectDir)
-				}
-			}
-		}
-		s.DetectDone = true
-	}
-	// Snapshot the cache under the lock: resetDetect (triggered concurrently
-	// by projectPath lookup failures) may clear or replace DetectDirs at any
-	// time, so the match loops below must never iterate the live slice
-	// (race). Iterating a copy keeps the cache semantics unchanged.
-	dirs := make([]string, len(s.DetectDirs))
-	copy(dirs, s.DetectDirs)
-	s.DetectMu.Unlock()
+	dirs := s.detectedProjectDirs()
 
 	// Exact match against the base name.
 	for _, q := range queries {
@@ -96,6 +70,38 @@ func (s *Server) detectProject(queries ...string) string {
 		}
 	}
 	return ""
+}
+
+// detectedProjectDirs returns a snapshot of cached project directories under
+// configured workdirs (the same list detectProject matches against). The
+// cache is populated on first use. Callers must not mutate the returned slice.
+func (s *Server) detectedProjectDirs() []string {
+	s.DetectMu.Lock()
+	if !s.DetectDone {
+		for _, wd := range s.Workdirs {
+			entries, err := os.ReadDir(wd)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				projectDir := filepath.Join(wd, e.Name())
+				if extraction.HasProjectMarker(projectDir) {
+					s.DetectDirs = append(s.DetectDirs, projectDir)
+				}
+			}
+		}
+		s.DetectDone = true
+	}
+	// Snapshot the cache under the lock: resetDetect (triggered concurrently
+	// by projectPath lookup failures) may clear or replace DetectDirs at any
+	// time, so callers must never iterate the live slice (race).
+	dirs := make([]string, len(s.DetectDirs))
+	copy(dirs, s.DetectDirs)
+	s.DetectMu.Unlock()
+	return dirs
 }
 
 // stripDetectedProjectPrefix drops a leading project directory name from path
