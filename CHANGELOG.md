@@ -3,6 +3,12 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.5] - 2026-08-21
+
+### Changed
+- 纯重构，无行为变化：拆分三个千行文件。`db/query.go`（2493 行）按领域拆为 nodes/files/refs/edges/facts/index 六个文件；`extraction/orchestrator.go`（1308 行）拆出文件级操作与 `indexFile` 写入器；`extraction/extractor.go`（1443 行）按语言族拆为六个文件。全量测试与 race 验证通过。
+- Display / daemon wire version **0.9.5**。
+
 ## [0.9.4] - 2026-08-21
 
 ### Fixed
