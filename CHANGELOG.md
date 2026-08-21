@@ -8,6 +8,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Fixed
 - daemon unix socket 绑定时临时设置 umask 0077，堵住 socket 创建到 chmod 之间的组/其他权限窗口；最终权限仍为 0600。
 - 同名候选超过 1 万条时不再被静默丢弃：`CollectCandidates` 改为分页遍历全部匹配。
+- deploy.sh 预热就绪判断要求 pidfile 记录的 pid 等于本次 spawn 的进程，不再把抢先复活的另一个 daemon 的产物误判为新 daemon 就绪；spawn 失败但已有存活 daemon 在服务时改报 INFO 而非 WARN。
+- deploy.sh 注册表清理在有存活 daemon 时跳过按 workdir 的记录删除，只按被杀 PID 清理，存活 daemon 的发现记录不再丢失。
 
 ### Changed
 - deploy.sh 的 daemon 注册表清理改用 `scripts/cleanup_daemon_registry.py`（JSON 解析后精确匹配 PID/root，畸形记录保留，出错立即失败）；deploy.sh 现在依赖 python3，缺失时部署直接失败并报错。

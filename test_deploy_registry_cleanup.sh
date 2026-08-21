@@ -99,12 +99,14 @@ mkdir -p "$REG_DIR"
 execute_cleanup() {
   local killed_pid="$1"
   local workdir="$2"
-  local code_home="${3:-$TMP_DIR}"
+  local remaining="${3:-}"
+  local code_home="${4:-$TMP_DIR}"
   
   (
     CODEGRAPH_HOME="$code_home"
     KILLED_PID="$killed_pid"
     WORKDIR="$workdir"
+    REMAINING="$remaining"
     
     REG_DIR="${CODEGRAPH_HOME:-$HOME/.codegraph}/daemons"
     if [ -d "$REG_DIR" ]; then
@@ -112,7 +114,13 @@ execute_cleanup() {
         echo "DEPLOY FAILED: python3 is required for registry cleanup" >&2
         exit 1
       fi
-      python3 "$CLEANUP_SCRIPT" "$REG_DIR" "${KILLED_PID:-}" "${WORKDIR:-}"
+      # Mirrors deploy.sh: workdir-scoped cleanup only when no live
+      # daemon remains; killed-PID cleanup always runs.
+      if [ -z "$REMAINING" ]; then
+        python3 "$CLEANUP_SCRIPT" "$REG_DIR" "${KILLED_PID:-}" "${WORKDIR:-}"
+      else
+        python3 "$CLEANUP_SCRIPT" "$REG_DIR" "${KILLED_PID:-}" ""
+      fi
     fi
   )
 }
@@ -259,6 +267,33 @@ if "$CLEANUP_SCRIPT" "$TMP_DIR/nonexistent_daemons_dir" 123 "/test/path"; then
   PASSED_TESTS=$((PASSED_TESTS + 1))
 else
   echo "FAILED"
+  exit 1
+fi
+
+# --- 场景 9: 存活 daemon 时保留其记录，仍按 PID 删除被杀记录 ---
+echo "=== 场景 9: 有存活 daemon 时按 workdir 的清理被跳过 ==="
+cat > "$REG_DIR/live_daemon.json" <<'EOF'
+{"pid": 555, "root": "/workspace/live", "version": "0.9.3", "socketPath": "/tmp/live.sock"}
+EOF
+cat > "$REG_DIR/dead_daemon.json" <<'EOF'
+{"pid": 777, "root": "/workspace/live", "version": "0.9.2", "socketPath": "/tmp/dead.sock"}
+EOF
+
+# REMAINING 非空：workdir 匹配必须跳过；被杀 PID 的记录仍要删。
+execute_cleanup "777" "/workspace/live" "555"
+
+run_test "Live daemon record preserved when daemons remain"
+assert_file_exists "$REG_DIR/live_daemon.json"
+
+run_test "Killed daemon record still removed by PID"
+assert_file_not_exists "$REG_DIR/dead_daemon.json"
+
+run_test "deploy.sh guards workdir cleanup on empty REMAINING"
+if grep -qF '[ -z "$REMAINING" ]' "$DEPLOY_SCRIPT"; then
+  echo "OK"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "FAILED (expected REMAINING guard around cleanup invocation)"
   exit 1
 fi
 

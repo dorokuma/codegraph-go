@@ -291,7 +291,16 @@ if [ -d "$REG_DIR" ]; then
     echo "DEPLOY FAILED: python3 is required for registry cleanup" >&2
     exit 1
   fi
-  python3 "$ROOT/scripts/cleanup_daemon_registry.py" "$REG_DIR" "${KILLED_PID:-}" "${WORKDIR:-}"
+  # WORKDIR-scoped record cleanup only when no live daemon remains for
+  # this workdir. If a daemon survived (client respawn race), deleting
+  # its record by workdir match would leave a live daemon undiscoverable
+  # until its next restart; killed-PID cleanup always runs because that
+  # daemon is gone either way.
+  if [ -z "$REMAINING" ]; then
+    python3 "$ROOT/scripts/cleanup_daemon_registry.py" "$REG_DIR" "${KILLED_PID:-}" "${WORKDIR:-}"
+  else
+    python3 "$ROOT/scripts/cleanup_daemon_registry.py" "$REG_DIR" "${KILLED_PID:-}" ""
+  fi
 fi
 # Pre-warm: spawn the new daemon detached — the shell equivalent of Go-side
 # SpawnDetached (internal/daemon/spawn.go): setsid puts the daemon in its own
@@ -336,22 +345,34 @@ SPAWN_PID=$!
 # ready. Not ready is idempotent: the next client spawns automatically.
 ready=0
 for i in $(seq 1 15); do
-  if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ] \
-     && ! flock -n "$WORKDIR/.codegraph/codegraph.lock" true 2>/dev/null \
-     && kill -0 "$SPAWN_PID" 2>/dev/null; then
-    ready=1
+  if ! kill -0 "$SPAWN_PID" 2>/dev/null; then
     break
   fi
-  if ! kill -0 "$SPAWN_PID" 2>/dev/null; then
+  # All conditions must describe THE spawned process, not another daemon
+  # that won the lock race (e.g. a client respawn during the deploy).
+  # setsid execs in place, so the daemon keeps $SPAWN_PID — require the
+  # pidfile pid to match before calling this ready.
+  NEWPID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+  if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ] \
+     && ! flock -n "$WORKDIR/.codegraph/codegraph.lock" true 2>/dev/null \
+     && [ "$NEWPID" = "$SPAWN_PID" ]; then
+    ready=1
     break
   fi
   sleep 0.2
 done
 if [ "$ready" = "1" ]; then
-  NEWPID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" | grep -oE '[0-9]+' | head -1 || true)
-  echo "new daemon warmed up for $WORKDIR (pid $NEWPID)"
+  echo "new daemon warmed up for $WORKDIR (pid $SPAWN_PID)"
 else
-  echo "WARN: daemon warm-up did not take the lock — the next client will spawn it automatically"
+  # Distinguish "another live daemon is already serving" (fine — keep it,
+  # its discovery record was preserved above) from a genuinely failed
+  # warm-up (next client spawns automatically).
+  SERVING=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+  if [ -n "$SERVING" ] && kill -0 "$SERVING" 2>/dev/null; then
+    echo "INFO: live daemon already serving $WORKDIR (pid $SERVING) — warm-up spawn exited without taking over"
+  else
+    echo "WARN: daemon warm-up did not take the lock — the next client will spawn it automatically"
+  fi
 fi
 
 echo "=== 验证 ==="
