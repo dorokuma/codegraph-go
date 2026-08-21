@@ -195,7 +195,7 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	// Also any pending/failed whose name might be defined in changed files.
 	changedNames := map[string]bool{}
 	for _, f := range files {
-		nodes, err := database.GetNodesByFile(f)
+		nodes, err := database.GetNodesByFileLight(f)
 		if err != nil {
 			continue
 		}

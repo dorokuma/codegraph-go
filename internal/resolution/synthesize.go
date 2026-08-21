@@ -268,7 +268,11 @@ func (c *synthCtx) getNodesByName(name string) []db.Node {
 	if v, ok := c.nodesByName[name]; ok {
 		return v
 	}
-	nodes, err := c.db.GetNodeByName(name)
+	var nodes []db.Node
+	err := c.db.ForEachNodeByName(name, func(n db.Node) error {
+		nodes = append(nodes, n)
+		return nil
+	})
 	if err != nil {
 		nodes = nil
 	}

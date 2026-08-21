@@ -3,7 +3,19 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.3] - 2026-08-21
+
+### Fixed
+- daemon unix socket 绑定时临时设置 umask 0077，堵住 socket 创建到 chmod 之间的组/其他权限窗口；最终权限仍为 0600。
+- 同名候选超过 1 万条时不再被静默丢弃：`CollectCandidates` 改为分页遍历全部匹配。
+
+### Changed
+- deploy.sh 的 daemon 注册表清理改用 `scripts/cleanup_daemon_registry.py`（JSON 解析后精确匹配 PID/root，畸形记录保留，出错立即失败）；deploy.sh 现在依赖 python3，缺失时部署直接失败并报错。
+- 按文件、按名的节点查询增加 1 万条上限与 keyset 分页；图快照改用不含 body 的轻量投影。
+- search 简单标识符捷径改用无 body 的轻量查询，行号按符号范围回读源文件定位（单文件上限 10MB）。
+- community 在索引超过节点上限时先拒绝再加载快照；快照被截断时在报告中输出警告。
+- 跨项目 DB 缓存的 pending-close 条目可复活复用；新项目打开失败时回滚驱逐操作。
+- Display / daemon wire version **0.9.3**。
 
 ## [0.9.2] - 2026-08-18
 

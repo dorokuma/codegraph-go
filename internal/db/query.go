@@ -621,13 +621,9 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 	if file == "" {
 		return nil
 	}
-	nodes, err := d.GetNodesByFile(file)
-	if err != nil {
-		return err
-	}
-	for _, target := range nodes {
+	return d.ForEachNodeByFileLight(file, func(target Node) error {
 		if target.Kind == KindFile || target.Kind == "module" {
-			continue
+			return nil
 		}
 		incoming, err := d.GetIncomingEdges(target.ID, inboundParkKinds)
 		if err != nil {
@@ -659,8 +655,8 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 				return err
 			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // CountUnresolvedRefs returns how many unresolved_refs rows match status
@@ -959,6 +955,11 @@ const nodeSelectCols = `id, kind, name, file, line, end_line, body, language,
 	qualified_name, signature, docstring, start_column, end_column,
 	visibility, is_exported, return_type`
 
+// nodeLightSelectCols is the lightweight column list for Node scans omitting body.
+const nodeLightSelectCols = `id, kind, name, file, line, end_line, '' AS body, language,
+	qualified_name, signature, docstring, start_column, end_column,
+	visibility, is_exported, return_type`
+
 // DeleteUnresolvedRef removes one unresolved_refs row (resolved successfully).
 func (d *DB) DeleteUnresolvedRef(id int64) error {
 	d.mu.Lock()
@@ -977,22 +978,160 @@ func (d *DB) MarkUnresolvedFailed(id int64, nameTail string) error {
 	return err
 }
 
-// GetNodesByFile returns all nodes defined in a file path.
+// getNodesByFileCap bounds GetNodesByFile results to prevent unbounded reads.
+// Test-only mutation: tests that change this value must restore it and must
+// not run in parallel with other tests in this package.
+var getNodesByFileCap = 10_000
+
+// SetGetNodesByFileCapForTest overrides getNodesByFileCap for testing and returns the previous value.
+func SetGetNodesByFileCapForTest(newCap int) int {
+	old := getNodesByFileCap
+	getNodesByFileCap = newCap
+	return old
+}
+
+// GetNodesByFile returns nodes defined in a file path WITH bodies, capped at getNodesByFileCap.
 func (d *DB) GetNodesByFile(file string) ([]Node, error) {
 	return d.GetNodesByFileContext(context.Background(), file)
 }
 
-// GetNodesByFileContext is the context-aware variant of GetNodesByFile.
+// GetNodesByFileContext is the context-aware variant of GetNodesByFile (loads bodies).
 func (d *DB) GetNodesByFileContext(ctx context.Context, file string) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.QueryContext(ctx, `SELECT `+nodeSelectCols+` FROM nodes WHERE file = ?`, file)
+	rows, err := d.conn.QueryContext(ctx, `
+		SELECT `+nodeSelectCols+`
+		FROM nodes WHERE file = ?
+		ORDER BY id LIMIT ?
+	`, file, getNodesByFileCap)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanNodes(rows)
+}
+
+// GetNodesByFileLightLimitedContext returns up to limit nodes defined in file (omitting body)
+// and reports whether more nodes exist for that file.
+func (d *DB) GetNodesByFileLightLimitedContext(ctx context.Context, file string, limit int) ([]Node, bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = getNodesByFileCap
+	}
+	rows, err := d.conn.QueryContext(ctx, `
+		SELECT `+nodeLightSelectCols+`
+		FROM nodes WHERE file = ?
+		ORDER BY id LIMIT ?
+	`, file, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	nodes, err := scanNodes(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(nodes) > limit
+	if truncated {
+		nodes = nodes[:limit]
+	}
+	return nodes, truncated, nil
+}
+
+// GetNodesByFileLight returns nodes defined in a file path without bodies, capped at getNodesByFileCap.
+func (d *DB) GetNodesByFileLight(file string) ([]Node, error) {
+	return d.GetNodesByFileLightContext(context.Background(), file)
+}
+
+// GetNodesByFileLightContext is the context-aware variant of GetNodesByFileLight (omits body).
+func (d *DB) GetNodesByFileLightContext(ctx context.Context, file string) ([]Node, error) {
+	nodes, _, err := d.GetNodesByFileLightLimitedContext(ctx, file, getNodesByFileCap)
+	return nodes, err
+}
+
+// ForEachNodeByFileLight iterates through all nodes in file without bodies using keyset pagination.
+func (d *DB) ForEachNodeByFileLight(file string, fn func(n Node) error) error {
+	return d.ForEachNodeByFileLightContext(context.Background(), file, fn)
+}
+
+// ForEachNodeByFileLightContext iterates through all nodes in file without bodies using keyset pagination.
+func (d *DB) ForEachNodeByFileLightContext(ctx context.Context, file string, fn func(n Node) error) error {
+	if file == "" {
+		return nil
+	}
+	const batchSize = 1000
+	var lastID int64
+	for {
+		nodes, err := func() ([]Node, error) {
+			d.mu.RLock()
+			defer d.mu.RUnlock()
+			rows, err := d.conn.QueryContext(ctx, `
+				SELECT `+nodeLightSelectCols+`
+				FROM nodes WHERE file = ? AND id > ?
+				ORDER BY id LIMIT ?
+			`, file, lastID, batchSize)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			return scanNodes(rows)
+		}()
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			if err := fn(n); err != nil {
+				return err
+			}
+			lastID = n.ID
+		}
+		if len(nodes) < batchSize {
+			break
+		}
+	}
+	return nil
+}
+
+// getNodeByNameCap bounds GetNodeByName results to prevent unbounded reads.
+var getNodeByNameCap = 10_000
+
+// GetNodeByNameLimited finds nodes by name (exact match) up to limit, and reports truncation.
+func (d *DB) GetNodeByNameLimited(name string, limit int) ([]Node, bool, error) {
+	return d.GetNodeByNameLimitedContext(context.Background(), name, limit)
+}
+
+// GetNodeByNameLimitedContext finds nodes by name up to limit, and reports truncation.
+func (d *DB) GetNodeByNameLimitedContext(ctx context.Context, name string, limit int) ([]Node, bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = getNodeByNameCap
+	}
+	rows, err := d.conn.QueryContext(ctx, `
+		SELECT `+nodeSelectCols+`
+		FROM nodes WHERE name = ?
+		ORDER BY id LIMIT ?
+	`, name, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	nodes, err := scanNodes(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(nodes) > limit
+	if truncated {
+		nodes = nodes[:limit]
+	}
+	return nodes, truncated, nil
 }
 
 // GetNodeByName finds nodes by name (exact match).
@@ -1002,18 +1141,54 @@ func (d *DB) GetNodeByName(name string) ([]Node, error) {
 
 // GetNodeByNameContext is the context-aware variant of GetNodeByName.
 func (d *DB) GetNodeByNameContext(ctx context.Context, name string) ([]Node, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	nodes, _, err := d.GetNodeByNameLimitedContext(ctx, name, getNodeByNameCap)
+	return nodes, err
+}
 
-	rows, err := d.conn.QueryContext(ctx, `
-		SELECT `+nodeSelectCols+`
-		FROM nodes WHERE name = ?
-	`, name)
-	if err != nil {
-		return nil, err
+// ForEachNodeByName iterates through all nodes matching name using keyset pagination.
+func (d *DB) ForEachNodeByName(name string, fn func(n Node) error) error {
+	return d.ForEachNodeByNameContext(context.Background(), name, fn)
+}
+
+// ForEachNodeByNameContext iterates through all nodes matching name using keyset pagination.
+func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(n Node) error) error {
+	if name == "" {
+		return nil
 	}
-	defer rows.Close()
-	return scanNodes(rows)
+	const batchSize = 1000
+	var lastID int64
+	for {
+		nodes, err := func() ([]Node, error) {
+			d.mu.RLock()
+			defer d.mu.RUnlock()
+			rows, err := d.conn.QueryContext(ctx, `
+				SELECT `+nodeSelectCols+`
+				FROM nodes WHERE name = ? AND id > ?
+				ORDER BY id LIMIT ?
+			`, name, lastID, batchSize)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			return scanNodes(rows)
+		}()
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			if err := fn(n); err != nil {
+				return err
+			}
+			lastID = n.ID
+		}
+		if len(nodes) < batchSize {
+			break
+		}
+	}
+	return nil
 }
 
 // GetNodeByID loads one node by primary key.
@@ -1646,6 +1821,21 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 	return ids, nil
 }
 
+// CountNodes returns the total number of nodes in the index.
+func (d *DB) CountNodes() (int, error) {
+	return d.CountNodesContext(context.Background())
+}
+
+// CountNodesContext is the context-aware variant of CountNodes.
+func (d *DB) CountNodesContext(ctx context.Context) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var n int
+	err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM nodes").Scan(&n)
+	return n, err
+}
+
 // Stats returns index statistics.
 type Stats struct {
 	NodeCount  int
@@ -1723,6 +1913,112 @@ func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 		files = append(files, p)
 	}
 	return files, rows.Err()
+}
+
+// FindFileCandidatesContext finds candidate file paths in the files table
+// matching a path or basename hint without scanning the full table.
+func (d *DB) FindFileCandidatesContext(ctx context.Context, hint string) ([]string, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return nil, nil
+	}
+
+	hClean := filepath.ToSlash(filepath.Clean(hint))
+	hTrim := strings.TrimPrefix(hClean, "./")
+	hBase := filepath.Base(hClean)
+
+	exacts := map[string]bool{}
+	var exactList []string
+	for _, p := range []string{hint, hClean, hTrim} {
+		if p != "" && !exacts[p] {
+			exacts[p] = true
+			exactList = append(exactList, p)
+		}
+	}
+
+	seen := make(map[string]bool)
+	var paths []string
+
+	// Exact matches must take priority and cannot be evicted by broad LIKE matches.
+	if len(exactList) > 0 {
+		var exactWheres []string
+		var exactArgs []interface{}
+		for _, p := range exactList {
+			exactWheres = append(exactWheres, "path = ?")
+			exactArgs = append(exactArgs, p)
+		}
+		qExact := `SELECT DISTINCT path FROM files WHERE (` + strings.Join(exactWheres, " OR ") + `) ORDER BY path`
+		rows, err := d.conn.QueryContext(ctx, qExact, exactArgs...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("find file candidates scan exact: %w", err)
+			}
+			if !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	patterns := map[string]bool{}
+	if hTrim != "" && hTrim != "." && hTrim != ".." {
+		patterns["%/"+escapeLikePattern(hTrim)] = true
+	}
+	if hBase != "" && hBase != "." && hBase != ".." {
+		patterns[escapeLikePattern(hBase)] = true
+		patterns["%/"+escapeLikePattern(hBase)] = true
+	}
+
+	var patWheres []string
+	var patArgs []interface{}
+	for pat := range patterns {
+		patWheres = append(patWheres, "path LIKE ? ESCAPE '\\'")
+		patArgs = append(patArgs, pat)
+	}
+
+	if len(patWheres) > 0 {
+		qPat := `SELECT DISTINCT path FROM files WHERE (` + strings.Join(patWheres, " OR ") + `) ORDER BY path LIMIT 1000`
+		rows, err := d.conn.QueryContext(ctx, qPat, patArgs...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("find file candidates scan pattern: %w", err)
+			}
+			if !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	return paths, nil
+}
+
+// FindFileCandidates is the background context variant of FindFileCandidatesContext.
+func (d *DB) FindFileCandidates(hint string) ([]string, error) {
+	return d.FindFileCandidatesContext(context.Background(), hint)
 }
 
 // ListFilesInDir returns all indexed files whose parent directory matches dir.
@@ -2123,8 +2419,16 @@ type GraphSnapshot struct {
 
 // graphSnapshotCap bounds the rows loaded per collection to prevent OOM on
 // very large indexes. Exceeding it truncates the snapshot instead of failing.
-// A var (not const) so tests can lower it to exercise the truncation path.
+// Test-only mutation: tests that change this value must restore it and must
+// not run in parallel with other tests in this package.
 var graphSnapshotCap = 500_000
+
+// SetGraphSnapshotCapForTest overrides graphSnapshotCap for testing and returns the previous value.
+func SetGraphSnapshotCapForTest(newCap int) int {
+	old := graphSnapshotCap
+	graphSnapshotCap = newCap
+	return old
+}
 
 // GetGraphSnapshot returns all nodes and edges in one call, protected by RLock.
 // When the index exceeds graphSnapshotCap rows in either collection the result
@@ -2137,7 +2441,7 @@ func (d *DB) GetGraphSnapshot() (*GraphSnapshot, error) {
 	snap := &GraphSnapshot{}
 
 	nodes, err := func() ([]Node, error) {
-		rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes LIMIT ?`, graphSnapshotCap+1)
+		rows, err := d.conn.Query(`SELECT `+nodeLightSelectCols+` FROM nodes LIMIT ?`, graphSnapshotCap+1)
 		if err != nil {
 			return nil, fmt.Errorf("query nodes: %w", err)
 		}

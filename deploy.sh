@@ -287,14 +287,11 @@ fi
 # (leave other projects' records intact).
 REG_DIR="${CODEGRAPH_HOME:-$HOME/.codegraph}/daemons"
 if [ -d "$REG_DIR" ]; then
-  for f in "$REG_DIR"/*.json; do
-    [ -e "$f" ] || continue
-    if [ -n "$KILLED_PID" ] && grep -Fq "\"pid\": $KILLED_PID" "$f" 2>/dev/null; then
-      rm -f "$f"
-    elif [ -n "$WORKDIR" ] && grep -Fq "\"root\": \"$WORKDIR\"" "$f" 2>/dev/null; then
-      rm -f "$f"
-    fi
-  done
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "DEPLOY FAILED: python3 is required for registry cleanup" >&2
+    exit 1
+  fi
+  python3 "$ROOT/scripts/cleanup_daemon_registry.py" "$REG_DIR" "${KILLED_PID:-}" "${WORKDIR:-}"
 fi
 # Pre-warm: spawn the new daemon detached — the shell equivalent of Go-side
 # SpawnDetached (internal/daemon/spawn.go): setsid puts the daemon in its own

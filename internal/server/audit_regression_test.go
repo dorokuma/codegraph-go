@@ -474,3 +474,36 @@ func TestToolFilesCapListings(t *testing.T) {
 		t.Fatalf("files listing exceeded max: %d lines", len(lines))
 	}
 }
+
+// TestToolSearchSimpleIdentLightweight verifies simple identifier searches
+// query lightweight refs without requiring bodies and match line numbers accurately.
+func TestToolSearchSimpleIdentLightweight(t *testing.T) {
+	s, dir := setupToolServer(t)
+	filePath := filepath.Join(dir, "calc.go")
+	code := "package calc\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+	if err := os.WriteFile(filePath, []byte(code), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert a node without body in DB (mimicking lightweight projection or indexing)
+	if _, err := s.Database.UpsertNode(&db.Node{
+		Kind:     db.KindFunction,
+		Name:     "Add",
+		File:     filePath,
+		Line:     3,
+		EndLine:  5,
+		Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _, err := s.toolSearch(context.Background(), nil, searchArgs{Pattern: "Add"})
+	if err != nil {
+		t.Fatalf("toolSearch: %v", err)
+	}
+	text := textContent(res)
+	if !strings.Contains(text, "calc.go:3") {
+		t.Fatalf("expected calc.go:3 in search results, got:\n%s", text)
+	}
+}
+

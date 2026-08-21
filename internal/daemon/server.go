@@ -66,7 +66,7 @@ func (d *Daemon) Start() error {
 	var lastErr error
 	for i, path := range candidates {
 		_ = os.Remove(path) // clear stale socket; we hold the lock
-		ln, err := net.Listen("unix", path)
+		ln, err := listenUnixWithUmask(path)
 		if err != nil {
 			lastErr = err
 			// EADDRINUSE → don't relocate (another live binder); other errors try next.

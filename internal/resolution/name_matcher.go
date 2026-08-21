@@ -119,7 +119,8 @@ func MatchName(candidates []db.Node, refName, fromFile string, preferCall bool) 
 	return best
 }
 
-// CollectCandidates gathers nodes whose name equals ref or its tail segment.
+// CollectCandidates gathers nodes whose name equals ref or its tail segment,
+// paginating through all matches to avoid silently losing candidates.
 func CollectCandidates(database *db.DB, refName string) ([]db.Node, error) {
 	refName = strings.TrimSpace(refName)
 	if refName == "" {
@@ -128,29 +129,28 @@ func CollectCandidates(database *db.DB, refName string) ([]db.Node, error) {
 	seen := map[int64]bool{}
 	var out []db.Node
 
-	add := func(nodes []db.Node) {
-		for _, n := range nodes {
-			if seen[n.ID] {
-				continue
-			}
+	add := func(n db.Node) {
+		if !seen[n.ID] {
 			seen[n.ID] = true
 			out = append(out, n)
 		}
 	}
 
-	nodes, err := database.GetNodeByName(refName)
-	if err != nil {
+	if err := database.ForEachNodeByName(refName, func(n db.Node) error {
+		add(n)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	add(nodes)
 
 	// Class.method / pkg.Func / util.greet
 	if tail := nameTail(refName); tail != "" && tail != refName {
-		more, err := database.GetNodeByName(tail)
-		if err != nil {
+		if err := database.ForEachNodeByName(tail, func(n db.Node) error {
+			add(n)
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-		add(more)
 	}
 	return out, nil
 }

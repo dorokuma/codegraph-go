@@ -1,6 +1,7 @@
 package resolution_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -337,3 +338,91 @@ func Caller() { _ = 1 }
 	}
 	assertGraphCall(t, database, "Caller", "Foo")
 }
+
+// TestNameResolution10001SameNameCandidates tests that CollectCandidates and
+// resolver.ResolveAll / MatchName correctly handle and resolve when there are
+// 10,001 candidates with the exact same name across different files, ensuring
+// candidate #10,001 (such as the same-file definition) is not silently dropped by pagination/caps.
+func TestNameResolution10001SameNameCandidates(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Insert 10,001 nodes named "CommonService"
+	const total = 10001
+	for i := 0; i < total; i++ {
+		file := filepath.Join(dir, fmt.Sprintf("service_%05d.go", i))
+		if _, err := database.UpsertNode(&db.Node{
+			Kind:     db.KindFunction,
+			Name:     "CommonService",
+			File:     file,
+			Line:     1,
+			Language: "go",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The 10,001st node is in service_10000.go
+	targetFile := filepath.Join(dir, fmt.Sprintf("service_%05d.go", total-1))
+
+	// In the same file (service_10000.go), insert a caller node
+	callerID, err := database.UpsertNode(&db.Node{
+		Kind:     db.KindFunction,
+		Name:     "Client",
+		File:     targetFile,
+		Line:     10,
+		Language: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert an unresolved ref from Client to CommonService in service_10000.go
+	if _, err := database.InsertUnresolvedRef(&db.UnresolvedRef{
+		FromNode:      callerID,
+		ReferenceName: "CommonService",
+		ReferenceKind: db.EdgeCalls,
+		Line:          11,
+		FilePath:      targetFile,
+		Language:      "go",
+		Status:        "pending",
+		NameTail:      "CommonService",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Verify CollectCandidates returns all 10,001 candidates
+	cands, err := resolution.CollectCandidates(database, "CommonService")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != total {
+		t.Fatalf("CollectCandidates returned %d candidates, want %d", len(cands), total)
+	}
+
+	// 2. Resolve the pending reference end-to-end
+	st, err := resolution.ResolveAll(database, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Resolved != 1 {
+		t.Fatalf("expected 1 resolved reference, got %+v", st)
+	}
+
+	// Verify caller in service_10000.go resolved to the 10001st candidate in service_10000.go
+	callees, err := database.GetCalleesWithKind(callerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callees) != 1 {
+		t.Fatalf("expected 1 callee, got %d: %+v", len(callees), callees)
+	}
+	if callees[0].Name != "CommonService" || callees[0].File != targetFile {
+		t.Fatalf("expected call to CommonService in %s, got %+v", targetFile, callees[0])
+	}
+}
+

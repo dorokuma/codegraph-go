@@ -301,3 +301,60 @@ func TestCommunityTopSymbolsOrdered(t *testing.T) {
 		t.Error("hub should appear before leaf2 (higher weighted degree)")
 	}
 }
+
+func TestCommunitySnapshotTruncatedWarning(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert 4 nodes and 3 edges
+	n1, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "A", File: "/a.go", Line: 1})
+	n2, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "B", File: "/b.go", Line: 1})
+	n3, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "C", File: "/c.go", Line: 1})
+	database.UpsertEdge(&db.Edge{SourceID: n1, TargetID: n2, Kind: db.EdgeCalls, Provenance: "exact"})
+	database.UpsertEdge(&db.Edge{SourceID: n2, TargetID: n3, Kind: db.EdgeCalls, Provenance: "exact"})
+
+	// Lower snapshot cap in db package to trigger truncation
+	oldCap := db.SetGraphSnapshotCapForTest(2)
+	defer db.SetGraphSnapshotCapForTest(oldCap)
+
+	result, err := ToolCommunity(context.Background(), database, "/workdir", CommunityArgs{MinSize: 1})
+	if err != nil {
+		t.Fatalf("ToolCommunity: %v", err)
+	}
+	text := result.Content[0].Text
+	if !strings.Contains(text, "Warning: graph snapshot was truncated") {
+		t.Fatalf("expected truncation warning in output, got:\n%s", text)
+	}
+}
+
+func TestCommunityNodeCapRefusal(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	n1, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "A", File: "/a.go", Line: 1})
+	n2, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "B", File: "/b.go", Line: 1})
+	database.UpsertEdge(&db.Edge{SourceID: n1, TargetID: n2, Kind: db.EdgeCalls, Provenance: "exact"})
+
+	oldCap := maxCommunityNodes
+	maxCommunityNodes = 1
+	defer func() { maxCommunityNodes = oldCap }()
+
+	snapshotLoaded := false
+	oldLoader := snapshotLoader
+	snapshotLoader = func(database *db.DB) (*db.GraphSnapshot, error) {
+		snapshotLoaded = true
+		return oldLoader(database)
+	}
+	defer func() { snapshotLoader = oldLoader }()
+
+	_, err := ToolCommunity(context.Background(), database, "/workdir", CommunityArgs{MinSize: 1})
+	if err == nil {
+		t.Fatal("expected refusal error when node count exceeds maxCommunityNodes")
+	}
+	if !strings.Contains(err.Error(), "community detection refused") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if snapshotLoaded {
+		t.Fatal("expected snapshot NOT to be loaded when index exceeds maxCommunityNodes")
+	}
+}

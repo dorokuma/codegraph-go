@@ -30,6 +30,53 @@ func matchLineInNode(n db.Node, pattern string) int {
 	return n.Line + strings.Count(n.Body[:idx], "\n")
 }
 
+// matchLineForNode returns the file line of the first pattern occurrence in n.
+// When n already has a body, it inspects n.Body.
+// When n has no body (lightweight ref), if n.Name matches pattern or n.Line is given,
+// it reuses n.Line; otherwise it checks the file on disk in the symbol range.
+func matchLineForNode(projRoot string, n db.Node, pattern string) int {
+	if n.Line <= 0 {
+		n.Line = 1
+	}
+	if pattern == "" || n.Name == pattern {
+		return n.Line
+	}
+	if n.Body != "" {
+		idx := strings.Index(n.Body, pattern)
+		if idx >= 0 {
+			return n.Line + strings.Count(n.Body[:idx], "\n")
+		}
+		return n.Line
+	}
+	filePath := db.AbsPath(projRoot, n.File)
+	lines, err := readLines(filePath)
+	if err != nil || len(lines) == 0 {
+		return n.Line
+	}
+	start := n.Line - 1
+	if start < 0 {
+		start = 0
+	}
+	end := n.EndLine
+	if end <= 0 || end > len(lines) {
+		end = len(lines)
+	}
+	if end < start {
+		end = len(lines)
+	}
+	for i := start; i < end && i < len(lines); i++ {
+		if strings.Contains(lines[i], pattern) {
+			return i + 1
+		}
+	}
+	for i, l := range lines {
+		if strings.Contains(l, pattern) {
+			return i + 1
+		}
+	}
+	return n.Line
+}
+
 // isSimpleIdent reports whether s looks like a bare symbol name (no regex).
 func isSimpleIdent(s string) bool {
 	if s == "" {

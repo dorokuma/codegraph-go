@@ -364,11 +364,11 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 	// no_ignore=true must not take this shortcut: FTS only sees indexed
 	// (non-ignored) files, so --no-ignore has to go through rg.
 	if args.Path == "" && args.Glob == "" && !args.IgnoreCase && !args.Regex && !args.NoIgnore && isSimpleIdent(args.Pattern) {
-		nodes, err := database.FullTextSearchContext(ctx, args.Pattern, args.MaxResults)
+		nodes, err := database.FullTextSearchRefsContext(ctx, args.Pattern, args.MaxResults)
 		if err == nil && len(nodes) > 0 {
 			var b strings.Builder
 			for _, n := range nodes {
-				fmt.Fprintf(&b, "%s:%d\n", db.RelPath(projRoot, n.File), matchLineInNode(n, args.Pattern))
+				fmt.Fprintf(&b, "%s:%d\n", db.RelPath(projRoot, n.File), matchLineForNode(projRoot, n, args.Pattern))
 			}
 			text := truncateOutput(b.String(), defaultOutputChars)
 			text = s.addStalenessWarning(text)

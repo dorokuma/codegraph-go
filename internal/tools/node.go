@@ -242,7 +242,7 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 	}
 
 	rel := db.RelPath(workdir, resolved)
-	nodes, err := database.GetNodesByFileContext(ctx, resolved)
+	nodes, truncated, err := database.GetNodesByFileLightLimitedContext(ctx, resolved, 0)
 	if err != nil {
 		return "", err
 	}
@@ -297,6 +297,11 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 			for _, n := range symbols {
 				fmt.Fprintf(&b, "%s %s:%d\n", n.Name, db.RelPath(workdir, n.File), n.Line)
 			}
+			if truncated {
+				fmt.Fprintf(&b, "... (truncated at %d symbols, more exist)\n", len(symbols))
+			}
+		} else if truncated {
+			b.WriteString("(no indexed symbols)\n... (truncated, more exist)\n")
 		} else {
 			b.WriteString("(no indexed symbols)\n")
 		}
@@ -359,11 +364,14 @@ func handleFileView(ctx context.Context, database *db.DB, workdir, fileArg strin
 // resolveIndexedFile finds one indexed path for a path/basename hint.
 // When workdir is set, only files under workdir are considered (no ../ escape).
 func resolveIndexedFile(ctx context.Context, database *db.DB, workdir, fileArg string) (resolved string, candidates []string, err error) {
-	all, err := database.ListFilesContext(ctx)
+	if strings.TrimSpace(fileArg) == "" {
+		return "", nil, nil
+	}
+	cands, err := database.FindFileCandidatesContext(ctx, fileArg)
 	if err != nil {
 		return "", nil, err
 	}
-	if len(all) == 0 {
+	if len(cands) == 0 {
 		return "", nil, nil
 	}
 
@@ -371,20 +379,20 @@ func resolveIndexedFile(ctx context.Context, database *db.DB, workdir, fileArg s
 	// Indexed paths are workdir-relative (or legacy absolute); resolve before check.
 	if workdir != "" {
 		var scoped []string
-		for _, f := range all {
+		for _, f := range cands {
 			abs := db.AbsPath(workdir, f)
 			if _, ok := pathWithinRoot(workdir, abs); ok {
 				scoped = append(scoped, f)
 			}
 		}
-		all = scoped
-		if len(all) == 0 {
+		cands = scoped
+		if len(cands) == 0 {
 			return "", nil, nil
 		}
 	}
 
 	var hits []string
-	for _, f := range all {
+	for _, f := range cands {
 		if fileHintMatches(f, fileArg, workdir) {
 			hits = append(hits, f)
 		}

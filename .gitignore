@@ -12,6 +12,9 @@ context_mode.db*
 *.prof
 vendor/
 
+# python bytecode cache
+__pycache__/
+
 # editor
 .idea/
 .vscode/

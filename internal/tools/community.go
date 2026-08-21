@@ -30,6 +30,11 @@ type CommunityArgs struct {
 // index from pinning the daemon. A var so tests can lower it.
 var maxCommunityNodes = 100_000
 
+// snapshotLoader loads the graph snapshot. A var so tests can verify whether snapshot loading occurred.
+var snapshotLoader = func(database *db.DB) (*db.GraphSnapshot, error) {
+	return database.GetGraphSnapshot()
+}
+
 // ctxCheckInterval bounds how often the graph-build loops poll ctx: checking
 // on every iteration would add a branch + atomic load per edge on a snapshot
 // of up to ~500k rows, while every 4096 rows keeps the overhead negligible
@@ -112,16 +117,29 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 		args.MinSize = 3
 	}
 
-	// Step 1: Load graph snapshot. GetGraphSnapshot has no ctx variant (the
-	// DB side is not interruptible), so check ctx before and after the call
-	// and poll periodically through the build loops below — a canceled
-	// request must abort during graph construction, not only at the Louvain
-	// gates. The 60s server deadline therefore bounds the build + enrichment
-	// phase for real, not just the tail ends.
+	// Step 1: Pre-flight checks and graph snapshot load.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	snapshot, err := database.GetGraphSnapshot()
+
+	nodeCount, err := database.CountNodesContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("count nodes: %w", err)
+	}
+
+	if nodeCount == 0 {
+		return &CommunityResult{
+			Content: []ContentItem{{Type: "text", Text: "No nodes in index. Nothing to analyze."}},
+		}, nil
+	}
+
+	// Node-scale guard (audit high): refuse before the expensive snapshot load,
+	// O(E) graph build, and Louvain pass instead of burning CPU/memory on an oversized index.
+	if nodeCount > maxCommunityNodes {
+		return nil, fmt.Errorf("community detection refused: index has %d nodes (max %d) — the full-graph Louvain pass would take too long; ask the operator to analyze a smaller index", nodeCount, maxCommunityNodes)
+	}
+
+	snapshot, err := snapshotLoader(database)
 	if err != nil {
 		return nil, fmt.Errorf("load graph snapshot: %w", err)
 	}
@@ -130,14 +148,6 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 		return &CommunityResult{
 			Content: []ContentItem{{Type: "text", Text: "No nodes in index. Nothing to analyze."}},
 		}, nil
-	}
-
-	// Node-scale guard (audit high): refuse before the O(E) graph build and
-	// Louvain pass instead of burning CPU on an oversized index. The DB
-	// snapshot itself is already capped at ~500k rows; this keeps the
-	// expensive part bounded.
-	if len(snapshot.Nodes) > maxCommunityNodes {
-		return nil, fmt.Errorf("community detection refused: index has %d nodes (max %d) — the full-graph Louvain pass would take too long; ask the operator to analyze a smaller index", len(snapshot.Nodes), maxCommunityNodes)
 	}
 
 	// Cancellation gate: the Louvain pass itself is not interruptible and
@@ -258,6 +268,9 @@ func ToolCommunity(ctx context.Context, database *db.DB, workdir string, args Co
 	var b strings.Builder
 
 	b.WriteString("# Community Detection Report\n\n")
+	if snapshot.Truncated {
+		b.WriteString("Warning: graph snapshot was truncated (reached safety limit); community structure is approximate.\n\n")
+	}
 	b.WriteString(fmt.Sprintf("Total nodes: %d\n", len(snapshot.Nodes)))
 	b.WriteString(fmt.Sprintf("Total edges (after filter, undirected): %d\n", totalWeightedEdges))
 	b.WriteString(fmt.Sprintf("Communities found: %d (showing %d, min size %d)\n", len(rawCommunities), len(infos), args.MinSize))

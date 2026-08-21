@@ -8,6 +8,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -272,6 +275,175 @@ func TestDaemonChmodFailureAbortsStart(t *testing.T) {
 	for _, sock := range SocketCandidates(root) {
 		if _, serr := os.Stat(sock); !os.IsNotExist(serr) {
 			t.Fatalf("socket still present after failed Start: %s", sock)
+		}
+	}
+}
+
+// TestDaemonSocketPermissions0600 verifies that the bound socket file has 0600 permissions.
+func TestDaemonSocketPermissions0600(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := TryAcquireLock(root)
+	if err != nil || res.Kind != "acquired" {
+		t.Fatalf("lock: %+v err=%v", res, err)
+	}
+	defer os.Remove(res.PidPath)
+
+	d := New(root, func(ctx context.Context, rwc io.ReadWriteCloser) error { return nil })
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop("test end")
+
+	fi, err := os.Stat(d.SocketPath())
+	if err != nil {
+		t.Fatalf("stat socket: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket permissions = %o, want 0600", perm)
+	}
+}
+
+// TestDaemonSocketCreationUmaskProtected verifies that the socket inode is created
+// with umask 0077 protection at bind time before chmod runs, preventing any window
+// with broader-than-0600 / other access.
+func TestDaemonSocketCreationUmaskProtected(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := TryAcquireLock(root)
+	if err != nil || res.Kind != "acquired" {
+		t.Fatalf("lock: %+v err=%v", res, err)
+	}
+	defer os.Remove(res.PidPath)
+
+	var preChmodPerm os.FileMode
+	oldChmod := chmodSocket
+	chmodSocket = func(name string, mode os.FileMode) error {
+		fi, err := os.Stat(name)
+		if err == nil {
+			preChmodPerm = fi.Mode().Perm()
+		}
+		return oldChmod(name, mode)
+	}
+	defer func() { chmodSocket = oldChmod }()
+
+	d := New(root, func(ctx context.Context, rwc io.ReadWriteCloser) error { return nil })
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop("test end")
+
+	// Pre-chmod permission must not allow group or other access (0077 umask protection).
+	if preChmodPerm&0o077 != 0 {
+		t.Fatalf("socket created with broad permissions before chmod: %o (has group/other bits)", preChmodPerm)
+	}
+	// Post-start permission must be 0600.
+	fi, err := os.Stat(d.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("final socket permissions = %o, want 0600", perm)
+	}
+}
+
+// TestDaemonSocketFallbackPermissions verifies fallback candidate socket creation
+// also preserves 0600 permissions and functions normally.
+func TestDaemonSocketFallbackPermissions(t *testing.T) {
+	long := strings.Repeat("a", 120)
+	root := filepath.Join(t.TempDir(), long, "proj")
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := TryAcquireLock(root)
+	if err != nil || res.Kind != "acquired" {
+		t.Fatalf("lock: %+v err=%v", res, err)
+	}
+	defer os.Remove(res.PidPath)
+
+	d := New(root, func(ctx context.Context, rwc io.ReadWriteCloser) error {
+		br := bufio.NewReader(rwc)
+		line, _ := br.ReadString('\n')
+		_, _ = rwc.Write([]byte(line))
+		return nil
+	})
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop("test end")
+
+	// Ensure fallback path (in tmpdir) was selected.
+	if !strings.Contains(d.SocketPath(), os.TempDir()) {
+		t.Fatalf("expected tmpdir fallback socket, got %s", d.SocketPath())
+	}
+	fi, err := os.Stat(d.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("fallback socket permissions = %o, want 0600", perm)
+	}
+
+	// Verify client proxy connection over fallback socket works.
+	conn, br, _, pr := ConnectHello(d.SocketPath())
+	if pr.Outcome != "proxied" {
+		t.Fatalf("connect fallback socket: %+v", pr)
+	}
+	defer conn.Close()
+	if err := WriteClientHello(conn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	resp, err := br.ReadString('\n')
+	if err != nil || resp != "ping\n" {
+		t.Fatalf("echo response: got %q, err=%v", resp, err)
+	}
+}
+
+// TestListenUnixWithUmaskConcurrent verifies concurrent calls to listenUnixWithUmask
+// do not race or leak corrupted umask.
+func TestListenUnixWithUmaskConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	const n = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sockPath := filepath.Join(dir, fmt.Sprintf("test-%d.sock", idx))
+			ln, err := listenUnixWithUmask(sockPath)
+			if err != nil {
+				errs <- fmt.Errorf("listen %d: %w", idx, err)
+				return
+			}
+			defer ln.Close()
+
+			fi, err := os.Stat(sockPath)
+			if err != nil {
+				errs <- fmt.Errorf("stat %d: %w", idx, err)
+				return
+			}
+			if fi.Mode().Perm()&0o077 != 0 {
+				errs <- fmt.Errorf("socket %d has broad perm: %o", idx, fi.Mode().Perm())
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
 		}
 	}
 }

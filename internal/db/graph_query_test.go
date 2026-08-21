@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -521,3 +522,272 @@ func TestGraphQueriesCapped(t *testing.T) {
 		t.Fatalf("GetCalleesWithKindContext: got %d, want 1", len(crefs))
 	}
 }
+
+func TestGetNodeByNameCap(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	oldCap := getNodeByNameCap
+	getNodeByNameCap = 2
+	defer func() { getNodeByNameCap = oldCap }()
+
+	for i := 0; i < 5; i++ {
+		if _, err := database.UpsertNode(&Node{
+			Kind: KindFunction, Name: "same_name", File: fmt.Sprintf("file_%d.go", i), Line: 1, Language: "go",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	nodes, err := database.GetNodeByName("same_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("GetNodeByName must be capped at 2, got %d", len(nodes))
+	}
+}
+
+func TestGetGraphSnapshotLightweightProjection(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	body := "func Hello() { return 42 }"
+	nID, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Hello", File: "a.go", Line: 10, EndLine: 12,
+		Body: body, Language: "go", QualifiedName: "pkg.Hello", ReturnType: "int",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := database.GetGraphSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(snap.Nodes))
+	}
+	n := snap.Nodes[0]
+	if n.ID != nID || n.Name != "Hello" || n.Kind != KindFunction || n.File != "a.go" || n.Line != 10 {
+		t.Fatalf("unexpected node fields: %+v", n)
+	}
+	if n.Body != "" {
+		t.Fatalf("GetGraphSnapshot must omit body (lightweight), got %q", n.Body)
+	}
+	if n.QualifiedName != "pkg.Hello" || n.ReturnType != "int" {
+		t.Fatalf("non-body fields must be preserved: %+v", n)
+	}
+}
+
+func TestGetNodesByFileLightweightAndWithBody(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	body := "func Target() { return }"
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Target1", File: "target.go", Line: 1, Body: body, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Target2", File: "target.go", Line: 5, Body: body, Language: "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// GetNodesByFile restores body semantics
+	nodes, err := database.GetNodesByFile("target.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("want 2 nodes, got %d", len(nodes))
+	}
+	for _, n := range nodes {
+		if n.Body != body {
+			t.Fatalf("GetNodesByFile must load body, got %q", n.Body)
+		}
+	}
+
+	// GetNodesByFileLight omits body
+	lightNodes, err := database.GetNodesByFileLight("target.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lightNodes) != 2 {
+		t.Fatalf("want 2 light nodes, got %d", len(lightNodes))
+	}
+	for _, n := range lightNodes {
+		if n.Body != "" {
+			t.Fatalf("GetNodesByFileLight must not load body, got %q", n.Body)
+		}
+	}
+
+	// Context variants
+	ctx := context.Background()
+	ctxNodes, err := database.GetNodesByFileContext(ctx, "target.go")
+	if err != nil || len(ctxNodes) != 2 || ctxNodes[0].Body != body {
+		t.Fatalf("GetNodesByFileContext failed: err=%v, len=%d", err, len(ctxNodes))
+	}
+
+	ctxLight, err := database.GetNodesByFileLightContext(ctx, "target.go")
+	if err != nil || len(ctxLight) != 2 || ctxLight[0].Body != "" {
+		t.Fatalf("GetNodesByFileLightContext failed: err=%v, len=%d", err, len(ctxLight))
+	}
+
+	// Test cap
+	oldCap := getNodesByFileCap
+	getNodesByFileCap = 1
+	defer func() { getNodesByFileCap = oldCap }()
+
+	capped, err := database.GetNodesByFile("target.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped) != 1 {
+		t.Fatalf("GetNodesByFile must be capped at 1, got %d", len(capped))
+	}
+
+	cappedLight, err := database.GetNodesByFileLight("target.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cappedLight) != 1 {
+		t.Fatalf("GetNodesByFileLight must be capped at 1, got %d", len(cappedLight))
+	}
+}
+
+func TestFindFileCandidates(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for _, p := range []string{"cmd/app/main.go", "pkg/main.go", "internal/db/query.go", "root.go"} {
+		if err := database.UpsertFile(p, 100, 1000.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Basename search
+	cands, err := database.FindFileCandidates("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 2 {
+		t.Fatalf("main.go: want 2 candidates, got %v", cands)
+	}
+
+	// Exact / suffix search
+	cands, err = database.FindFileCandidates("db/query.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0] != "internal/db/query.go" {
+		t.Fatalf("db/query.go: want [internal/db/query.go], got %v", cands)
+	}
+
+	// Non-existent
+	cands, err = database.FindFileCandidates("missing.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("missing.go: want 0 candidates, got %v", cands)
+	}
+}
+
+func TestFindFileCandidatesExactNotEvictedByLimit(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert 1005 files matching the same basename "candidate.go" across various directories.
+	for i := 0; i < 1005; i++ {
+		p := fmt.Sprintf("dir_%04d/candidate.go", i)
+		if err := database.UpsertFile(p, 100, 1000.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Exact query for the 1005th file (dir_1004/candidate.go)
+	exactTarget := "dir_1004/candidate.go"
+	cands, err := database.FindFileCandidates(exactTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) == 0 {
+		t.Fatalf("expected candidates for %s, got 0", exactTarget)
+	}
+	if cands[0] != exactTarget {
+		t.Fatalf("exact match %s must be returned first, got %s", exactTarget, cands[0])
+	}
+
+	// Basename search without exact path should return capped 1000 candidates
+	baseCands, err := database.FindFileCandidates("candidate.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(baseCands) != 1000 {
+		t.Fatalf("basename search should be capped at 1000, got %d", len(baseCands))
+	}
+}
+
+func TestParkInboundRefsForFilePagination(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert 10005 nodes in target.go (exceeding old 10000 cap and keyset pagination batchSize = 1000)
+	targetFile := "target.go"
+	var targetIDs []int64
+	for i := 0; i < 10005; i++ {
+		id, err := database.UpsertNode(&Node{
+			Kind: KindFunction, Name: fmt.Sprintf("TargetFunc_%05d", i), File: targetFile, Line: i + 1, Language: "go",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		targetIDs = append(targetIDs, id)
+	}
+
+	// Insert a caller in caller.go
+	callerID, err := database.UpsertNode(&Node{
+		Kind: KindFunction, Name: "Caller", File: "caller.go", Line: 1, Language: "go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create edges pointing to targets in first batch (<1000), intermediate batch, and 10001st node (index 10000) and beyond (index 10004)
+	targetIndices := []int{10, 500, 1000, 10000, 10004}
+	for _, idx := range targetIndices {
+		if _, err := database.UpsertEdge(&Edge{
+			SourceID: callerID, TargetID: targetIDs[idx], Kind: EdgeCalls, File: "caller.go", Line: idx + 10,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Park inbound refs for target.go
+	if err := database.ParkInboundRefsForFile(targetFile); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := database.ListUnresolvedRefs("caller.go", "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != len(targetIndices) {
+		t.Fatalf("want %d parked refs, got %d", len(targetIndices), len(refs))
+	}
+
+	refNames := make(map[string]bool)
+	for _, r := range refs {
+		refNames[r.ReferenceName] = true
+	}
+	for _, idx := range targetIndices {
+		name := fmt.Sprintf("TargetFunc_%05d", idx)
+		if !refNames[name] {
+			t.Fatalf("expected parked ref for %s, but missing", name)
+		}
+	}
+}
+

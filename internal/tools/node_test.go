@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,3 +247,112 @@ func TestToolNodeIncludeCodeFalseMulti(t *testing.T) {
 		t.Fatalf("expected both files listed:\n%s", text)
 	}
 }
+
+func TestResolveIndexedFile(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	workdir := "/workspace/myproj"
+	files := []string{
+		"/workspace/myproj/pkg/util/helper.go",
+		"/workspace/myproj/cmd/app/main.go",
+		"/workspace/myproj/internal/db/main.go",
+		"/outside/workspace/secret.go",
+	}
+	for _, f := range files {
+		if err := database.UpsertFile(f, 100, 1000.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// 1. Exact match within workdir
+	res, cands, err := resolveIndexedFile(ctx, database, workdir, "pkg/util/helper.go")
+	if err != nil || res != "/workspace/myproj/pkg/util/helper.go" || len(cands) != 0 {
+		t.Fatalf("exact match: got res=%q cands=%v err=%v", res, cands, err)
+	}
+
+	// 2. Basename search with multiple matches -> returns ambiguous candidates
+	res, cands, err = resolveIndexedFile(ctx, database, workdir, "main.go")
+	if err != nil || res != "" || len(cands) != 2 {
+		t.Fatalf("ambiguous search: got res=%q cands=%v err=%v", res, cands, err)
+	}
+
+	// 3. File outside workdir is excluded by path scoping
+	res, cands, err = resolveIndexedFile(ctx, database, workdir, "secret.go")
+	if err != nil || res != "" || len(cands) != 0 {
+		t.Fatalf("outside workdir: got res=%q cands=%v err=%v", res, cands, err)
+	}
+
+	// 4. Empty hint
+	res, cands, err = resolveIndexedFile(ctx, database, workdir, "")
+	if err != nil || res != "" || len(cands) != 0 {
+		t.Fatalf("empty hint: got res=%q cands=%v err=%v", res, cands, err)
+	}
+}
+
+func TestToolNodeSymbolsOnlyTruncated(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "funcs.go")
+	src := "package p\nfunc F1() {}\nfunc F2() {}\nfunc F3() {}\nfunc F4() {}\n"
+	if err := os.WriteFile(filePath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := database.UpsertFileRecord(&db.FileRecord{Path: filePath, Language: "go"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		name := fmt.Sprintf("F%d", i)
+		if _, err := database.UpsertNode(&db.Node{
+			Kind:     db.KindFunction,
+			Name:     name,
+			File:     filePath,
+			Line:     i + 1,
+			EndLine:  i + 1,
+			Language: "go",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldCap := db.SetGetNodesByFileCapForTest(2)
+	defer db.SetGetNodesByFileCapForTest(oldCap)
+
+	// 1. symbolsOnly=true with cap=2 must report real truncation notice
+	res, err := ToolNodeIn(context.Background(), database, dir, NodeArgs{File: "funcs.go", SymbolsOnly: true})
+	if err != nil {
+		t.Fatalf("ToolNodeIn symbolsOnly: %v", err)
+	}
+	text := res.Content[0].Text
+	if !strings.Contains(text, "... (truncated at 2 symbols, more exist)") {
+		t.Fatalf("expected truncation notice in symbolsOnly view, got:\n%s", text)
+	}
+	if !strings.Contains(text, "F1") || !strings.Contains(text, "F2") {
+		t.Fatalf("expected first 2 symbols in output, got:\n%s", text)
+	}
+	if strings.Contains(text, "F3") || strings.Contains(text, "F4") {
+		t.Fatalf("expected symbols beyond cap to be omitted, got:\n%s", text)
+	}
+
+	// 2. symbolsOnly=false (default source view) remains intact and displays source lines
+	resDefault, err := ToolNodeIn(context.Background(), database, dir, NodeArgs{File: "funcs.go", SymbolsOnly: false})
+	if err != nil {
+		t.Fatalf("ToolNodeIn default view: %v", err)
+	}
+	defaultText := resDefault.Content[0].Text
+	if !strings.Contains(defaultText, "1\tpackage p") || !strings.Contains(defaultText, "func F1") {
+		t.Fatalf("expected default source lines in output, got:\n%s", defaultText)
+	}
+	if strings.Contains(defaultText, "truncated at") {
+		t.Fatalf("default source view should not include symbolsOnly truncation notice, got:\n%s", defaultText)
+	}
+}
+

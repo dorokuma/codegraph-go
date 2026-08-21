@@ -208,7 +208,12 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 	if s.ProjectCache == nil {
 		s.ProjectCache = map[string]*dbEntry{}
 		s.ProjectPendingClose = map[string]*dbEntry{}
-		s.ProjectMaxLRU = 10 // keep at most 10 cross-project DBs open
+		if s.ProjectMaxLRU == 0 {
+			s.ProjectMaxLRU = 10 // keep at most 10 cross-project DBs open
+		}
+	}
+	if s.ProjectPendingClose == nil {
+		s.ProjectPendingClose = map[string]*dbEntry{}
 	}
 	if cached, ok := s.ProjectCache[resolved]; ok {
 		// Move to end of LRU list (most recently used).
@@ -216,24 +221,57 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 		atomic.AddInt32(&cached.refs, 1)
 		return resolved, cached.db, nil
 	}
+	if pending, ok := s.ProjectPendingClose[resolved]; ok {
+		delete(s.ProjectPendingClose, resolved)
+		if s.ProjectMaxLRU > 0 && len(s.ProjectLRU) >= s.ProjectMaxLRU {
+			evict := s.ProjectLRU[0]
+			s.ProjectLRU = s.ProjectLRU[1:]
+			if e, ok := s.ProjectCache[evict]; ok {
+				delete(s.ProjectCache, evict)
+				if atomic.LoadInt32(&e.refs) == 0 {
+					_ = e.db.Close()
+				} else {
+					s.ProjectPendingClose[evict] = e
+				}
+			}
+		}
+		s.ProjectCache[resolved] = pending
+		s.ProjectLRU = append(s.ProjectLRU, resolved)
+		atomic.AddInt32(&pending.refs, 1)
+		return resolved, pending.db, nil
+	}
+
+	var (
+		evictedKey   string
+		evictedEntry *dbEntry
+		didEvict     bool
+	)
 	// Evict oldest if at capacity. For entries still in use (refs>0),
 	// remove from cache+LRU but defer Close to releaseProject via
 	// ProjectPendingClose so in-flight callers are not disrupted.
 	if s.ProjectMaxLRU > 0 && len(s.ProjectLRU) >= s.ProjectMaxLRU {
-		evict := s.ProjectLRU[0]
-		s.ProjectLRU = s.ProjectLRU[1:]
-		if e, ok := s.ProjectCache[evict]; ok {
-			delete(s.ProjectCache, evict)
-			if atomic.LoadInt32(&e.refs) == 0 {
-				_ = e.db.Close()
-			} else {
-				s.ProjectPendingClose[evict] = e
+		evictedKey = s.ProjectLRU[0]
+		if e, ok := s.ProjectCache[evictedKey]; ok {
+			s.ProjectLRU = s.ProjectLRU[1:]
+			delete(s.ProjectCache, evictedKey)
+			evictedEntry = e
+			didEvict = true
+			if atomic.LoadInt32(&e.refs) > 0 {
+				s.ProjectPendingClose[evictedKey] = e
 			}
 		}
 	}
 	opened, err := db.Open(resolved)
 	if err != nil {
+		if didEvict {
+			s.ProjectCache[evictedKey] = evictedEntry
+			s.ProjectLRU = append([]string{evictedKey}, s.ProjectLRU...)
+			delete(s.ProjectPendingClose, evictedKey)
+		}
 		return "", nil, fmt.Errorf("open index at %s: %w", resolved, err)
+	}
+	if didEvict && atomic.LoadInt32(&evictedEntry.refs) == 0 {
+		_ = evictedEntry.db.Close()
 	}
 	entry := &dbEntry{db: opened, refs: 1}
 	s.ProjectCache[resolved] = entry
