@@ -1,5 +1,5 @@
 #!/bin/bash
-# codegraph-go 一键部署：编译 → 杀进程 → 替换二进制 → 重启 daemon
+# codegraph-go 一键部署：编译 → 替换二进制 → 杀进程 → 重启 daemon
 # M4: -u（未定义变量直接报错）+ pipefail（管道中段失败即退出）。
 # 所有本来可容忍缺失的管道（cat/grep 找不到 pidfile/pid）都显式 `|| true`。
 set -euo pipefail
@@ -12,6 +12,43 @@ echo "=== 编译 ==="
 cd "$ROOT"
 go build -o ./bin/codegraph-go ./cmd/codegraph-go 2>&1
 echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
+
+# Install the new binary BEFORE any kill: a client that respawns a daemon in
+# the kill window must exec the NEW version. Installing first also means an
+# install failure aborts before any daemon is disturbed.
+echo "=== 替换二进制 ==="
+# M6: install 目标父目录（~/.local/bin）在新机器上可能不存在，先建好。
+mkdir -p "$(dirname "$BINARY")"
+if [ -f "$BINARY" ]; then
+  if install -m 755 ./bin/codegraph-go "$BINARY.new" && \
+     mv "$BINARY" "$BINARY.old" && \
+     mv "$BINARY.new" "$BINARY"; then
+    rm -f "$BINARY.old"
+  else
+    # 失败回滚：只在确实已经把旧二进制挪走、且新二进制没装上时恢复 .old；
+    # 上次崩溃残留的旧 .old 绝不能被当成回滚源覆盖新二进制。
+    if [ -f "$BINARY.old" ] && [ ! -f "$BINARY" ]; then
+      mv "$BINARY.old" "$BINARY" 2>/dev/null || true
+    fi
+    rm -f "$BINARY.new" 2>/dev/null || true
+    echo "DEPLOY FAILED: rolled back" >&2
+    exit 1
+  fi
+else
+  if ! install -m 755 ./bin/codegraph-go "$BINARY"; then
+    echo "DEPLOY FAILED: could not install $BINARY" >&2
+    exit 1
+  fi
+fi
+echo "DEPLOYED → $BINARY"
+# rm -rf 保护：只允许删除本次构建产物目录。仓库若被检到 / 下，`rm -rf ./bin`
+# 会变成 `rm -rf /bin`；符号链接的 bin 也绝不能跟随删除。
+if [ "$ROOT" = "/" ] || [ -L "$ROOT/bin" ] || [ ! -d "$ROOT/bin" ]; then
+  echo "WARN: skipping ./bin cleanup ($ROOT/bin is not a plain build dir)"
+else
+  rm -rf -- "$ROOT/bin"
+  echo "cleaned build output $ROOT/bin"
+fi
 
 echo "=== 停止旧进程 ==="
 # Resolve the daemon workdir BEFORE any artifact handling. The pidfile
@@ -115,6 +152,7 @@ if [ -n "$PID" ]; then
   sleep 1
 fi
 
+
 # scan_daemon_pids <workdir>: print pids of daemon-mode codegraph processes
 # whose -workdir value equals the argument (exact match). Reuses
 # daemon_matches — no duplicated predicate logic.
@@ -128,40 +166,6 @@ scan_daemon_pids() {
   done
   true
 }
-
-echo "=== 替换二进制 ==="
-# M6: install 目标父目录（~/.local/bin）在新机器上可能不存在，先建好。
-mkdir -p "$(dirname "$BINARY")"
-if [ -f "$BINARY" ]; then
-  if install -m 755 ./bin/codegraph-go "$BINARY.new" && \
-     mv "$BINARY" "$BINARY.old" && \
-     mv "$BINARY.new" "$BINARY"; then
-    rm -f "$BINARY.old"
-  else
-    # 失败回滚：只在确实已经把旧二进制挪走、且新二进制没装上时恢复 .old；
-    # 上次崩溃残留的旧 .old 绝不能被当成回滚源覆盖新二进制。
-    if [ -f "$BINARY.old" ] && [ ! -f "$BINARY" ]; then
-      mv "$BINARY.old" "$BINARY" 2>/dev/null || true
-    fi
-    rm -f "$BINARY.new" 2>/dev/null || true
-    echo "DEPLOY FAILED: rolled back" >&2
-    exit 1
-  fi
-else
-  if ! install -m 755 ./bin/codegraph-go "$BINARY"; then
-    echo "DEPLOY FAILED: could not install $BINARY" >&2
-    exit 1
-  fi
-fi
-echo "DEPLOYED → $BINARY"
-# rm -rf 保护：只允许删除本次构建产物目录。仓库若被检到 / 下，`rm -rf ./bin`
-# 会变成 `rm -rf /bin`；符号链接的 bin 也绝不能跟随删除。
-if [ "$ROOT" = "/" ] || [ -L "$ROOT/bin" ] || [ ! -d "$ROOT/bin" ]; then
-  echo "WARN: skipping ./bin cleanup ($ROOT/bin is not a plain build dir)"
-else
-  rm -rf -- "$ROOT/bin"
-  echo "cleaned build output $ROOT/bin"
-fi
 
 echo "=== 升级后强制重启 daemon ==="
 # WORKDIR was resolved in the stop section above (first existing pidfile

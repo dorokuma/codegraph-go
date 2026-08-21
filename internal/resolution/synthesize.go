@@ -284,9 +284,14 @@ func (c *synthCtx) getNodesInFile(file string) []db.Node {
 	if v, ok := c.nodesInFile[file]; ok {
 		return v
 	}
-	nodes, err := c.db.GetNodesByFile(file)
+	// Truncation-aware variant: a generated file can hold more symbols than
+	// the per-file cap; log it instead of silently dropping the tail.
+	nodes, truncated, err := c.db.GetNodesByFileBodiesLimited(file, 0)
 	if err != nil {
 		nodes = nil
+	}
+	if truncated {
+		log.Printf("synthesize: %s exceeds the per-file symbol cap; synthesis covers only the first %d symbols", file, len(nodes))
 	}
 	c.nodesInFile[file] = nodes
 	return nodes

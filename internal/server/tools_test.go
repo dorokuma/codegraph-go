@@ -961,3 +961,33 @@ func TestToolStoreFactWithSupersedes(t *testing.T) {
 
 	_ = res2
 }
+
+// TestToolCallersImpactDashLeadingName pins the "--" rg argument separator:
+// a name starting with "-" must be matched literally, never parsed as an rg
+// flag (flag injection could previously flip e.g. --no-ignore or -f<file>).
+func TestToolCallersImpactDashLeadingName(t *testing.T) {
+	s, dir := setupToolServer(t)
+	ctx := context.Background()
+	code := "package p\n\nvar dashFlag = callTool(--version)\n"
+	if err := os.WriteFile(filepath.Join(dir, "dash.go"), []byte(code), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// callers: index has no call edges, so the rg fallback path runs.
+	res, _, err := s.toolCallers(ctx, nil, nameArgs{Name: "--version"})
+	if err != nil {
+		t.Fatalf("toolCallers: %v", err)
+	}
+	if text := textContent(res); !strings.Contains(text, "dash.go") {
+		t.Fatalf("expected literal --version match in dash.go, got:\n%s", text)
+	}
+
+	// impact: same via the count-mode fallback.
+	res, _, err = s.toolImpact(ctx, nil, nameArgs{Name: "--version"})
+	if err != nil {
+		t.Fatalf("toolImpact: %v", err)
+	}
+	if text := textContent(res); !strings.Contains(text, "dash.go") {
+		t.Fatalf("expected literal --version impact on dash.go, got:\n%s", text)
+	}
+}

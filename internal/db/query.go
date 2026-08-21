@@ -996,20 +996,10 @@ func (d *DB) GetNodesByFile(file string) ([]Node, error) {
 }
 
 // GetNodesByFileContext is the context-aware variant of GetNodesByFile (loads bodies).
+// Delegates to the truncation-aware limited variant; the flag is discarded.
 func (d *DB) GetNodesByFileContext(ctx context.Context, file string) ([]Node, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	rows, err := d.conn.QueryContext(ctx, `
-		SELECT `+nodeSelectCols+`
-		FROM nodes WHERE file = ?
-		ORDER BY id LIMIT ?
-	`, file, getNodesByFileCap)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanNodes(rows)
+	nodes, _, err := d.GetNodesByFileBodiesLimitedContext(ctx, file, getNodesByFileCap)
+	return nodes, err
 }
 
 // GetNodesByFileLightLimitedContext returns up to limit nodes defined in file (omitting body)
@@ -1050,6 +1040,42 @@ func (d *DB) GetNodesByFileLight(file string) ([]Node, error) {
 func (d *DB) GetNodesByFileLightContext(ctx context.Context, file string) ([]Node, error) {
 	nodes, _, err := d.GetNodesByFileLightLimitedContext(ctx, file, getNodesByFileCap)
 	return nodes, err
+}
+
+// GetNodesByFileBodiesLimitedContext returns up to limit nodes defined in
+// file WITH bodies and reports whether more nodes exist for that file.
+// limit <= 0 defaults to getNodesByFileCap.
+func (d *DB) GetNodesByFileBodiesLimitedContext(ctx context.Context, file string, limit int) ([]Node, bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = getNodesByFileCap
+	}
+	rows, err := d.conn.QueryContext(ctx, `
+		SELECT `+nodeSelectCols+`
+		FROM nodes WHERE file = ?
+		ORDER BY id LIMIT ?
+	`, file, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	nodes, err := scanNodes(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(nodes) > limit
+	if truncated {
+		nodes = nodes[:limit]
+	}
+	return nodes, truncated, nil
+}
+
+// GetNodesByFileBodiesLimited is the background-context variant of
+// GetNodesByFileBodiesLimitedContext.
+func (d *DB) GetNodesByFileBodiesLimited(file string, limit int) ([]Node, bool, error) {
+	return d.GetNodesByFileBodiesLimitedContext(context.Background(), file, limit)
 }
 
 // ForEachNodeByFileLight iterates through all nodes in file without bodies using keyset pagination.
@@ -1915,6 +1941,11 @@ func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 	return files, rows.Err()
 }
 
+// pattern-match candidate cap. Generous on purpose: basename collisions in
+// the thousands are possible on big indexes, and candidates are re-filtered
+// by fileHintMatches afterwards. A var (not const) so tests can lower it.
+var findFileCandidatesPatternLimit = 10_000
+
 // FindFileCandidatesContext finds candidate file paths in the files table
 // matching a path or basename hint without scanning the full table.
 func (d *DB) FindFileCandidatesContext(ctx context.Context, hint string) ([]string, error) {
@@ -1990,8 +2021,8 @@ func (d *DB) FindFileCandidatesContext(ctx context.Context, hint string) ([]stri
 	}
 
 	if len(patWheres) > 0 {
-		qPat := `SELECT DISTINCT path FROM files WHERE (` + strings.Join(patWheres, " OR ") + `) ORDER BY path LIMIT 1000`
-		rows, err := d.conn.QueryContext(ctx, qPat, patArgs...)
+		qPat := `SELECT DISTINCT path FROM files WHERE (` + strings.Join(patWheres, " OR ") + `) ORDER BY path LIMIT ?`
+		rows, err := d.conn.QueryContext(ctx, qPat, append(patArgs, findFileCandidatesPatternLimit)...)
 		if err != nil {
 			return nil, err
 		}

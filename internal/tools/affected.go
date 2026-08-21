@@ -332,6 +332,12 @@ func fileToPackage(file string) string {
 	return filepath.Base(dir)
 }
 
+// findGoModule walks up from start looking for the nearest go.mod. The walk
+// intentionally crosses the workdir boundary: when workdir is a subdirectory
+// of a larger Go module (monorepo), the module root lives ABOVE the workspace
+// and the module path is needed for correct package-name matching. This is a
+// documented exemption from the project-wide realpath jail; only the module
+// path string is read, never file contents.
 func findGoModule(start string) (modDir, modulePath string) {
 	cur := start
 	for i := 0; i < 24; i++ {
@@ -357,6 +363,9 @@ func findGoModule(start string) (modDir, modulePath string) {
 	return "", ""
 }
 
+// findNPMPackage walks up from start looking for the nearest package.json.
+// Same documented workdir-boundary exemption as findGoModule (monorepo
+// support); only the package name is read.
 func findNPMPackage(start string) (pkgDir, name string) {
 	cur := start
 	for i := 0; i < 24; i++ {

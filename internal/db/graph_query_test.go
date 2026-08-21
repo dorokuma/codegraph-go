@@ -700,6 +700,12 @@ func TestFindFileCandidatesExactNotEvictedByLimit(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
+	// Lower the pattern cap so the test stays fast while still pinning the
+	// invariant: exact matches survive regardless of the pattern LIMIT.
+	oldLimit := findFileCandidatesPatternLimit
+	findFileCandidatesPatternLimit = 1000
+	defer func() { findFileCandidatesPatternLimit = oldLimit }()
+
 	// Insert 1005 files matching the same basename "candidate.go" across various directories.
 	for i := 0; i < 1005; i++ {
 		p := fmt.Sprintf("dir_%04d/candidate.go", i)

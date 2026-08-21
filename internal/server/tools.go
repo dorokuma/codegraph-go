@@ -686,11 +686,13 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 			"--line-number", "--no-heading", "--color=never",
 			"--fixed-strings",
 			fmt.Sprintf("--max-count=%d", rgCap),
-			"-w", args.Name)
+			"-w")
 		if args.Glob != "" {
 			rg.Args = append(rg.Args, "--glob", args.Glob)
 		}
-		rg.Args = append(rg.Args, searchRoot)
+		// "--" ends flag parsing so a Name starting with "-" is matched
+		// literally instead of parsed as an rg flag (flag injection).
+		rg.Args = append(rg.Args, "--", args.Name, searchRoot)
 		return rg
 	})
 	if err != nil {
@@ -770,8 +772,10 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 	outLines, err := rgEachRoot(searchRoots, args.MaxResults, rgMaxOutputBytes, func(searchRoot string) *exec.Cmd {
 		return exec.CommandContext(ctx, "rg",
 			"--line-number", "--no-heading", "--color=never",
-			"--fixed-strings",
-			"-c", "-w", args.Name, searchRoot)
+			"--fixed-strings", "-c", "-w",
+			// "--" ends flag parsing so a Name starting with "-" is matched
+			// literally instead of parsed as an rg flag (flag injection).
+			"--", args.Name, searchRoot)
 	})
 	if err != nil {
 		if len(outLines) == 0 {

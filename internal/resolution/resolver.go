@@ -195,12 +195,14 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	// Also any pending/failed whose name might be defined in changed files.
 	changedNames := map[string]bool{}
 	for _, f := range files {
-		nodes, err := database.GetNodesByFileLight(f)
+		// ForEach paginates through ALL matches: a file with more symbols
+		// than getNodesByFileCap must not silently lose name candidates.
+		err := database.ForEachNodeByFileLight(f, func(n db.Node) error {
+			changedNames[n.Name] = true
+			return nil
+		})
 		if err != nil {
 			continue
-		}
-		for _, n := range nodes {
-			changedNames[n.Name] = true
 		}
 	}
 	if len(changedNames) > 0 {

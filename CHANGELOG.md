@@ -3,6 +3,18 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] - 2026-08-21
+
+### Fixed
+- callers/impact 的 rg 回退加 `--` 分隔符：`-` 开头的符号名按字面匹配，不再被解析为 rg flag（参数注入，可改变搜索行为）。
+- synthesize 按文件读节点改用带截断报告的查询，超过单文件上限时打日志；`ResolveForFiles` 的 changedNames 改为全量分页遍历，超上限文件不再丢候选。
+
+### Changed
+- 文件候选 LIKE 查询上限从 1000 提高到 10000。
+- deploy.sh 安装二进制移到任何 kill 之前：kill 窗口内客户端复活的 daemon 必为新版本；安装失败时先于停进程中止，不再产生「旧 daemon 已死、新二进制未就位」的空窗。
+- `findGoModule`/`findNPMPackage` 的跨界上溯补充豁免说明（monorepo 场景故意越过工作区边界读模块名）。
+- Display / daemon wire version **0.9.4**。
+
 ## [0.9.3] - 2026-08-21
 
 ### Fixed
