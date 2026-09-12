@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // writerChCap is the number of log lines that can be buffered before dropping.
@@ -87,4 +88,26 @@ func parseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// Flush waits, bounded by timeout, for log lines still queued in the global
+// non-blocking writer (installed by SetupLogger) to reach stderr, and returns
+// the number of entries left unwritten (0 = fully drained; see
+// nonBlockWriter.Flush for the exact contract). timeout<=0 means
+// DefaultFlushTimeout. It is a safe no-op returning 0 when SetupLogger has
+// not been called or its cleanup already ran.
+//
+// Fatal exit paths in cmd/codegraph-go call this before os.Exit: without the
+// flush, every line still sitting in the async buffer — including the fatal
+// message itself — was silently dropped (red team: `codegraph init` on a
+// symlinked .codegraph exited rc=1 with 0 bytes on stderr, the db.Open
+// rejection entirely invisible).
+func Flush(timeout time.Duration) int {
+	globalMu.Lock()
+	w := globalWriter
+	globalMu.Unlock()
+	if w == nil {
+		return 0
+	}
+	return w.Flush(timeout)
 }
