@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -323,4 +324,189 @@ func TestHalfDeadDaemonHoldsLockStartupGrace(t *testing.T) {
 
 	_ = cmd.Process.Kill()
 	<-waited
+}
+
+// withPipedStdio replaces the process-level os.Stdin/os.Stdout that RunProxy
+// pipes through with os.Pipes (RunProxy reads the package-level vars), so a
+// test can feed host stdin and capture host stdout. The original streams and
+// all pipe fds are restored/closed via t.Cleanup.
+func withPipedStdio(t *testing.T) (stdinW, stdoutW, stdoutR *os.File) {
+	t.Helper()
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutR, stdoutW, err = os.Pipe()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		t.Fatal(err)
+	}
+	origIn, origOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinR, stdoutW
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout = origIn, origOut
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+	})
+	return stdinW, stdoutW, stdoutR
+}
+
+// TestRunProxyDeliversTailResponsesAfterStdinEOF (proxy drain regression):
+// MCP's shutdown order is "client closes stdin, then keeps reading stdout
+// until EOF". The old proxy closed the WHOLE connection when host stdin hit
+// EOF, killing the daemon's responses to requests it had already received
+// (tail truncation). Over a real unix socket, RunProxy must half-close
+// (CloseWrite) instead and keep draining until the daemon closes, so BOTH
+// responses reach host stdout.
+func TestRunProxyDeliversTailResponsesAfterStdinEOF(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "drain.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	const earlyResp = `{"jsonrpc":"2.0","id":1,"result":"early"}`
+	const tailResp = `{"jsonrpc":"2.0","id":2,"result":"tail"}`
+
+	// Fake daemon: answer immediately, then consume the client hello and
+	// request until the client's write side closes, and only then emit the
+	// tail response and close — the exact close order that used to truncate
+	// the tail.
+	daemonDone := make(chan struct{})
+	go func() {
+		defer close(daemonDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte(earlyResp + "\n")); err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, c) // client hello + request, until stdin EOF
+		_, _ = c.Write([]byte(tailResp + "\n"))
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-daemonDone:
+		case <-time.After(2 * time.Second):
+			t.Error("fake daemon never observed the client's stdin EOF")
+		}
+	})
+
+	stdinW, stdoutW, stdoutR := withPipedStdio(t)
+	if _, err := stdinW.WriteString(`{"jsonrpc":"2.0","id":2,"method":"shutdown"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	// stdin EOF before RunProxy starts: leg 1 copies the request, hits EOF,
+	// and must half-close instead of tearing the socket down.
+	if err := stdinW.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	br := bufio.NewReader(conn) // no daemon hello in this fixture: nothing buffered
+
+	res, err := RunProxy(conn, br, Hello{SocketPath: sock, PID: os.Getpid(), Codegraph: PackageVersion})
+	if err != nil {
+		t.Fatalf("RunProxy: %v", err)
+	}
+	if res.Outcome != "proxied" {
+		t.Fatalf("outcome = %q, want proxied", res.Outcome)
+	}
+
+	// Collect host stdout: the early response, then the tail response.
+	_ = stdoutW.Close()
+	out, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	iEarly, iTail := strings.Index(got, earlyResp), strings.Index(got, tailResp)
+	if iEarly < 0 || iTail < 0 {
+		t.Fatalf("daemon responses truncated at stdin EOF: stdout = %q", got)
+	}
+	if iEarly > iTail {
+		t.Fatalf("responses out of order: %q", got)
+	}
+}
+
+// TestRunProxyDrainTimeoutClosesStuckDaemonConn: the post-stdin-EOF drain is
+// bounded. When the daemon never closes the connection after client stdin
+// EOF (wedged daemon), RunProxy must still return after proxyDrainTimeout,
+// closing the socket instead of hanging forever.
+func TestRunProxyDrainTimeoutClosesStuckDaemonConn(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "stuck.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// Fake daemon: answer once, consume until client stdin EOF, then hold
+	// the connection open — never answer, never close — until released.
+	release := make(chan struct{})
+	daemonDone := make(chan struct{})
+	go func() {
+		defer close(daemonDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"early"}` + "\n"))
+		_, _ = io.Copy(io.Discard, c)
+		<-release
+	}()
+	t.Cleanup(func() {
+		close(release)
+		select {
+		case <-daemonDone:
+		case <-time.After(2 * time.Second):
+			t.Error("fake daemon goroutine did not finish")
+		}
+	})
+
+	orig := proxyDrainTimeout
+	proxyDrainTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { proxyDrainTimeout = orig })
+
+	stdinW, _, _ := withPipedStdio(t)
+	if err := stdinW.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	br := bufio.NewReader(conn)
+
+	start := time.Now()
+	res, err := RunProxy(conn, br, Hello{SocketPath: sock, PID: os.Getpid(), Codegraph: PackageVersion})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("RunProxy: %v", err)
+	}
+	if res.Outcome != "proxied" {
+		t.Fatalf("outcome = %q, want proxied", res.Outcome)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("RunProxy returned after %v; drain timeout did not elapse", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("RunProxy hung for %v; drain timeout not applied", elapsed)
+	}
 }
