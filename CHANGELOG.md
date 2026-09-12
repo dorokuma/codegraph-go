@@ -3,6 +3,20 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.6] - 2026-09-12
+
+### Fixed
+- `.codegraph` 本身为符号链接时索引数据库会被写到 workdir 之外（对抗审计实证）：walk-up 判定改用 `Lstat`，`db.Open` 增加 Lstat + realpath 双重防线，symlink 形态的 `.codegraph` 拒绝打开并给出可操作错误。
+- stale daemon 清理的身份校验可被伪造 pidfile 绕过：击杀条件改为 pidfile procStart 匹配 且 `/proc/<pid>/exe` 等于本二进制 或 environ 含 `CODEGRAPH_DAEMON_INTERNAL=1`；legacy 无 procStart 的 pidfile 不再进入击杀路径（fail closed），升级清理路径用真实旧 daemon 实测保持可用。
+- `store_fact` / `search_facts` 声明的 30 秒超时实际从未生效：facts 查询补齐 Context 变体并全链路透传。
+
+### Changed
+- `ResolveAll` / `ResolveForFiles` 的边写入改为按 500 条一批的单事务提交，批失败回退逐条隔离坏行；大仓库 resolve 阶段的事务提交数从 ~2N 降为 N/500。
+- CI 新增 `go test -race`、`gofmt`、staticcheck（pin 2026.1）三道严格门禁。
+- 清理 0.9.5 拆分残留：15 个文件 526 行重复文档注释、5 个测试文件 gofmt、staticcheck 10 条告警清零；删除过期的未跟踪 coverage.out。
+- README 对齐实际能力：移除不存在的 comparison.md 引用、架构树更新为拆分后的真实文件、tree-sitter 覆盖更正为 15 种语言、框架路由清单以 `frameworks.go` 实际为准（补 GoFrame、React Router）。
+- Display / daemon wire version **0.9.6**。
+
 ## [0.9.5] - 2026-08-21
 
 ### Changed
