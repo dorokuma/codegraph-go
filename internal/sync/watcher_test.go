@@ -1,10 +1,13 @@
 package sync
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -834,4 +837,93 @@ func TestProcessPendingMissingPathDeleteTree(t *testing.T) {
 	if len(f.treeCalls) != 1 || f.treeCalls[0] != p {
 		t.Fatalf("expected DeleteTree(%s), got %v", p, f.treeCalls)
 	}
+}
+
+// TestStartDegradesOnNonRootAddFailures (inotify-limit regression): a huge
+// repo can exhaust fs.inotify.max_user_watches, making Watcher.Add fail for
+// subdirectories. That must NOT abort Start (and with it the whole daemon —
+// L4): the failure is counted and logged ("changes there will not be
+// tracked") and the walk continues. Only a root Add failure aborts Start.
+func TestStartDegradesOnNonRootAddFailures(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "pkg")
+	nested := filepath.Join(sub, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	addErr := errors.New("inotify limit reached (fake)")
+	var mu sync.Mutex
+	var added []string
+	w, err := NewWatcher(nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.addDirFn = func(path string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		added = append(added, path)
+		if filepath.Clean(path) == filepath.Clean(dir) {
+			return nil // the root itself is watchable
+		}
+		return addErr // every subtree fails, as under max_user_watches
+	}
+
+	// Capture the degradation log (the default logger is global and no test
+	// in this package runs in parallel).
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start must degrade on non-root Add failures, got: %v", err)
+	}
+	w.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{dir, sub, nested} {
+		found := false
+		for _, got := range added {
+			if filepath.Clean(got) == filepath.Clean(want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("walk did not reach %s (added: %v); a non-root Add failure aborted the walk", want, added)
+		}
+	}
+	out := logs.String()
+	if !strings.Contains(out, "will not be tracked") {
+		t.Fatalf("degradation not logged: %q", out)
+	}
+	if !strings.Contains(out, sub) {
+		t.Fatalf("degradation log does not name the unwatchable subtree %s: %q", sub, out)
+	}
+}
+
+// TestStartFailsOnRootAddFailure: when the ROOT directory itself cannot be
+// watched, nothing can be tracked — Start must fail (releasing the fsnotify
+// handle, as before) instead of degrading into a no-op watcher.
+func TestStartFailsOnRootAddFailure(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWatcher(nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.addDirFn = func(string) error {
+		return errors.New("inotify limit reached (fake)")
+	}
+
+	if err := w.Start(); err == nil {
+		t.Fatal("root Add failure must abort Start")
+	}
+
+	// The failed Start must have released the fsnotify handle (unchanged
+	// contract): a closed watcher refuses further Adds.
+	if err := w.watcher.Add(dir); !errors.Is(err, fsnotify.ErrClosed) {
+		t.Fatalf("failed Start must close the fsnotify watcher; Add after it returned %v", err)
+	}
+	w.Stop() // must not panic even after the failed Start
 }

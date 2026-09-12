@@ -71,6 +71,10 @@ type Watcher struct {
 	// budget (see requeue); exposed via DroppedCount so drops are observable
 	// outside the logs.
 	dropped atomic.Uint64
+	// addDirFn, when non-nil, replaces fsnotify Watcher.Add for directory
+	// registration. Tests inject failures here to exercise Start's
+	// degrade/abort paths without kernel inotify limits; nil in production.
+	addDirFn func(path string) error
 }
 
 // NewWatcher creates a new file watcher.
@@ -90,15 +94,28 @@ func NewWatcher(orch *extraction.Orchestrator, workdir string) (*Watcher, error)
 	}, nil
 }
 
+// addDir registers one directory with the fsnotify watcher, honoring the
+// test-injected addDirFn (see the field comment).
+func (w *Watcher) addDir(path string) error {
+	if w.addDirFn != nil {
+		return w.addDirFn(path)
+	}
+	return w.watcher.Add(path)
+}
+
 // Start begins watching for file changes.
 func (w *Watcher) Start() error {
 	// Add directories to watch. The initial walk must not silently swallow
 	// errors: an unreadable subtree would otherwise be a permanent blind
-	// spot (no watch, no events, no reindex). Non-root walk errors are
-	// logged and counted; failure at the root itself aborts Start so it
-	// surfaces to the caller.
+	// spot (no watch, no events, no reindex). Non-root walk and Add errors
+	// are logged and counted — the affected subtree becomes a known blind
+	// spot while the rest of the watch stays up, so a huge repo exhausting
+	// fs.inotify.max_user_watches degrades instead of taking the whole
+	// daemon down. Failure at the root itself aborts Start so it surfaces
+	// to the caller.
 	root := filepath.Clean(w.workdir)
 	walkErrs := 0
+	addErrs := 0
 	err := filepath.Walk(w.workdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("watcher: walk %s: %v", path, err)
@@ -112,9 +129,19 @@ func (w *Watcher) Start() error {
 			if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
 				return filepath.SkipDir
 			}
-			if aerr := w.watcher.Add(path); aerr != nil {
+			if aerr := w.addDir(path); aerr != nil {
+				if filepath.Clean(path) == root {
+					// The root watch itself failed: nothing can be
+					// tracked, so abort Start (the caller surfaces the
+					// error; the cleanup below releases the fsnotify
+					// handle).
+					return aerr
+				}
+				// A subtree that cannot be watched must not abort the
+				// walk: keep going so the directories that CAN be watched
+				// still are.
+				addErrs++
 				log.Printf("watcher add %s: %v", path, aerr)
-				return aerr
 			}
 		}
 		return nil
@@ -128,6 +155,9 @@ func (w *Watcher) Start() error {
 	}
 	if walkErrs > 0 {
 		log.Printf("watcher: %d directories unreadable during initial walk; changes there will not be tracked", walkErrs)
+	}
+	if addErrs > 0 {
+		log.Printf("watcher: %d directories could not be watched during initial walk (inotify limit?); changes there will not be tracked", addErrs)
 	}
 
 	w.wg.Add(1)
