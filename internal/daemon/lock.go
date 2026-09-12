@@ -199,13 +199,30 @@ func terminateStaleDaemon(info *LockInfo, projectRoot, pidPath string) error {
 }
 
 // terminateStaleViaPidfd delivers SIGTERM and, after the 5s grace, SIGKILL
-// through the pidfd pinning the verified daemon incarnation. The pre-SIGKILL
-// identity recheck is kept (parity with the classic path — the grace window
-// is a PID-reuse TOCTOU, and the recheck refuses escalation the moment /proc
-// no longer shows the recorded incarnation); the pin closes the residual
-// recheck→signal window: pidfd_send_signal hits the pinned process or fails
-// with ESRCH, never a recycled pid.
+// through the pidfd pinning the verified daemon incarnation. A post-pidfd_open
+// recheck guards the verification→pidfd_open window: without it, a daemon
+// that died in that window and had its pid recycled by a same-uid process
+// would be pinned by the fresh fd and receive the first SIGTERM (same
+// pre-signal discipline as recovery.go's terminateViaPidfd). The pre-SIGKILL
+// identity recheck is kept as well (parity with the classic path — the grace
+// window is a PID-reuse TOCTOU, and the recheck refuses escalation the moment
+// /proc no longer shows the recorded incarnation); the pin closes the
+// residual recheck→signal windows: pidfd_send_signal hits the pinned process
+// or fails with ESRCH, never a recycled pid.
 func terminateStaleViaPidfd(fd int, info *LockInfo, projectRoot, pidPath string) error {
+	// Re-verify the pinned incarnation BEFORE the first signal: the identity
+	// check in KillStaleDaemon ran before pidfd_open, so a daemon that exited
+	// in between and had its pid recycled by a same-uid process is pinned by
+	// fd right now. On mismatch: dead pid → the daemon exited and nothing
+	// took its place — clear the stale pidfile and succeed; live pid → the
+	// pinned process is NOT the recorded daemon — refuse without signaling.
+	if err := verifyDaemonIdentity(info, projectRoot); err != nil {
+		if !IsProcessAlive(info.PID) {
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return err
+	}
 	if serr := pidfdSendSignalFn(fd, syscall.SIGTERM); serr != nil {
 		if errors.Is(serr, syscall.ESRCH) {
 			// The pinned daemon exited between verification and signal — a
