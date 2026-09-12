@@ -71,10 +71,12 @@ type Watcher struct {
 	// budget (see requeue); exposed via DroppedCount so drops are observable
 	// outside the logs.
 	dropped atomic.Uint64
-	// blindDirs counts directories the initial walk could not register with
+	// blindDirs counts directories that could not be registered with
 	// fsnotify (Add failed — typically fs.inotify.max_user_watches
-	// exhaustion). Each one is a permanent blind spot: no watch, no events,
-	// no reindex, while the stale index keeps being served as current.
+	// exhaustion): the initial walk and the runtime additions (a newly
+	// created directory, the overflow rescan) alike. Each one is a permanent
+	// blind spot: no watch, no events, no reindex, while the stale index
+	// keeps being served as current.
 	// unreadableDirs counts directories that could not even be read during
 	// the initial walk (same blind-spot effect). Both are atomic fields on
 	// the Watcher (not locals, as they used to be) and surfaced via
@@ -272,7 +274,11 @@ func (w *Watcher) loop() {
 	}
 }
 
-// watchTree recursively adds a newly created directory tree to the watch list.
+// watchTree recursively adds a newly created directory tree to the watch
+// list. Registration goes through addDir and an Add failure is counted as a
+// blind spot — the same semantics as Start's initial walk: a directory that
+// appears at runtime and cannot be watched is invisible to fsnotify exactly
+// like one the initial walk missed.
 func (w *Watcher) watchTree(root string) {
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -294,7 +300,8 @@ func (w *Watcher) watchTree(root string) {
 		if extraction.ShouldSkipDirIn(w.workdir, path, info.Name()) {
 			return filepath.SkipDir
 		}
-		if err := w.watcher.Add(path); err != nil {
+		if err := w.addDir(path); err != nil {
+			w.blindDirs.Add(1)
 			log.Printf("watcher add %s: %v", path, err)
 		}
 		return nil
@@ -582,9 +589,10 @@ func (w *Watcher) DroppedCount() uint64 {
 	return w.dropped.Load()
 }
 
-// BlindDirs returns how many directories the initial walk could not register
-// with the fsnotify watcher (a root failure aborts Start; subtree failures
-// degrade, keeping the rest of the watch up). Each such directory is a
+// BlindDirs returns how many directories could not be registered with the
+// fsnotify watcher — by the initial walk (a root failure aborts Start;
+// subtree failures degrade, keeping the rest of the watch up) or at runtime
+// (a newly created directory, the overflow rescan). Each such directory is a
 // permanent blind spot — no watch, no events, no reindex — so the status tool
 // surfaces this count: a zero-watch or partially-blind watcher (e.g. another
 // process exhausted fs.inotify.max_user_watches) must be observable instead
