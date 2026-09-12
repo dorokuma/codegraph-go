@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -174,4 +175,95 @@ func TestStopAfterDirSwapLeavesSymlinkTargetClean(t *testing.T) {
 	}
 	mustExist(t, filepath.Join(cg+".real", "daemon.pid"))
 	mustExist(t, filepath.Join(cg+".real", "daemon.sock"))
+}
+
+// The start-failure path: RunAsDaemon removes the pidfile when Start fails.
+// The removal must go through the same dir-identity guard as every other
+// artifact removal (cleanupArtifacts, stale-socket clearing) — a bare
+// os.Remove deletes through whatever the .codegraph path currently resolves
+// to, the same red-team shape as the SIGTERM-after-swap fix above, just on
+// the startup failure path instead of shutdown.
+
+// TestRunAsDaemonStartFailureRemovesPidfile (control): Start fails while
+// .codegraph still matches the identity it recorded, so the pidfile is
+// removed and the next start can acquire the lock immediately.
+func TestRunAsDaemonStartFailureRemovesPidfile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	oldChmod := chmodSocket
+	chmodSocket = func(name string, mode os.FileMode) error { return fmt.Errorf("injected chmod failure") }
+	defer func() { chmodSocket = oldChmod }()
+
+	if err := RunAsDaemon(root, func(context.Context, io.ReadWriteCloser) error { return nil }, nil); err == nil {
+		t.Fatal("RunAsDaemon must fail when Start fails")
+	}
+	mustNotExist(t, PidPath(root))
+}
+
+// TestRunAsDaemonStartFailureSkipsRemovalAfterDirSwap: the .codegraph
+// directory is swapped while Start runs (injected via the chmod hook, which
+// fires after the identity was recorded but before Start returns), so the
+// start-failure pidfile removal must skip: the planted pidfile in the
+// symlink target survives, and the real pidfile — naming this, now exiting,
+// process — is left in place for the next start's ClearStaleLock instead of
+// being deleted through the swapped path.
+func TestRunAsDaemonStartFailureSkipsRemovalAfterDirSwap(t *testing.T) {
+	root := t.TempDir()
+	cg := CodeGraphDir(root)
+	if err := os.MkdirAll(cg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	evil := filepath.Join(outside, "evil")
+	if err := os.MkdirAll(evil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink support probe, before any state is changed.
+	probe := filepath.Join(outside, "probe")
+	if err := os.Symlink(evil, probe); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	_ = os.Remove(probe)
+
+	planted := EncodeLock(LockInfo{PID: os.Getpid(), Version: PackageVersion})
+	if err := os.WriteFile(filepath.Join(evil, "daemon.pid"), planted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evil, "daemon.sock"), []byte("planted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	swapped := false
+	oldChmod := chmodSocket
+	chmodSocket = func(name string, mode os.FileMode) error {
+		// Swap .codegraph at the exact point Start uses it: the identity is
+		// already recorded, the injected failure is about to propagate.
+		if !swapped {
+			swapped = true
+			if err := os.Rename(cg, cg+".real"); err != nil {
+				return err
+			}
+			if err := os.Symlink(evil, cg); err != nil {
+				return err
+			}
+			t.Cleanup(func() { _ = os.Remove(cg) })
+		}
+		return fmt.Errorf("injected chmod failure")
+	}
+	defer func() { chmodSocket = oldChmod }()
+
+	if err := RunAsDaemon(root, func(context.Context, io.ReadWriteCloser) error { return nil }, nil); err == nil {
+		t.Fatal("RunAsDaemon must fail when Start fails")
+	}
+
+	// The guard, not a bare path removal, handled the pidfile: nothing in
+	// the attacker-controlled target was touched.
+	mustExist(t, filepath.Join(evil, "daemon.pid"))
+	mustExist(t, filepath.Join(evil, "daemon.sock"))
+	// Our own pidfile survives in the renamed real directory; it names this
+	// (now exiting) process, so the next start's ClearStaleLock removes it.
+	mustExist(t, filepath.Join(cg+".real", "daemon.pid"))
 }

@@ -468,7 +468,13 @@ func RunAsDaemon(root string, handler SessionHandler, onReady func() error) erro
 		if res.Kind == "acquired" {
 			d := New(root, handler)
 			if err := d.Start(); err != nil {
-				_ = os.Remove(res.PidPath)
+				// Same removal discipline as cleanupArtifacts: go through the
+				// dir-identity guard instead of deleting through a bare path.
+				// When Start failed before the identity was recorded (the
+				// cgdir.Ensure / statDirIdentity steps), the guard refuses and
+				// the pidfile stays behind — it names this (now exiting)
+				// process, so the next start's ClearStaleLock removes it.
+				d.removeArtifact(res.PidPath)
 				return err
 			}
 			if onReady != nil {
