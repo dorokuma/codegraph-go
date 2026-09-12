@@ -618,16 +618,6 @@ func (w *Watcher) SetBlindSpotCountersForTest(blindDirs, unreadableDirs int64) {
 	w.unreadableDirs.Store(unreadableDirs)
 }
 
-// AddDir adds a new directory to the watch list.
-func (w *Watcher) AddDir(path string) error {
-	return w.watcher.Add(path)
-}
-
-// RemoveDir removes a directory from the watch list.
-func (w *Watcher) RemoveDir(path string) error {
-	return w.watcher.Remove(path)
-}
-
 // IsSupported returns true if the file is a supported source file.
 func IsSupported(path string) bool {
 	lang := extraction.DetectLanguage(path)
