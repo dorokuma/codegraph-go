@@ -71,6 +71,17 @@ type Watcher struct {
 	// budget (see requeue); exposed via DroppedCount so drops are observable
 	// outside the logs.
 	dropped atomic.Uint64
+	// blindDirs counts directories the initial walk could not register with
+	// fsnotify (Add failed — typically fs.inotify.max_user_watches
+	// exhaustion). Each one is a permanent blind spot: no watch, no events,
+	// no reindex, while the stale index keeps being served as current.
+	// unreadableDirs counts directories that could not even be read during
+	// the initial walk (same blind-spot effect). Both are atomic fields on
+	// the Watcher (not locals, as they used to be) and surfaced via
+	// BlindDirs/UnreadableDirs so the status tool can show watch blind spots
+	// instead of leaving them in the one-shot startup logs.
+	blindDirs      atomic.Int64
+	unreadableDirs atomic.Int64
 	// addDirFn, when non-nil, replaces fsnotify Watcher.Add for directory
 	// registration. Tests inject failures here to exercise Start's
 	// degrade/abort paths without kernel inotify limits; nil in production.
@@ -114,12 +125,10 @@ func (w *Watcher) Start() error {
 	// daemon down. Failure at the root itself aborts Start so it surfaces
 	// to the caller.
 	root := filepath.Clean(w.workdir)
-	walkErrs := 0
-	addErrs := 0
 	err := filepath.Walk(w.workdir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("watcher: walk %s: %v", path, err)
-			walkErrs++
+			w.unreadableDirs.Add(1)
 			if filepath.Clean(path) == root {
 				return err
 			}
@@ -140,7 +149,7 @@ func (w *Watcher) Start() error {
 				// A subtree that cannot be watched must not abort the
 				// walk: keep going so the directories that CAN be watched
 				// still are.
-				addErrs++
+				w.blindDirs.Add(1)
 				log.Printf("watcher add %s: %v", path, aerr)
 			}
 		}
@@ -153,11 +162,11 @@ func (w *Watcher) Start() error {
 		_ = w.watcher.Close()
 		return err
 	}
-	if walkErrs > 0 {
-		log.Printf("watcher: %d directories unreadable during initial walk; changes there will not be tracked", walkErrs)
+	if unreadable := w.unreadableDirs.Load(); unreadable > 0 {
+		log.Printf("watcher: %d directories unreadable during initial walk; changes there will not be tracked", unreadable)
 	}
-	if addErrs > 0 {
-		log.Printf("watcher: %d directories could not be watched during initial walk (inotify limit?); changes there will not be tracked", addErrs)
+	if blind := w.blindDirs.Load(); blind > 0 {
+		log.Printf("watcher: %d directories could not be watched during initial walk (inotify limit?); changes there will not be tracked", blind)
 	}
 
 	w.wg.Add(1)
@@ -571,6 +580,34 @@ func (w *Watcher) PendingFileStats() (files []string, total int, truncated bool)
 // so a file that stops syncing entirely is observable.
 func (w *Watcher) DroppedCount() uint64 {
 	return w.dropped.Load()
+}
+
+// BlindDirs returns how many directories the initial walk could not register
+// with the fsnotify watcher (a root failure aborts Start; subtree failures
+// degrade, keeping the rest of the watch up). Each such directory is a
+// permanent blind spot — no watch, no events, no reindex — so the status tool
+// surfaces this count: a zero-watch or partially-blind watcher (e.g. another
+// process exhausted fs.inotify.max_user_watches) must be observable instead
+// of silently serving a stale index until restart.
+func (w *Watcher) BlindDirs() int64 {
+	return w.blindDirs.Load()
+}
+
+// UnreadableDirs returns how many directories could not be read during the
+// initial walk (e.g. permission errors). Their contents are untracked for
+// the same reason as BlindDirs; see that accessor for the rationale.
+func (w *Watcher) UnreadableDirs() int64 {
+	return w.unreadableDirs.Load()
+}
+
+// SetBlindSpotCountersForTest stages blind-spot counters on a watcher for
+// tests in OTHER packages: they build the watcher through the exported
+// constructor and cannot reach the unexported atomic fields, while real
+// blind spots cannot be forced without exhausting the kernel inotify budget.
+// In-package tests inject addDirFn instead; production code never calls this.
+func (w *Watcher) SetBlindSpotCountersForTest(blindDirs, unreadableDirs int64) {
+	w.blindDirs.Store(blindDirs)
+	w.unreadableDirs.Store(unreadableDirs)
 }
 
 // AddDir adds a new directory to the watch list.

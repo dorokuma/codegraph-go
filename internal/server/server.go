@@ -29,6 +29,12 @@ type Server struct {
 	Orchestrator *extraction.Orchestrator
 	// Watcher is set from the background index goroutine after auto-sync starts.
 	Watcher atomic.Pointer[sync.Watcher]
+	// WatcherStartFailed records that the primary watcher could not be started
+	// even after the bounded backoff retries in backgroundIndexAndWatch:
+	// auto-sync is OFF and file changes are NOT reindexed until the daemon is
+	// restarted. The status tool surfaces it ("watcher_active: false") so the
+	// blind state is observable instead of living only in the startup log.
+	WatcherStartFailed atomic.Bool
 
 	// BgDone signals the background index/watch goroutine to exit.
 	BgDone chan struct{}
@@ -238,6 +244,67 @@ func OpenServerState(workdir string, workdirs []string, noSync bool) (*Server, f
 	return s, cleanup, nil
 }
 
+// watcherStartAttempts bounds how many times the background goroutine tries
+// to start a watcher before giving up (auto-sync then stays off for the
+// daemon's lifetime). watcherStartDelay computes the sleep after failed
+// attempt N (N = 1..): exponential 1s/2s/4s/8s/16s. Vars so tests can inject
+// a small attempt count and an instant backoff.
+var (
+	watcherStartAttempts = 5
+	watcherStartDelay    = func(attempt int) time.Duration {
+		return time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s, 8s, 16s
+	}
+)
+
+// newWatcher is sync.NewWatcher behind a var so tests can inject
+// constructor failures; the retry loop must rebuild the Watcher on every
+// attempt (see startWatcherWithRetry).
+var newWatcher = sync.NewWatcher
+
+// startWatcherWithRetry creates and starts a watcher for workdir, retrying
+// with bounded backoff while Start keeps failing. The self-healing matters
+// because Start fails hard exactly when the watch budget is exhausted
+// (fs.inotify.max_user_watches, EMFILE) — a transient condition another
+// process can cause and later release; without retries the daemon would
+// serve a stale index until restart. Start closes its fsnotify handle on
+// failure (watcher.go), so every attempt builds a fresh Watcher — a retry on
+// the old object would run against a closed handle. Per-subtree add failures
+// inside an otherwise successful Start are NOT retried: they degrade by
+// design and are counted as blind spots on the watcher itself. Returns the
+// running watcher, or nil when every attempt failed or shutdown was
+// requested (check BgDone to tell the two apart).
+func (s *Server) startWatcherWithRetry(orch *extraction.Orchestrator, workdir string) *sync.Watcher {
+	var lastErr error
+	for attempt := 1; attempt <= watcherStartAttempts; attempt++ {
+		select {
+		case <-s.BgDone:
+			return nil
+		default:
+		}
+		w, err := newWatcher(orch, workdir)
+		if err != nil {
+			lastErr = err
+			slog.Warn("watcher warning", "workdir", workdir, "attempt", attempt, "error", err)
+		} else if err = w.Start(); err != nil {
+			// Start already released the fsnotify handle; the next attempt
+			// must build a fresh Watcher.
+			lastErr = err
+			slog.Warn("watcher start warning", "workdir", workdir, "attempt", attempt, "error", err)
+		} else {
+			return w
+		}
+		if attempt < watcherStartAttempts {
+			select {
+			case <-s.BgDone:
+				return nil
+			case <-time.After(watcherStartDelay(attempt)):
+			}
+		}
+	}
+	slog.Warn("watcher start failed after retries; auto-sync stays off until restart", "workdir", workdir, "attempts", watcherStartAttempts, "error", lastErr)
+	return nil
+}
+
 func backgroundIndexAndWatch(s *Server, noSync bool) {
 	defer s.BgWg.Done()
 	database := s.Database
@@ -417,14 +484,16 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 				return
 			default:
 			}
-			w2, wErr := sync.NewWatcher(otherOrch, wd)
-			if wErr != nil {
-				slog.Warn("watcher warning", "workdir", wd, "error", wErr)
-				_ = otherDB.Close()
-				continue
-			}
-			if wErr := w2.Start(); wErr != nil {
-				slog.Warn("watcher start warning", "workdir", wd, "error", wErr)
+			w2 := s.startWatcherWithRetry(otherOrch, wd)
+			if w2 == nil {
+				select {
+				case <-s.BgDone:
+					_ = otherDB.Close()
+					return
+				default:
+				}
+				// Retries exhausted: this secondary root keeps its (stale)
+				// index without auto-sync; the DB handle must not leak.
 				_ = otherDB.Close()
 				continue
 			}
@@ -470,13 +539,16 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		return
 	default:
 	}
-	watcher, wErr := sync.NewWatcher(orch, workdir)
-	if wErr != nil {
-		slog.Warn("watcher warning", "error", wErr)
-		return
-	}
-	if wErr := watcher.Start(); wErr != nil {
-		slog.Warn("watcher start warning", "error", wErr)
+	watcher := s.startWatcherWithRetry(orch, workdir)
+	if watcher == nil {
+		select {
+		case <-s.BgDone:
+			return
+		default:
+		}
+		// Observable via status ("watcher_active: false"): auto-sync is off
+		// and the index goes stale silently until the daemon restarts.
+		s.WatcherStartFailed.Store(true)
 		return
 	}
 	s.Watcher.Store(watcher)

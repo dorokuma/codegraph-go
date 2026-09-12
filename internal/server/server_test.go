@@ -1,13 +1,17 @@
 package server
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
+	"github.com/dorokuma/codegraph-go/internal/sync"
 )
 
 func TestResolvePath(t *testing.T) {
@@ -412,5 +416,113 @@ func TestGlobMatch(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("globMatch(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
 		}
+	}
+}
+
+// TestStartWatcherWithRetryGivesUpAfterBoundedAttempts: when every Start
+// attempt fails, the retry loop must stop after watcherStartAttempts tries
+// (bounded latency, no infinite hot loop in the background goroutine) and
+// leave the WatcherStartFailed flag to the caller, which knows whether the
+// loop ended because of retries or because of shutdown.
+func TestStartWatcherWithRetryGivesUpAfterBoundedAttempts(t *testing.T) {
+	origNew := newWatcher
+	origAttempts := watcherStartAttempts
+	origDelay := watcherStartDelay
+	defer func() {
+		newWatcher = origNew
+		watcherStartAttempts = origAttempts
+		watcherStartDelay = origDelay
+	}()
+
+	watcherStartAttempts = 3
+	watcherStartDelay = func(int) time.Duration { return time.Millisecond }
+
+	calls := 0
+	newWatcher = func(*extraction.Orchestrator, string) (*sync.Watcher, error) {
+		calls++
+		return nil, errors.New("watcher construction failed (fake)")
+	}
+
+	s := &Server{Workdir: t.TempDir(), BgDone: make(chan struct{})}
+	if got := s.startWatcherWithRetry(nil, s.Workdir); got != nil {
+		t.Fatal("startWatcherWithRetry must give up (nil watcher) when every attempt fails")
+	}
+	if calls != 3 {
+		t.Fatalf("watcher built %d times, want watcherStartAttempts=3", calls)
+	}
+	if s.WatcherStartFailed.Load() {
+		t.Fatal("the retry helper must not set WatcherStartFailed itself (the caller owns the flag)")
+	}
+}
+
+// TestStartWatcherWithRetryRecoversOnLaterAttempt: a Start failure that
+// clears (e.g. another process releases the inotify watch budget) must
+// self-heal without a daemon restart; every attempt builds a fresh Watcher
+// because a failed Start closes the fsnotify handle of the old one.
+func TestStartWatcherWithRetryRecoversOnLaterAttempt(t *testing.T) {
+	origNew := newWatcher
+	origAttempts := watcherStartAttempts
+	origDelay := watcherStartDelay
+	defer func() {
+		newWatcher = origNew
+		watcherStartAttempts = origAttempts
+		watcherStartDelay = origDelay
+	}()
+
+	watcherStartAttempts = 5
+	watcherStartDelay = func(int) time.Duration { return time.Millisecond }
+
+	dir := t.TempDir()
+	calls := 0
+	newWatcher = func(orch *extraction.Orchestrator, workdir string) (*sync.Watcher, error) {
+		calls++
+		if calls < 3 {
+			return nil, errors.New("transient failure (fake)")
+		}
+		return sync.NewWatcher(orch, workdir)
+	}
+
+	s := &Server{Workdir: dir, BgDone: make(chan struct{})}
+	w := s.startWatcherWithRetry(nil, dir)
+	if w == nil {
+		t.Fatal("startWatcherWithRetry must succeed once the transient failures stop")
+	}
+	defer w.Stop()
+	if calls != 3 {
+		t.Fatalf("watcher built %d times, want 3", calls)
+	}
+}
+
+// TestStartWatcherWithRetryAbortsOnShutdown: BgDone closed during a backoff
+// sleep must end the retry loop promptly (shutdown must not wait out the
+// full backoff schedule) and return nil.
+func TestStartWatcherWithRetryAbortsOnShutdown(t *testing.T) {
+	origNew := newWatcher
+	origAttempts := watcherStartAttempts
+	origDelay := watcherStartDelay
+	defer func() {
+		newWatcher = origNew
+		watcherStartAttempts = origAttempts
+		watcherStartDelay = origDelay
+	}()
+
+	watcherStartAttempts = 5
+	watcherStartDelay = func(int) time.Duration { return 50 * time.Millisecond }
+	newWatcher = func(*extraction.Orchestrator, string) (*sync.Watcher, error) {
+		return nil, errors.New("watcher construction failed (fake)")
+	}
+
+	s := &Server{BgDone: make(chan struct{})}
+	done := make(chan *sync.Watcher, 1)
+	go func() { done <- s.startWatcherWithRetry(nil, t.TempDir()) }()
+	time.Sleep(20 * time.Millisecond) // let attempt 1 fail and enter the backoff sleep
+	close(s.BgDone)
+	select {
+	case w := <-done:
+		if w != nil {
+			t.Fatal("expected a nil watcher once shutdown was observed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry loop did not observe shutdown during the backoff sleep")
 	}
 }
