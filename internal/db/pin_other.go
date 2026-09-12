@@ -12,7 +12,12 @@ import (
 // (Lstat + realpath) that Open already performs before creating anything.
 // The rechecks become no-ops instead of failing: pinning is a hardening
 // layer on top of the path-level jail, and on these platforms the guard
-// stays exactly as strong as it was before this change.
+// stays exactly as strong as it was before this change. The fallback is
+// theoretical anyway: the repository as a whole does not build on non-unix
+// platforms (including windows) in the first place — the tree-sitter cgo
+// dependency has no non-unix support upstream and CI has no coverage there
+// — and that was already true before 0.9.5, so this file degrades nothing
+// that ever worked.
 
 type pinnedDir struct{}
 

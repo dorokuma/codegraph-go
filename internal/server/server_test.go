@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -524,5 +525,58 @@ func TestStartWatcherWithRetryAbortsOnShutdown(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("retry loop did not observe shutdown during the backoff sleep")
+	}
+}
+
+// TestExtraWatcherStartFailureRecordedForStatus: when the retries for an
+// extra workdir's watcher are exhausted, the failure must be recorded per
+// root (ExtraWatcherStartFailed) so the status tool can show
+// "watcher_active: false" for that root — before this the secondary-root
+// failure lived only in the startup log (slog.Warn) while the root's index
+// went stale silently.
+func TestExtraWatcherStartFailureRecordedForStatus(t *testing.T) {
+	origNew := newWatcher
+	origAttempts := watcherStartAttempts
+	defer func() {
+		newWatcher = origNew
+		watcherStartAttempts = origAttempts
+	}()
+	watcherStartAttempts = 1
+	newWatcher = func(*extraction.Orchestrator, string) (*sync.Watcher, error) {
+		return nil, errors.New("watcher construction failed (fake)")
+	}
+
+	dir := t.TempDir()
+	extra := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	s := &Server{
+		Workdir:      dir,
+		Workdirs:     []string{dir, extra},
+		Database:     database,
+		Orchestrator: extraction.NewOrchestrator(database, dir),
+		BgDone:       make(chan struct{}),
+	}
+	s.Orchestrator.SetDone(s.BgDone)
+
+	s.BgWg.Add(1)
+	backgroundIndexAndWatch(s, false)
+
+	if !s.ExtraWatcherStartFailed[extra] {
+		t.Fatalf("extra watcher start failure must be recorded per root, got %v (primary WatcherStartFailed=%v)", s.ExtraWatcherStartFailed, s.WatcherStartFailed.Load())
+	}
+
+	// The recorded failure must be visible through the status tool for the
+	// extra root (resolveProject falls back to the ProjectCache DB because
+	// the failed root has no ExtraDBs entry).
+	result, _, err := s.toolStatus(context.Background(), nil, statusArgs{ProjectPath: extra})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := textContent(result); !strings.Contains(text, "watcher_active: false") {
+		t.Fatalf("status for the failed extra root must expose watcher_active: false, got:\n%s", text)
 	}
 }

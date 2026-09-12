@@ -973,6 +973,67 @@ func TestStartExposesBlindSpotCounters(t *testing.T) {
 	}
 }
 
+// TestWatchTreeRuntimeAddFailureCountsBlindDir: directories that appear at
+// runtime (a create event handled by the loop, the overflow rescan) register
+// through the same addDir injection point as Start's walk, and an Add failure
+// there is a permanent blind spot just the same — it must be counted into
+// BlindDirs (status's watcher_blind_dirs) instead of only logged. Before this
+// the runtime path called fsnotify Add directly: the counter missed it and
+// tests could not inject failures at all, so watcher_blind_dirs undercounted
+// blind spots that showed up after startup.
+func TestWatchTreeRuntimeAddFailureCountsBlindDir(t *testing.T) {
+	addErr := errors.New("inotify limit reached (fake)")
+	var mu sync.Mutex
+	var asked []string
+	inject := func(w *Watcher) {
+		w.addDirFn = func(path string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, path)
+			if filepath.Clean(path) == filepath.Clean(w.workdir) {
+				return nil // the root itself is watchable
+			}
+			return addErr // every other dir fails, as under max_user_watches
+		}
+	}
+
+	dir := t.TempDir()
+	w, err := NewWatcher(nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inject(w)
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// A directory created AFTER Start reaches watchTree through the runtime
+	// path (loop create branch / rescanAll). watchTree must consult the
+	// injected addDirFn and count the failure as a blind spot.
+	late := filepath.Join(dir, "late")
+	if err := os.MkdirAll(late, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.watchTree(late)
+
+	mu.Lock()
+	defer mu.Unlock()
+	reached := false
+	for _, got := range asked {
+		if filepath.Clean(got) == filepath.Clean(late) {
+			reached = true
+			break
+		}
+	}
+	if !reached {
+		t.Fatalf("runtime watchTree bypassed the addDir injection point (addDirFn never called for %s; asked: %v)", late, asked)
+	}
+	if got := w.BlindDirs(); got != 1 {
+		t.Fatalf("BlindDirs = %d, want 1 (the runtime-added dir is unwatchable)", got)
+	}
+}
+
 // TestStartCountsUnreadableRootWalkError: a walk error on the root (e.g. the
 // workdir vanished before Start) aborts Start, but the unreadable directory
 // must still be counted so the blind spot stays observable. A retrying

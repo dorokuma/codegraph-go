@@ -35,6 +35,15 @@ type Server struct {
 	// restarted. The status tool surfaces it ("watcher_active: false") so the
 	// blind state is observable instead of living only in the startup log.
 	WatcherStartFailed atomic.Bool
+	// ExtraWatcherStartFailed records extra workdirs whose watcher could not
+	// be started even after the bounded backoff retries in
+	// startWatcherWithRetry — the per-root counterpart of WatcherStartFailed
+	// for secondary roots: auto-sync is OFF for that root and file changes
+	// are NOT reindexed until the daemon is restarted. The status tool
+	// surfaces each entry ("watcher_active: false" when the root is
+	// resolved) so the blind state is observable instead of living only in
+	// the startup log. Guarded by ExtraMu.
+	ExtraWatcherStartFailed map[string]bool
 
 	// BgDone signals the background index/watch goroutine to exit.
 	BgDone chan struct{}
@@ -494,6 +503,16 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 				}
 				// Retries exhausted: this secondary root keeps its (stale)
 				// index without auto-sync; the DB handle must not leak.
+				// Record the failure per root — the counterpart of the
+				// primary's WatcherStartFailed below — so status can show
+				// "watcher_active: false" for this root instead of leaving
+				// the stale-index state in the startup log only.
+				s.ExtraMu.Lock()
+				if s.ExtraWatcherStartFailed == nil {
+					s.ExtraWatcherStartFailed = map[string]bool{}
+				}
+				s.ExtraWatcherStartFailed[wd] = true
+				s.ExtraMu.Unlock()
 				_ = otherDB.Close()
 				continue
 			}
