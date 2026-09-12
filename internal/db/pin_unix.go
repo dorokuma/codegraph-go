@@ -27,13 +27,16 @@ type pinnedDir struct {
 	fd int // -1 when no pinning is available (degraded mode)
 }
 
-// pinDir opens dir with O_DIRECTORY|O_NOFOLLOW and pins the resulting fd.
-// O_NOFOLLOW makes the open itself fail when the final path component is a
-// symlink, so the fd always refers to a real directory inode resolved within
-// this single syscall — the same syscall boundary the path-level checks ran
-// just before.
+// pinDir opens dir with O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC and pins the
+// resulting fd. O_NOFOLLOW makes the open itself fail when the final path
+// component is a symlink, so the fd always refers to a real directory inode
+// resolved within this single syscall — the same syscall boundary the
+// path-level checks ran just before. O_CLOEXEC keeps the pin out of spawned
+// child processes: the fd backs the /proc/self/fd/<fd> connection DSN (see
+// pinnedDBPath), and a leaked copy would both hold the directory open and
+// make the DSN's fd number meaningless to reason about across execs.
 func pinDir(dir string) (*pinnedDir, error) {
-	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("pin .codegraph dir %s: %w", dir, err)
 	}
@@ -51,14 +54,17 @@ func (p *pinnedDir) close() error {
 }
 
 // openLockFile creates/opens name relative to the pinned directory.
-// O_NOFOLLOW refuses a symlinked lock file instead of following it. The fd
-// is wrapped back into an *os.File so the flock semantics are unchanged.
+// O_NOFOLLOW refuses a symlinked lock file instead of following it. O_CLOEXEC
+// keeps the lock fd out of spawned children: flock lives on the open file
+// description, so an inherited copy would keep the A1 single-writer lock
+// held long after this process exited. The fd is wrapped back into an
+// *os.File so the flock semantics are unchanged.
 func (p *pinnedDir) openLockFile(dir, name string) (*os.File, error) {
 	fullPath := filepath.Join(dir, name)
 	if p.fd < 0 {
 		return os.OpenFile(fullPath, os.O_CREATE|os.O_RDWR, 0o600)
 	}
-	fd, err := unix.Openat(p.fd, name, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW, 0o600)
+	fd, err := unix.Openat(p.fd, name, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("openat %s under pinned .codegraph dir: %w", name, err)
 	}

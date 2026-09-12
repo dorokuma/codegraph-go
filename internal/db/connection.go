@@ -28,6 +28,11 @@ type DB struct {
 	// lockFile is the process-level exclusive lock on .codegraph/codegraph.lock
 	// (A1 single-writer). Held for the lifetime of the DB; released on Close.
 	lockFile *os.File
+	// pinned is the dirfd pinning the validated .codegraph directory. On
+	// Linux the connection DSN is built as /proc/self/fd/<fd>/codegraph.db
+	// (see pinnedDBPath), so the fd must stay open for the whole connection
+	// lifetime — it is released in Close, after the last connection is gone.
+	pinned *pinnedDir
 }
 
 // ErrIndexInUse marks the A1 single-writer lock conflict: Open failed
@@ -72,7 +77,15 @@ func Open(workdir string) (db *DB, err error) {
 	if perr != nil {
 		return nil, perr
 	}
-	defer func() { _ = pinned.close() }()
+	// The pin lives as long as the DB: on Linux the connection DSN is a
+	// /proc/self/fd/<fd> magic link, so closing the fd would sever the DSN
+	// under every pooled connection. Release it here only when Open fails;
+	// on success the DB owns it and Close frees it after the connections.
+	defer func() {
+		if err != nil || db == nil {
+			_ = pinned.close()
+		}
+	}()
 
 	// A1: single-writer lock. SQLite WAL allows one writer; a second process
 	// opening the same index would fight over the write lock (busy errors,
@@ -108,8 +121,13 @@ func Open(workdir string) (db *DB, err error) {
 	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
 	// not just the first one in the pool (database/sql may open new connections
 	// concurrently, and default is foreign_keys=OFF / busy_timeout=0).
-	// Escape URI-special characters in the path so spaces / # / ? / & work.
-	dsn := sqliteFileDSN(dbPath)
+	// On Linux the path part is /proc/self/fd/<pinned fd>/codegraph.db (see
+	// pinnedDBPath): SQLite's own file resolutions — db, -wal, -shm — then
+	// always land in the pinned directory, whatever the .codegraph path does
+	// after validation. On other platforms (and when procfs is unavailable)
+	// this is the validated plain path. Escape URI-special characters in the
+	// path so spaces / # / ? / & work.
+	dsn := sqliteFileDSN(pinnedDBPath(pinned, dir))
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -126,13 +144,15 @@ func Open(workdir string) (db *DB, err error) {
 		return nil, fmt.Errorf("enable WAL: %w", err)
 	}
 
-	// Post-creation recheck: modernc SQLite only receives dbPath, so its file
-	// creations re-resolved the path independently of the pin. Now that
-	// codegraph.db exists, verify through the pinned fd that the file the
-	// path names is the one inside the pinned directory. Detection, not
-	// prevention: if this fires, stray files already exist outside and are
-	// deliberately NOT unlinked (deleting through a freshly swapped path
-	// would touch attacker-chosen names).
+	// Post-creation recheck (defense in depth): on non-Linux SQLite receives
+	// the plain dbPath and its file creations re-resolve the path
+	// independently of the pin, so this comparison is the only escape
+	// detection there. On Linux the DSN goes through the pinned fd's magic
+	// link and creations cannot escape; the recheck stays as a cheap,
+	// redundant verification that the on-disk state matches the pin. Either
+	// way it is detection, not cleanup: if this fires, stray files may
+	// already exist outside and are deliberately NOT unlinked (deleting
+	// through a freshly swapped path would touch attacker-chosen names).
 	if err := pinned.recheckChild(dir, "codegraph.db", dbPath); err != nil {
 		conn.Close()
 		return nil, err
@@ -149,7 +169,7 @@ func Open(workdir string) (db *DB, err error) {
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
 	}
 
-	db = &DB{conn: conn, path: dbPath, lockFile: lockFile}
+	db = &DB{conn: conn, path: dbPath, lockFile: lockFile, pinned: pinned}
 
 	// Finish any edges rebuild interrupted by a crash in pre-transaction
 	// builds BEFORE schema.sql runs: schema.sql would otherwise recreate an
@@ -220,9 +240,9 @@ func (d *DB) ensureFTSBackfill() error {
 	return nil
 }
 
-// Close closes the database connection and releases the single-writer lock.
-// Idempotent: a second Close is a no-op returning nil (the connection and the
-// flock are each released exactly once).
+// Close closes the database connection, releases the single-writer lock and
+// the directory pin. Idempotent: a second Close is a no-op returning nil
+// (the connection, the flock and the pin are each released exactly once).
 func (d *DB) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -236,6 +256,14 @@ func (d *DB) Close() error {
 		_ = syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_UN)
 		_ = d.lockFile.Close()
 		d.lockFile = nil
+	}
+	if d.pinned != nil {
+		// Released after the connection: on Linux the DSN is a
+		// /proc/self/fd/<fd> magic link that must stay resolvable until the
+		// last SQLite handle (including its -wal/-shm cleanup on close) is
+		// done with it.
+		_ = d.pinned.close()
+		d.pinned = nil
 	}
 	return err
 }
