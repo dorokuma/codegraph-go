@@ -3,6 +3,14 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.11] - 2026-09-12
+
+### Changed
+- 删除 internal/sync 的死代码 `Watcher.AddDir`/`RemoveDir`（全仓零调用，第五轮全面审计唯一可操作项）。
+- `cgdir.Ensure` 返回验证过的目录身份（Dev/Ino），daemon Start 直接采用——消除 Ensure 与独立 stat 之间的微秒级换手间隙（第五轮对抗审计 F6，30 次竞态未命中的理论窗口）；新增 `internal/cgdir/identity_unix.go`/`identity_other.go` 平台拆分。
+- `CODEGRAPH_ALLOW_PLAIN_DB=1` 降级模式自声明：告警中明确"plain-path DSN 下目录换手由 recheck 检出而非阻止"（第五轮对抗审计 F1）。
+- Display / daemon wire version **0.9.11**。
+
 ## [0.9.10] - 2026-09-12
 
 ### Fixed
