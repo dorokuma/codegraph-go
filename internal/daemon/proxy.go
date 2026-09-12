@@ -49,6 +49,31 @@ func ConnectHello(socketPath string) (net.Conn, *bufio.Reader, Hello, ProxyResul
 	return conn, br, hello, ProxyResult{Outcome: "proxied"}
 }
 
+// proxyDrainTimeout bounds how long RunProxy waits for the daemon→stdout leg
+// to drain after host stdin hit EOF. The daemon normally closes the
+// connection once it answered the tail requests, ending the drain early; the
+// timeout only covers a daemon that never closes. A var so tests can exercise
+// the timeout branch quickly (same pattern as sync's stopGracePeriod).
+var proxyDrainTimeout = 5 * time.Second
+
+// halfCloseWrite ends the client→daemon direction of the proxy connection
+// without tearing down the daemon→stdout direction. A full Close after host
+// stdin EOF would truncate the daemon's tail responses: MCP's documented
+// shutdown order is "client closes stdin, then keeps reading stdout until
+// EOF", so a daemon answering requests it already received must still be
+// able to deliver them. Unix sockets support a write-side shutdown (the
+// daemon's read side sees EOF while the socket stays readable); conns that
+// are not *net.UnixConn — and failed half-closes — fall back to the
+// historical full close.
+func halfCloseWrite(conn net.Conn) error {
+	if uc, ok := conn.(*net.UnixConn); ok {
+		if err := uc.CloseWrite(); err == nil {
+			return nil
+		}
+	}
+	return conn.Close()
+}
+
 // RunProxy pipes host stdio through a same-version daemon socket until either end closes.
 // Call after ConnectHello succeeded; br must be the reader positioned after daemon hello.
 // WriteClientHello failure returns an error (L2): the connection is useless
@@ -75,23 +100,60 @@ func RunProxy(conn net.Conn, br *bufio.Reader, hello Hello) (ProxyResult, error)
 	})
 	defer stopWD()
 
-	errc := make(chan error, 2)
+	stdinErr := make(chan error, 1)
+	stdoutErr := make(chan error, 1)
 	// Host stdin → daemon (after optional leftover in br is empty).
 	go func() {
 		_, err := io.Copy(conn, os.Stdin)
-		_ = conn.Close()
-		errc <- err
+		if err != nil {
+			// The copy itself failed (stdin error or dead conn): the
+			// legacy full close is the right teardown.
+			_ = conn.Close()
+		} else if cerr := halfCloseWrite(conn); cerr != nil {
+			// stdin EOF: signal end-of-input to the daemon without killing
+			// the daemon→stdout leg (see halfCloseWrite).
+			err = cerr
+		}
+		stdinErr <- err
 	}()
 	// Daemon → host stdout. Drain br first (should be empty post-hello), then conn.
 	go func() {
 		// Anything already buffered after hello (shouldn't be) then the rest of the conn.
 		mr := io.MultiReader(br, conn)
 		_, err := io.Copy(os.Stdout, mr)
-		errc <- err
+		stdoutErr <- err
 	}()
 
-	if err := <-errc; err != nil && err != io.EOF {
-		log.Printf("proxy copy: %v", err)
+	// Whichever leg ends first decides how RunProxy terminates:
+	//
+	//   - stdin EOF (leg 1): the daemon has just seen end-of-input and must
+	//     still answer the requests it already received. Wait — bounded by
+	//     proxyDrainTimeout — for leg 2 to drain those tail responses; the
+	//     daemon normally ends the drain itself by closing the connection
+	//     once done.
+	//   - daemon closed (leg 2): nothing more will arrive, so finish at
+	//     once (unchanged behavior); leg 1 is parked on os.Stdin and dies
+	//     with the process as before.
+	//
+	// The PPID watchdog above still ends both branches: closing the socket
+	// unblocks both io.Copy legs (daemon refcount--).
+	select {
+	case err := <-stdinErr:
+		if err != nil && err != io.EOF {
+			log.Printf("proxy copy (stdin): %v", err)
+		}
+		select {
+		case err := <-stdoutErr:
+			if err != nil && err != io.EOF {
+				log.Printf("proxy copy (stdout): %v", err)
+			}
+		case <-time.After(proxyDrainTimeout):
+			log.Printf("proxy: daemon still open %v after stdin EOF; closing", proxyDrainTimeout)
+		}
+	case err := <-stdoutErr:
+		if err != nil && err != io.EOF {
+			log.Printf("proxy copy (stdout): %v", err)
+		}
 	}
 	_ = conn.Close()
 	return ProxyResult{Outcome: "proxied"}, nil
