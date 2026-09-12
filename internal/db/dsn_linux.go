@@ -52,6 +52,7 @@ func pinnedDBPath(p *pinnedDir, dir string) (string, error) {
 		plain := filepath.Join(dir, "codegraph.db")
 		if os.Getenv(AllowPlainDBEnv) == "1" {
 			log.Printf("db: %v; %s=1 set, opening codegraph.db through the plain path %q (dirfd TOCTOU defense degraded to detection only)", probeErr, AllowPlainDBEnv, plain)
+			log.Printf("db: plain-path DSN in use (degraded): directory swaps are detected by recheck checks, not prevented")
 			return plain, nil
 		}
 		return "", fmt.Errorf("pinned .codegraph dir: %v; refusing to open codegraph.db through the plain path because the dirfd TOCTOU defense needs a resolvable /proc/self/fd magic link (mount procfs, or set %s=1 to accept the degraded detection-only fallback)", probeErr, AllowPlainDBEnv)
