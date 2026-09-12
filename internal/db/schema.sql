@@ -48,8 +48,8 @@ CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
     size INTEGER,
-    mtime REAL,
-    indexed_at REAL,
+    mtime REAL,      -- Unix milliseconds since epoch (time.UnixMilli), stored as REAL
+    indexed_at REAL, -- Unix milliseconds since epoch (time.UnixMilli); same units as mtime
     content_hash TEXT,
     language TEXT,
     node_count INTEGER DEFAULT 0

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,13 @@ type DB struct {
 	// (A1 single-writer). Held for the lifetime of the DB; released on Close.
 	lockFile *os.File
 }
+
+// ErrIndexInUse marks the A1 single-writer lock conflict: Open failed
+// because another process holds .codegraph/codegraph.lock. Callers match it
+// with errors.Is instead of string-matching the message. Its text is the
+// static prefix of the historical in-use error so the rendered message is
+// unchanged; the holder hint and the underlying flock error follow it.
+var ErrIndexInUse = errors.New("codegraph.db in use by another process")
 
 // Open opens (or creates) the SQLite database at .codegraph/codegraph.db under workdir.
 func Open(workdir string) (db *DB, err error) {
@@ -78,7 +86,7 @@ func Open(workdir string) (db *DB, err error) {
 	}
 	if ferr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); ferr != nil {
 		_ = lockFile.Close()
-		return nil, fmt.Errorf("codegraph.db in use by another process%s: %w", lockHolderHint(dir), ferr)
+		return nil, fmt.Errorf("%w%s: %w", ErrIndexInUse, lockHolderHint(dir), ferr)
 	}
 	// Every error path below must release the lock before returning.
 	defer func() {

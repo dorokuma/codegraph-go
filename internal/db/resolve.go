@@ -44,6 +44,18 @@ var callTargetKinds = map[string]bool{
 	"foreign_function": true,
 }
 
+// CallTargetKinds returns a read-only snapshot of callTargetKinds. Exported
+// solely so the cross-package consistency test can deep-compare this copy
+// against internal/resolution's snapshot; production code keeps using the
+// package-local map.
+func CallTargetKinds() map[string]bool {
+	out := make(map[string]bool, len(callTargetKinds))
+	for kind, want := range callTargetKinds {
+		out[kind] = want
+	}
+	return out
+}
+
 // ResolveBestTarget picks the best definition for a call/import name using
 // proximity scoring (official CodeGraph name-matcher idea, simplified):
 //

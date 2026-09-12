@@ -29,7 +29,7 @@ func (d *DB) UpsertFileRecord(f *FileRecord) error {
 			content_hash = excluded.content_hash,
 			language = excluded.language,
 			node_count = excluded.node_count
-	`, f.Path, f.Size, f.Mtime, float64(time.Now().Unix()), f.ContentHash, f.Language, f.NodeCount)
+	`, f.Path, f.Size, f.Mtime, float64(time.Now().UnixMilli()), f.ContentHash, f.Language, f.NodeCount)
 	return err
 }
 
@@ -86,7 +86,7 @@ func (d *DB) TouchFileMeta(path string, size int64, mtime float64, contentHash s
 		UPDATE files
 		SET size = ?, mtime = ?, content_hash = ?, indexed_at = ?
 		WHERE path = ?
-	`, size, mtime, contentHash, float64(time.Now().Unix()), path)
+	`, size, mtime, contentHash, float64(time.Now().UnixMilli()), path)
 	return err
 }
 

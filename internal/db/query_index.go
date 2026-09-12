@@ -174,7 +174,7 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 				content_hash = excluded.content_hash,
 				language = excluded.language,
 				node_count = excluded.node_count
-		`, fileRecord.Path, fileRecord.Size, fileRecord.Mtime, float64(time.Now().Unix()),
+		`, fileRecord.Path, fileRecord.Size, fileRecord.Mtime, float64(time.Now().UnixMilli()),
 			fileRecord.ContentHash, fileRecord.Language, fileRecord.NodeCount); err != nil {
 			return nil, fmt.Errorf("replace file record: %w", err)
 		}
