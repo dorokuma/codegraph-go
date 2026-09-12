@@ -10,7 +10,7 @@ Pipeline: extract → park cross-file refs → `ResolveAll` → scrub pure-noise
 
 ## Features
 
-Alignment: steps **1–9** done incl. 7.5 (logic **19**). Not full feature-parity — see `/root/codegraph-go-comparison.md` (next: step 10 eval).
+Alignment: steps **1–9** done incl. 7.5 (logic **19**). Not full feature-parity (next: step 10 eval).
 
 - **1 MCP tool `codegraph` (action router):** `action=explore` (PRIMARY), `node`, `search`, `callers`/`callees`/`impact`, `files`, `status`, `affected`/`communities`, `store_fact`/`search_facts`. Same capabilities as 0.7 multi-tool surface; one schema for lower prompt cost.
 - **node dual mode:** `file` alone = Read-like numbered source + dependents; `name` = body + trail; overloads return every body in one call
@@ -22,12 +22,12 @@ Alignment: steps **1–9** done incl. 7.5 (logic **19**). Not full feature-parit
 - **Smart explore:** Flow path + source for a bag of symbols; size-tier output budget
 - **SQLite indexing:** symbols, edges, files, unresolved_refs in `.codegraph/codegraph.db`
 - **FTS5 full-text search:** plain identifiers in `search` hit FTS first (no separate search_fts tool)
-- **Tree-sitter AST parsing:** Go / TypeScript / JavaScript / Python with qualified_name, signature, is_exported, visibility, return_type (syntax-keyword call filter only)
+- **Tree-sitter AST parsing:** Go / TypeScript / JavaScript / Python / C / C++ / Java / Kotlin / Rust / Ruby / PHP / C# / Scala / Swift / Lua with qualified_name, signature, is_exported, visibility, return_type (syntax-keyword call filter only)
 - **SFC support:** Vue / Svelte / Astro — file component, multi-script/frontmatter, opening-tag template refs (HTML natives skipped, kebab→Pascal, `@click`/`v-on`)
 - **Parallel index:** IndexAll worker pool (`CODEGRAPH_INDEX_WORKERS`, default min(8, cores-1)); DB writes serialized
 - **Noise rules:** `ShouldParkRef` keeps real symbols even if named like `emit`; scrub after resolve
-- **Regex fallback:** Rust (use/fn/impl + pub/signature + cargo map), Java, C#, Ruby, PHP, C, C++, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Objective-C, Liquid, Pascal/Delphi
-- **Framework route detection:** Gin, chi, gorilla/mux, Express, NestJS, Flask, FastAPI, Django, Laravel, Rails, Spring, ASP.NET, Axum, actix, Rocket, Vapor, Play
+- **Regex fallback:** Dart, Luau, R, Objective-C, Liquid, Pascal/Delphi (regex is also the fallback when tree-sitter parsing fails, incl. Rust use/fn/impl + pub/signature + cargo map)
+- **Framework route detection:** Gin, chi, gorilla/mux, GoFrame, Express, NestJS, React Router, Flask, FastAPI, Django, Laravel, Rails, Spring, ASP.NET, Axum, actix, Rocket, Vapor, Play
 - **Cross-language bridging:** CGo (Go↔C), Python ctypes/cffi/Cython, React Native/Expo, Swift↔ObjC
 - **Home-mode indexing:** workdir=`$HOME` only enters project-like top-level dirs
 - **Shared daemon (optional):** one process per project root owns SQLite + watcher; MCP hosts attach via Unix socket proxy. `CODEGRAPH_NO_DAEMON=1` keeps the old embedded mode. Idle exit default 300s (`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`).
@@ -49,8 +49,6 @@ Aligned steps **1–9** (including optional **7.5** C fn-pointer + GoFrame synth
 | Display version | 0.9.5 |
 | Index logic | 19 |
 | Feature parity | **not claimed** (step 10 open) |
-
-Single source of truth: `/root/codegraph-go-comparison.md`.
 
 ## Installation
 
@@ -140,7 +138,7 @@ files whose content changes get re-extracted under the new semantics.
 
 ### Tree-sitter vs Regex
 
-For Go, TypeScript, JavaScript, and Python, codegraph-go uses tree-sitter for accurate AST-based extraction. This provides:
+For Go, TypeScript, JavaScript, Python, C, C++, Java, Kotlin, Rust, Ruby, PHP, C#, Scala, Swift, and Lua, codegraph-go uses tree-sitter for accurate AST-based extraction. This provides:
 - Better method detection (including struct methods with receivers)
 - More accurate call graph (handles method calls, selector expressions)
 - Proper handling of nested functions and closures
@@ -151,9 +149,16 @@ For other languages, regex-based extraction is used as a fallback.
 
 codegraph-go detects web framework routing patterns and creates `route` nodes:
 
-- **Go:** Gin, chi, gorilla/mux
-- **JavaScript:** Express
+- **Go:** Gin, chi, gorilla/mux, GoFrame
+- **JavaScript/TypeScript:** Express, NestJS, React Router
 - **Python:** Flask, FastAPI, Django
+- **PHP:** Laravel
+- **Ruby:** Rails
+- **Java:** Spring
+- **C#:** ASP.NET
+- **Rust:** Axum, actix, Rocket
+- **Swift:** Vapor
+- **Scala:** Play
 
 Routes are stored as nodes with kind `route`, where the name is `METHOD /path` and the body is the handler function name.
 
@@ -179,12 +184,17 @@ codegraph-go/
 │   ├── root.go          # FindNearestCodeGraphRoot
 │   └── query.go         # nodes, edges, files, unresolved_refs
 ├── internal/extraction/
-│   ├── common.go        # Language detection
-│   ├── extractor.go     # Regex extraction (+ Rust use/fn)
-│   ├── treesitter.go    # Tree-sitter AST (Go, TS, JS, Python)
-│   ├── frameworks.go    # Framework route detection
-│   ├── bridge.go        # Cross-language bridging
-│   └── orchestrator.go  # Index builder → ResolveAll
+│   ├── common.go                # Language detection
+│   ├── extractor_core.go        # Regex extractor dispatch + shared helpers
+│   ├── extractor_brace.go       # Brace/indent body scanning
+│   ├── extractor_c_braced.go    # Go + JS regex extraction
+│   ├── extractor_generic.go     # Generic regex extraction (other languages)
+│   ├── extractor_misc.go        # ObjC / Liquid / Lua / Pascal regex extraction
+│   ├── extractor_python_rust.go # Python + Rust regex extraction (Rust use/fn)
+│   ├── treesitter.go            # Tree-sitter AST (15 languages)
+│   ├── frameworks.go            # Framework route detection
+│   ├── bridge.go                # Cross-language bridging
+│   └── orchestrator.go          # Index builder → ResolveAll
 ├── internal/resolution/
 │   ├── resolver.go      # pending refs → edges
 │   ├── name_matcher.go
