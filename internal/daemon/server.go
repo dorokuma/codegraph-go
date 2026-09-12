@@ -87,6 +87,7 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("stat %s: %w", CodeGraphDir(d.root), derr)
 	}
 	d.dirID = dirID
+	log.Printf("daemon start: .codegraph dir identity dev=%d ino=%d (also recorded in the pidfile)", dirID.dev, dirID.ino)
 	candidates := SocketCandidates(d.root)
 	if len(candidates) == 0 {
 		return errNoSocketSupport

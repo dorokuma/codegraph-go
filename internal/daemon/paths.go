@@ -32,6 +32,18 @@ type LockInfo struct {
 	// entirely when it is absent: a pidfile without it cannot prove which
 	// process incarnation it names, so a kill must never be based on it.
 	ProcStart int64 `json:"procStart,omitempty"`
+	// DirDev/DirIno record the (st_dev, st_ino) identity of the .codegraph
+	// directory as it was when this pidfile was written (absent for pidfiles
+	// from older builds and on platforms without a stat-able directory
+	// identity). A same-inode swap of .codegraph (rename + symlink pointing
+	// back at the original inode) passes every existing guard with the
+	// daemon's integrity intact but used to leave no audit trail; recording
+	// the start-time identity here (and in the daemon.log start line) makes
+	// such swaps traceable after the fact. Observability only: these fields
+	// deliberately do NOT participate in verifyDaemonIdentity or any kill
+	// decision, and absent/zero values decode exactly like before.
+	DirDev uint64 `json:"dirDev,omitempty"`
+	DirIno uint64 `json:"dirIno,omitempty"`
 }
 
 // CodeGraphDir returns <root>/.codegraph.

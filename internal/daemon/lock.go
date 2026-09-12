@@ -43,6 +43,15 @@ func TryAcquireLock(projectRoot string) (AcquireResult, error) {
 		StartedAt:  time.Now().UnixMilli(),
 		ProcStart:  procStartTime(os.Getpid()),
 	}
+	// Audit trail: fingerprint the .codegraph directory at acquire time.
+	// The cgdir.Ensure call above verified that the path resolves to a real
+	// directory, so this stat sees the same object a later same-inode swap
+	// would impersonate; recording it makes such swaps traceable via the
+	// pidfile and the daemon.log start line. Best-effort: on stat failure
+	// the fields stay absent (omitempty) and acquisition proceeds unchanged.
+	if id, err := statDirIdentity(filepath.Dir(pidPath)); err == nil {
+		info.DirDev, info.DirIno = id.dev, id.ino
+	}
 
 	tmp := pidPath + "." + itoa(os.Getpid()) + ".tmp"
 	if err := os.WriteFile(tmp, EncodeLock(info), 0o600); err != nil {
