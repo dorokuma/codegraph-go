@@ -3,6 +3,20 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.9] - 2026-09-12
+
+### Fixed
+- **TOCTOU 根治（第三轮对抗审计 20/20 实证的检测型残留）**：`db.Open` 改经 `/proc/self/fd/<dirfd>/codegraph.db`（procfs magic link 恒定解析到钉住目录 inode）打开 SQLite——db/-wal/-shm 全部不再经路径重解析，目录换手后写入仍落在钉住的真实目录；pinned fd 由 DB 持有至 `Close`（openat 加 `O_CLOEXEC` 防泄漏）；非 Linux 或 procfs 不可用回退路径打开并保留 inode 复核。实测换手后写入零越界（修复前 20/20 越界可复现）。
+- **失败不再静默**：safelog 暴露 `Flush` 并在全部致命退出路径排空缓冲——`main.go` 3 处 `log.Fatalf` 与 9 处 `slog.Error` 后的 `os.Exit(1)`（allowlist 拒绝、symlink 拒绝、TOCTOU 检出、flock 冲突此前全部 0 字节 stderr，5/5 复现）修复后 stderr 均含可操作错误；`Close` 改为先 Flush 再关，顺带修复 PPID watchdog 日志行丢失（正常返回路径进程退出过快所致）。
+- **Stop 清理身份复核**：daemon 记录 `.codegraph` 目录 dev/ino，`cleanupArtifacts` 删除 pidfile/socket 前复核——目录被换手后不再经 symlink 删除界外文件（红队实测的第三条删除通道：Go `UnixListener` unlink-on-close 亦已 `SetUnlinkOnClose(false)` 收口到守卫点）。
+- **pidfd 首信号前补身份复核**：`terminateStaleViaPidfd` 在 pidfdOpen 后重跑 `verifyDaemonIdentity`（镜像 recovery 侧模式），封死 verify→pidfdOpen 的换进程窗口；失配且进程已死则清锁，存活则拒绝。
+- **watcher 自愈**：Start 失败按退避重试（5 次 1s-16s，关机即时中止），最终失败在 status 可见（`watcher_active: false`）；盲区计数（Add 失败/walk 读失败）升为原子字段并进 status（`watcher_blind_dirs`/`watcher_unreadable_dirs`），不再"启动日志一次即失忆"。
+- `RegistryDir` 在 $HOME 不可解析时放弃注册（best-effort），不再写 `/tmp/.codegraph/daemons`（walk-up 误认污染源）。
+
+### Changed
+- 修正 `BoundedEditDistance` 注释（实为普通 Levenshtein，无换位步）；deploy.sh 在 lock 探测前拒绝 symlink 的 `.codegraph`。
+- Display / daemon wire version **0.9.9**。
+
 ## [0.9.8] - 2026-09-12
 
 ### Fixed
