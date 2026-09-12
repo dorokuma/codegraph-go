@@ -27,6 +27,50 @@ type DB struct {
 	lockFile *os.File
 }
 
+// rejectSymlinkCodeGraphDir is the Lstat line of the .codegraph symlink jail:
+// it refuses to continue when <workdir>/.codegraph is a symlink (its target is
+// not this project's index, and creating the database there would write
+// outside the project) or not a directory at all. A missing .codegraph
+// passes - Open creates a fresh real directory right after.
+func rejectSymlinkCodeGraphDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat .codegraph dir %s: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(".codegraph is a symlink; refusing to open %s: remove the symlink and re-create the index (codegraph-go init) so the database files stay inside the project", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf(".codegraph is not a directory: %s", dir)
+	}
+	return nil
+}
+
+// verifyCodeGraphDirRealPath is the realpath line of the .codegraph symlink
+// jail: the directory must resolve to itself, otherwise Open refuses before
+// any database file is written. Only the .codegraph component itself may not
+// alias elsewhere - a symlinked ANCESTOR stays allowed, because the codebase
+// treats a symlinked workdir as a supported alias of its real path (see
+// PathUnderRoot and projectRootAllowed, which resolve instead of reject);
+// the parent is therefore resolved separately before comparing.
+func verifyCodeGraphDirRealPath(dir string) error {
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("resolve .codegraph dir %s: %w", dir, err)
+	}
+	want := filepath.Join(filepath.Dir(dir), filepath.Base(dir))
+	if realParent, perr := filepath.EvalSymlinks(filepath.Dir(dir)); perr == nil && realParent != "" {
+		want = filepath.Join(realParent, filepath.Base(dir))
+	}
+	if real != want {
+		return fmt.Errorf(".codegraph is a symlink; refusing to open %s: it resolves to %s", dir, real)
+	}
+	return nil
+}
+
 // Open opens (or creates) the SQLite database at .codegraph/codegraph.db under workdir.
 func Open(workdir string) (db *DB, err error) {
 	// Resolve to an absolute path up front. The DSN is a file:// URI where a
@@ -40,8 +84,22 @@ func Open(workdir string) (db *DB, err error) {
 	workdir = absWorkdir
 
 	dir := filepath.Join(workdir, ".codegraph")
+	// Symlink jail (adversarial audit): a symlinked .codegraph makes the
+	// MkdirAll below a no-op, and SQLite would then create codegraph.db,
+	// -wal, -shm and codegraph.lock at the symlink TARGET - outside the
+	// project. Fail closed in two independent steps:
+	//  1. Lstat - an existing .codegraph that is a symlink (or not a real
+	//     directory) is rejected before anything is created or modified.
+	//  2. realpath - after creation, .codegraph must still resolve to
+	//     itself, or Open refuses before a single database file is written.
+	if err := rejectSymlinkCodeGraphDir(dir); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create .codegraph dir: %w", err)
+	}
+	if err := verifyCodeGraphDirRealPath(dir); err != nil {
+		return nil, err
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")
 
