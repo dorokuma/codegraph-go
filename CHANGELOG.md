@@ -3,6 +3,22 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.8] - 2026-09-12
+
+### Fixed
+- 修复 CI flake（GH Actions 上 `TestVerifyDaemonIdentitySameProjectDaemon` 偶发失败）：`/proc/<pid>/stat` 的 starttime 在 fork 时固定并延续到 exec 之后，而 `/proc/<pid>/cmdline` 在 fork→exec 窗口内显示的是父进程 argv——慢速 runner 上测试 helper 刚启动即被读取会看不到 `-workdir` 而误判拒绝。`startDaemonLikeProcess` 现在等待目标 argv 真正可见后再返回（2s 兜底）。
+- proxy 在 host stdin EOF 时对 unix socket 做 `CloseWrite` 半关闭而非整体断开，并等待 daemon 侧输出排空（5s 兜底）再收尾——修复"先关 stdin、再读 stdout 收尾"顺序下最后一条 JSON-RPC 响应被截断。
+- watcher 对非根目录的 inotify Add 失败降级为计数+日志并继续遍历，仅根目录失败才中止启动——超大仓库撞 `fs.inotify.max_user_watches` 时不再整体退出。
+- files 表时间列统一为 Unix milliseconds：`indexed_at` 此前写秒（只写不读，纯防雷），schema 注明两列单位。
+- db 包导出 `ErrIndexInUse` sentinel 并在 flock 冲突源头包装（渲染文案逐字节不变），`main.go` 改用 `errors.Is` 判定，保留驱动层 `locked` 文案回退。
+- `callTargetKinds` 双份实现增加跨包一致性测试护栏（internal/db 与 internal/resolution 快照深比较）。
+
+### Changed
+- README 新增 "Shared daemon socket auth" 一节：`CODEGRAPH_MCP_TOKEN` 的作用、启用方式（双侧同值）、默认关闭与拒绝行为；明确 0600 socket 权限仍是第一道防线。
+- 删除 extraction/orchestrator.go 中 3 处 0.9.5 拆分遗留的悬空 doc comment（fileNodeCount/IndexFile/indexFile）。
+- deploy.sh 的 DEPLOY_COMMIT 提交集合补入 CHANGELOG.md 与 README.md。
+- Display / daemon wire version **0.9.8**。
+
 ## [0.9.7] - 2026-09-12
 
 ### Fixed
