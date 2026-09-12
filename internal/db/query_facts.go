@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -11,11 +12,16 @@ import (
 // InsertFact stores a new fact. contentHash is a SHA-256 hex string.
 // The caller must already have computed it. Returns the new row ID and nil.
 func (d *DB) InsertFact(f *Fact) (int64, error) {
+	return d.InsertFactContext(context.Background(), f)
+}
+
+// InsertFactContext is the context-aware variant of InsertFact.
+func (d *DB) InsertFactContext(ctx context.Context, f *Fact) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now().Unix()
-	result, err := d.conn.Exec(`
+	result, err := d.conn.ExecContext(ctx, `
 		INSERT INTO facts (target_file, target_symbol, target_line, content, content_hash,
 			author, status, superseded_by, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -32,24 +38,31 @@ func (d *DB) InsertFact(f *Fact) (int64, error) {
 // existing fact superseded by the new row. Both writes share one transaction
 // so a failed supersede does not leave an orphan insert.
 func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
+	return d.InsertFactSupersedingContext(context.Background(), f, supersedes)
+}
+
+// InsertFactSupersedingContext is the context-aware variant of
+// InsertFactSuperseding. Both writes share one transaction so a failed
+// supersede does not leave an orphan insert.
+func (d *DB) InsertFactSupersedingContext(ctx context.Context, f *Fact, supersedes int64) (int64, error) {
 	if f == nil {
 		return 0, fmt.Errorf("insert fact: nil fact")
 	}
 	if supersedes == 0 {
-		return d.InsertFact(f)
+		return d.InsertFactContext(ctx, f)
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	tx, err := d.conn.Begin()
+	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("insert fact superseding: begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
 	now := time.Now().Unix()
-	result, err := tx.Exec(`
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO facts (target_file, target_symbol, target_line, content, content_hash,
 			author, status, superseded_by, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -65,7 +78,7 @@ func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
 	}
 
 	var newStatus string
-	err = tx.QueryRow(`SELECT status FROM facts WHERE id = ?`, newID).Scan(&newStatus)
+	err = tx.QueryRowContext(ctx, `SELECT status FROM facts WHERE id = ?`, newID).Scan(&newStatus)
 	if err != nil {
 		return 0, fmt.Errorf("insert fact superseding: lookup new fact %d: %w", newID, err)
 	}
@@ -73,7 +86,7 @@ func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
 		return 0, fmt.Errorf("insert fact superseding: new fact %d is not active (status %q)", newID, newStatus)
 	}
 
-	upd, err := tx.Exec(`
+	upd, err := tx.ExecContext(ctx, `
 		UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
 		WHERE id = ? AND status = 'active'
 	`, newID, now, supersedes)
@@ -106,10 +119,16 @@ func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 // GetFactByHashAndTarget looks up a fact by content hash pinned to one
 // target. Same text on a different file/symbol is a different fact.
 func (d *DB) GetFactByHashAndTarget(hash, file, symbol string) (*Fact, error) {
+	return d.GetFactByHashAndTargetContext(context.Background(), hash, file, symbol)
+}
+
+// GetFactByHashAndTargetContext is the context-aware variant of
+// GetFactByHashAndTarget.
+func (d *DB) GetFactByHashAndTargetContext(ctx context.Context, hash, file, symbol string) (*Fact, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.conn.QueryRow(`
+	row := d.conn.QueryRowContext(ctx, `
 		SELECT id, target_file, target_symbol, target_line, content, content_hash,
 			author, status, COALESCE(superseded_by,0), created_at, updated_at
 		FROM facts
@@ -130,7 +149,12 @@ var maxFactsByTarget = 500
 // full pile). Pass symbol="" to ignore symbol filter. Callers that need the
 // truncation flag explicitly should use GetFactsByTargetLimited.
 func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
-	facts, truncated, err := d.GetFactsByTargetLimited(file, symbol, maxFactsByTarget)
+	return d.GetFactsByTargetContext(context.Background(), file, symbol)
+}
+
+// GetFactsByTargetContext is the context-aware variant of GetFactsByTarget.
+func (d *DB) GetFactsByTargetContext(ctx context.Context, file, symbol string) ([]Fact, error) {
+	facts, truncated, err := d.GetFactsByTargetLimitedContext(ctx, file, symbol, maxFactsByTarget)
 	if truncated {
 		sym := ""
 		if symbol != "" {
@@ -146,6 +170,12 @@ func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
 // limit <= 0 falls back to maxFactsByTarget. Unlike GetFactsByTarget,
 // truncation is explicit here so callers can surface it in responses.
 func (d *DB) GetFactsByTargetLimited(file, symbol string, limit int) ([]Fact, bool, error) {
+	return d.GetFactsByTargetLimitedContext(context.Background(), file, symbol, limit)
+}
+
+// GetFactsByTargetLimitedContext is the context-aware variant of
+// GetFactsByTargetLimited.
+func (d *DB) GetFactsByTargetLimitedContext(ctx context.Context, file, symbol string, limit int) ([]Fact, bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -162,7 +192,7 @@ func (d *DB) GetFactsByTargetLimited(file, symbol string, limit int) ([]Fact, bo
 	}
 	q += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, limit+1)
-	rows, err := d.conn.Query(q, args...)
+	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -183,6 +213,11 @@ func (d *DB) GetFactsByTargetLimited(file, symbol string, limit int) ([]Fact, bo
 // status "" returns all statuses. % and _ in query are matched literally
 // (escaped with ESCAPE '\') so a user search never expands into wildcards.
 func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, error) {
+	return d.SearchFactsContext(context.Background(), query, file, symbol, status, max)
+}
+
+// SearchFactsContext is the context-aware variant of SearchFacts.
+func (d *DB) SearchFactsContext(ctx context.Context, query, file, symbol, status string, max int) ([]Fact, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -215,7 +250,7 @@ func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, e
 	}
 	q += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, max)
-	rows, err := d.conn.Query(q, args...)
+	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
