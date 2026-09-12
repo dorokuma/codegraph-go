@@ -44,7 +44,7 @@ func TestEnsureRejectsSymlinkCodeGraph(t *testing.T) {
 	proj, victim := newSymlinkedProject(t)
 	dir := filepath.Join(proj, ".codegraph")
 
-	if err := Ensure(dir); err == nil {
+	if _, err := Ensure(dir); err == nil {
 		t.Fatal("Ensure must refuse a symlinked .codegraph")
 	} else if !strings.Contains(err.Error(), ".codegraph is a symlink; refusing to open") {
 		t.Fatalf("error must name the symlink refusal, got: %v", err)
@@ -57,7 +57,7 @@ func TestEnsureCreatesMissingDirAndKeepsRealDir(t *testing.T) {
 	dir := filepath.Join(proj, ".codegraph")
 
 	// Missing: Ensure creates a fresh real directory.
-	if err := Ensure(dir); err != nil {
+	if _, err := Ensure(dir); err != nil {
 		t.Fatalf("Ensure must create a missing .codegraph: %v", err)
 	}
 	fi, err := os.Lstat(dir)
@@ -69,7 +69,7 @@ func TestEnsureCreatesMissingDirAndKeepsRealDir(t *testing.T) {
 	}
 
 	// Real: Ensure passes and is idempotent.
-	if err := Ensure(dir); err != nil {
+	if _, err := Ensure(dir); err != nil {
 		t.Fatalf("Ensure must accept an existing real directory: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestEnsureCreatesMissingDirAndKeepsRealDir(t *testing.T) {
 	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Ensure(other); err == nil {
+	if _, err := Ensure(other); err == nil {
 		t.Fatal("Ensure must refuse a non-directory")
 	} else if !strings.Contains(err.Error(), "not a directory") {
 		t.Fatalf("error should say .codegraph is not a directory, got: %v", err)
@@ -97,7 +97,7 @@ func TestEnsureSymlinkedAncestorPasses(t *testing.T) {
 	if err := os.Symlink(realRoot, alias); err != nil {
 		t.Skipf("symlinks not supported: %v", err)
 	}
-	if err := Ensure(filepath.Join(alias, ".codegraph")); err != nil {
+	if _, err := Ensure(filepath.Join(alias, ".codegraph")); err != nil {
 		t.Fatalf("symlinked ancestor must not fail Ensure: %v", err)
 	}
 }
@@ -150,4 +150,44 @@ func TestDefenseLines(t *testing.T) {
 	}
 
 	assertTargetClean(t, victim)
+}
+
+// TestEnsureReturnsVerifiedIdentity pins Ensure's second return value: the
+// (dev, ino) fingerprint handed back must be that of the directory as an
+// independent, fresh stat sees it. daemon.Start records this identity
+// verbatim for its swap-detection removals, so it must describe the real
+// verified directory, never a stale or zero view of it.
+func TestEnsureReturnsVerifiedIdentity(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".codegraph")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id, err := Ensure(dir)
+	if err != nil {
+		t.Fatalf("Ensure must accept a real directory: %v", err)
+	}
+	// The identity must match an independent, fresh stat of the same path.
+	fresh, err := statIdentity(dir)
+	if err != nil {
+		t.Fatalf("stat the verified dir: %v", err)
+	}
+	if id != fresh {
+		t.Fatalf("Ensure returned identity %+v, but a fresh stat of %s says %+v", id, dir, fresh)
+	}
+	if id == (Identity{}) {
+		t.Skip("platform exposes no dev/ino fingerprint (zero identity)")
+	}
+	// Distinct directories must never share an identity — the property the
+	// daemon's swap detection relies on.
+	other := filepath.Join(t.TempDir(), ".codegraph")
+	if err := os.MkdirAll(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id2, err := Ensure(other)
+	if err != nil {
+		t.Fatalf("Ensure must accept a second real directory: %v", err)
+	}
+	if id2 == id {
+		t.Fatal("two distinct directories must not share one (dev, ino) identity")
+	}
 }

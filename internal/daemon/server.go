@@ -74,18 +74,19 @@ func (d *Daemon) Start() error {
 	// Guard .codegraph before the bind creates an inode in it: bind(2)
 	// mknods the socket, and the os.Remove of a stale socket below would
 	// delete through a symlink. Same jail line as db.Open, which runs later
-	// in onReady — this covers the write points that happen before it.
-	if err := cgdir.Ensure(CodeGraphDir(d.root)); err != nil {
+	// in onReady — this covers the write points that happen before it. The
+	// returned identity comes from the stat Ensure itself runs right after
+	// its verification, so jail check and fingerprint are one step with no
+	// second stat in between for a swap to slip into.
+	cgID, err := cgdir.Ensure(CodeGraphDir(d.root))
+	if err != nil {
 		return err
 	}
-	// Record the directory identity immediately after the jail check. From
-	// here on, every path-based deletion verifies against this fingerprint
-	// (the stale-socket remove in the bind loop below, and cleanupArtifacts
-	// at shutdown) — the removal-side counterpart of db.Open's recheckDir.
-	dirID, derr := statDirIdentity(CodeGraphDir(d.root))
-	if derr != nil {
-		return fmt.Errorf("stat %s: %w", CodeGraphDir(d.root), derr)
-	}
+	// Record the directory identity Ensure just verified. From here on,
+	// every path-based deletion verifies against this fingerprint (the
+	// stale-socket remove in the bind loop below, and cleanupArtifacts at
+	// shutdown) — the removal-side counterpart of db.Open's recheckDir.
+	dirID := &dirIdentity{dev: cgID.Dev, ino: cgID.Ino}
 	d.dirID = dirID
 	log.Printf("daemon start: .codegraph dir identity dev=%d ino=%d (also recorded in the pidfile)", dirID.dev, dirID.ino)
 	candidates := SocketCandidates(d.root)
@@ -472,7 +473,7 @@ func RunAsDaemon(root string, handler SessionHandler, onReady func() error) erro
 				// Same removal discipline as cleanupArtifacts: go through the
 				// dir-identity guard instead of deleting through a bare path.
 				// When Start failed before the identity was recorded (the
-				// cgdir.Ensure / statDirIdentity steps), the guard refuses and
+				// cgdir.Ensure identity step), the guard refuses and
 				// the pidfile stays behind — it names this (now exiting)
 				// process, so the next start's ClearStaleLock removes it.
 				d.removeArtifact(res.PidPath)

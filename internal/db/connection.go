@@ -61,7 +61,7 @@ func Open(workdir string) (db *DB, err error) {
 	// project. cgdir.Ensure fails closed in two independent steps (Lstat,
 	// realpath) before a single file is written; the dirfd pinning below
 	// closes the remaining post-validation TOCTOU.
-	if err := cgdir.Ensure(dir); err != nil {
+	if _, err := cgdir.Ensure(dir); err != nil {
 		return nil, err
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")

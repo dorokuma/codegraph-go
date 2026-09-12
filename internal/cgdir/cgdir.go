@@ -37,14 +37,40 @@ import (
 //
 // Callers must fail closed: when Ensure returns an error, nothing may be
 // written under dir.
-func Ensure(dir string) error {
+//
+// On success Ensure also returns the (dev, ino) Identity of the directory it
+// just verified, stat'ed immediately after the realpath line. Callers that
+// fingerprint .codegraph for later swap detection (daemon.Start's dirID)
+// take it from here instead of stat'ing the path again — a second stat
+// after Ensure returns would re-open the microsecond swap window the jail
+// just closed.
+func Ensure(dir string) (Identity, error) {
 	if err := rejectSymlinkDir(dir); err != nil {
-		return err
+		return Identity{}, err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create .codegraph dir: %w", err)
+		return Identity{}, fmt.Errorf("create .codegraph dir: %w", err)
 	}
-	return verifyRealPath(dir)
+	if err := verifyRealPath(dir); err != nil {
+		return Identity{}, err
+	}
+	// Fingerprint the just-verified directory right away: this stat IS the
+	// identity callers record, taken while the jail checks above are still
+	// warm. A separate stat after Ensure returns would re-open the
+	// microsecond swap window between verification and fingerprinting.
+	return statIdentity(dir)
+}
+
+// Identity is the (dev, ino) fingerprint of a .codegraph directory as it
+// resolved when Ensure verified it. cgdir is a leaf package (imported by db
+// and daemon alike) and cannot import the daemon's dirid helpers, so it
+// carries the two raw numbers; the daemon converts them to its own type. On
+// platforms without a syscall.Stat_t the fingerprint is the zero value and
+// fingerprinting degrades to "no identity" (the daemon mirrors this with
+// its dirid_other.go fallback).
+type Identity struct {
+	Dev uint64
+	Ino uint64
 }
 
 // rejectSymlinkDir is the Lstat line of the .codegraph symlink jail: it

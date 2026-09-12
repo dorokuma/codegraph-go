@@ -88,7 +88,7 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 	// touched: daemon.log below — and everything the daemon writes later —
 	// must land in the real .codegraph, never through a symlink at its
 	// target. On failure nothing under the project is written.
-	if err := cgdir.Ensure(CodeGraphDir(root)); err != nil {
+	if _, err := cgdir.Ensure(CodeGraphDir(root)); err != nil {
 		return err
 	}
 	self, err := resolveDaemonBinary()

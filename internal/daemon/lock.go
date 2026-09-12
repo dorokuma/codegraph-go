@@ -32,7 +32,7 @@ func TryAcquireLock(projectRoot string) (AcquireResult, error) {
 	// Same .codegraph guard as db.Open, fail closed before any file write:
 	// the temp pidfile and the hard link below must land in the real
 	// .codegraph, never through a symlink at its target.
-	if err := cgdir.Ensure(filepath.Dir(pidPath)); err != nil {
+	if _, err := cgdir.Ensure(filepath.Dir(pidPath)); err != nil {
 		return AcquireResult{}, err
 	}
 
