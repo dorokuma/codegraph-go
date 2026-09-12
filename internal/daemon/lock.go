@@ -122,9 +122,10 @@ var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed 
 
 // KillStaleDaemon terminates a live daemon whose version no longer matches
 // (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
-// pidfile, verifies the target is really the daemon we recorded (S3: PID-reuse
-// guard + identity bound to /proc facts outside the pidfile — see
-// verifyDaemonIdentity), SIGTERMs it when alive, polls up to 5s for exit, then
+// pidfile, verifies the target is really THIS project's daemon (S3: PID-reuse
+// guard + identity bound to /proc facts outside the pidfile + the -workdir
+// project binding — see verifyDaemonIdentity), SIGTERMs it when alive, polls
+// up to 5s for exit, then
 // escalates to
 // SIGKILL when the grace expires (a daemon stuck in Stop must not keep the
 // lock, and returning a fake nil here would make the caller spawn a
@@ -156,7 +157,7 @@ func KillStaleDaemon(projectRoot string) error {
 		// written and been recycled by an unrelated process. Never signal a
 		// process that is not the daemon we recorded: on mismatch, return a
 		// clear error without signaling and without touching the lock.
-		if err := verifyDaemonIdentity(info); err != nil {
+		if err := verifyDaemonIdentity(info, projectRoot); err != nil {
 			return err
 		}
 		log.Printf("killing stale daemon pid=%d (version mismatch; upgrade cleanup)", info.PID)
@@ -183,7 +184,7 @@ func KillStaleDaemon(projectRoot string) error {
 			// window) — clear the stale pidfile and succeed; if the pid is
 			// alive but no longer ours, leave the lock untouched and return
 			// the refusal error (never signal an innocent process).
-			if err := verifyDaemonIdentity(info); err != nil {
+			if err := verifyDaemonIdentity(info, projectRoot); err != nil {
 				if !IsProcessAlive(info.PID) {
 					ClearStaleLock(pidPath, info.PID)
 					return nil
@@ -240,7 +241,7 @@ var (
 )
 
 // verifyDaemonIdentity guards the SIGTERM/SIGKILL in KillStaleDaemon against
-// two attack shapes:
+// three attack shapes:
 //
 //   - PID reuse (S3): between reading the pidfile and signaling, the recorded
 //     pid may have died and been recycled by an unrelated process. The pidfile
@@ -268,15 +269,27 @@ var (
 //     Both facts live in the target's own /proc entries and cannot be forged
 //     into an unrelated process by writing a pidfile.
 //
+//   - Cross-project harvesting (second-round audit): exe/environ only prove
+//     the target is A codegraph daemon of SOME project — a pidfile forged
+//     inside project B still satisfies both facts for project A's daemon and
+//     a same-binary foreground client of any project satisfies fact 1. The
+//     kill therefore additionally requires the target's own /proc cmdline to
+//     carry -workdir projectRoot — the flag SpawnDetached has always passed
+//     (spawn.go), compared with the same Clean normalization as
+//     isInvisibleHolder in recovery.go. A daemon of another project, a
+//     marked-but-unrelated process, and a same-binary foreground client all
+//     fail this check.
+//
 // Fail closed: a pidfile without a recorded start time (legacy format) cannot
 // be checked for PID reuse at all, so it never enters the kill path — the
 // caller surfaces the refusal and the pidfile is removed manually or via the
 // normal ClearStaleLock path once the recorded process is dead. When identity
 // cannot be verified — exe unreadable (permission, vanished process, zombie),
-// environ unreadable, or neither fact matches — the kill is refused. Returns
+// environ unreadable, neither fact matches, or the target's cmdline carries no
+// -workdir for this project root — the kill is refused. Returns
 // nil only when the target process is positively identified as a codegraph
-// daemon.
-func verifyDaemonIdentity(info *LockInfo) error {
+// daemon of THIS project.
+func verifyDaemonIdentity(info *LockInfo, projectRoot string) error {
 	if info.ProcStart <= 0 {
 		// Legacy pidfile (written before start-time records existed): the
 		// PID-reuse guard cannot work, so the kill path is unavailable —
@@ -297,7 +310,14 @@ func verifyDaemonIdentity(info *LockInfo) error {
 		return fmt.Errorf("%w: pid %d: process start time changed", ErrStaleDaemonRefused, info.PID)
 	}
 	// Same incarnation the pidfile was written for. Now bind identity to the
-	// target process itself, not to pidfile content.
+	// target process itself, not to pidfile content — AND to this project:
+	// the target's own cmdline must carry -workdir projectRoot (SpawnDetached
+	// has always passed it — spawn.go). Checked before the exe/environ facts
+	// so a wrong-project or unbound process is refused with the specific
+	// reason below instead of the generic one.
+	if !cmdlineWorkdirMatches(procCmdlineFn(info.PID), projectRoot) {
+		return fmt.Errorf("%w: pid %d: not a daemon of this project (no -workdir %s in cmdline)", ErrStaleDaemonRefused, info.PID, projectRoot)
+	}
 	if exe, err := procExeFn(info.PID); err == nil && exe != "" && isSelfBinary(exe) {
 		return nil
 	}
@@ -333,6 +353,39 @@ func hasDaemonEnvMarker(environ string) bool {
 		}
 	}
 	return false
+}
+
+// cmdlineWorkdir extracts the value of the -workdir flag from a NUL-joined
+// /proc/<pid>/cmdline snapshot: the first argv element that is exactly
+// "-workdir", followed by the next element. Returns "" when the flag is
+// absent or has no value. The parse mirrors the inline loop in
+// isInvisibleHolder (recovery.go) so both predicates read the flag with the
+// identical shape; recovery.go keeps its copy because the two checks verify
+// different profiles (invisible flock holder vs. recorded daemon incarnation).
+func cmdlineWorkdir(cmdline string) string {
+	if cmdline == "" {
+		return ""
+	}
+	args := strings.Split(cmdline, "\x00")
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-workdir" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// cmdlineWorkdirMatches reports whether cmdline carries a -workdir value that
+// is path-equivalent to root: filepath.Clean equality, the same
+// normalization as isInvisibleHolder (both the daemon and the caller receive
+// the same canonicalized root, so this is exact in practice; Clean only
+// tolerates a trailing slash). An absent or empty -workdir never matches.
+func cmdlineWorkdirMatches(cmdline, root string) bool {
+	if root == "" {
+		return false
+	}
+	wd := cmdlineWorkdir(cmdline)
+	return wd != "" && filepath.Clean(wd) == filepath.Clean(root)
 }
 
 // isCodegraphCmdline reports whether the process argv names a codegraph

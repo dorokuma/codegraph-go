@@ -108,22 +108,21 @@ func TestKillStaleDaemonDeadPID(t *testing.T) {
 	}
 }
 
+// TestKillStaleDaemonSignalsLiveProcess (upgrade-cleanup non-regression):
+// KillStaleDaemon SIGTERMs the live process named in the pidfile — a REAL
+// daemon of this project (CODEGRAPH_DAEMON_INTERNAL=1 plus -workdir root, the
+// shape SpawnDetached has always produced) — waits for it to exit, then clears
+// the lock.
 func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
-	// B1: KillStaleDaemon SIGTERMs the live process named in the pidfile,
-	// waits for it to exit, then clears the lock.
 	root := t.TempDir()
 	pidPath := PidPath(root)
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sleep", "30")
-	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
-	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
-	// (plus the pidfile start time) is what authorizes the kill — never the argv.
-	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start helper process: %v", err)
-	}
+	// The exe (/usr/bin/sh) does not match this test binary, so the environ
+	// fact plus the workdir binding (and the pidfile start time) are what
+	// authorize the kill — never the argv[0].
+	cmd := startDaemonLikeProcess(t, root, true)
 	// Reap the child in the background — like a real daemon (reparented via
 	// SpawnDetached's Process.Release), the helper must not linger as a
 	// zombie or IsProcessAlive would see it as still alive.
@@ -378,13 +377,10 @@ func TestKillStaleDaemonSIGKILLFallback(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sleep", "30")
 	// Model a real spawned daemon: identity must pass via the
-	// CODEGRAPH_DAEMON_INTERNAL=1 environ marker before the kill path runs.
-	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start helper process: %v", err)
-	}
+	// CODEGRAPH_DAEMON_INTERNAL=1 environ marker plus the -workdir binding
+	// before the kill path runs.
+	cmd := startDaemonLikeProcess(t, root, true)
 	defer cmd.Process.Kill() //nolint:errcheck
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
@@ -436,14 +432,11 @@ func TestKillStaleDaemonRefusesPIDReuseAfterSIGTERMGrace(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sleep", "30")
-	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
-	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
-	// (plus the pidfile start time) is what authorizes the kill — never the argv.
-	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start helper process: %v", err)
-	}
+	// Model a real spawned daemon: SpawnDetached marks it with
+	// CODEGRAPH_DAEMON_INTERNAL=1 and its cmdline carries -workdir root, so
+	// the first (pre-SIGTERM) verification passes on the real /proc data and
+	// only the injected start-time change can trigger the recheck refusal.
+	cmd := startDaemonLikeProcess(t, root, true)
 	defer cmd.Process.Kill() //nolint:errcheck
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -520,14 +513,10 @@ func TestKillStaleDaemonClearsLockWhenDeadAfterGrace(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sleep", "30")
-	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
-	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
-	// (plus the pidfile start time) is what authorizes the kill — never the argv.
-	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start helper process: %v", err)
-	}
+	// Model a real spawned daemon: SpawnDetached marks it with
+	// CODEGRAPH_DAEMON_INTERNAL=1 and its cmdline carries -workdir root, so
+	// the verifications pass on the real /proc data.
+	cmd := startDaemonLikeProcess(t, root, true)
 	defer cmd.Process.Kill() //nolint:errcheck
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
@@ -583,6 +572,244 @@ func TestKillStaleDaemonClearsLockWhenDeadAfterGrace(t *testing.T) {
 	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 		t.Fatal("stale pidfile not cleared after daemon died post-grace")
 	}
+}
+
+// startDaemonLikeProcess starts a live helper that models a SpawnDetached
+// daemon for identity purposes: its /proc/<pid>/cmdline carries "-workdir
+// root" as separate argv elements (the flag SpawnDetached has always passed —
+// spawn.go), optionally with the CODEGRAPH_DAEMON_INTERNAL=1 environ marker.
+// The shell wrapper backgrounded a sleeping child and traps SIGTERM, so a
+// killed helper exits promptly like a real daemon (and takes its child along);
+// the whole process group is SIGKILLed on cleanup so nothing outlives the
+// test. The ambient CODEGRAPH_DAEMON_INTERNAL marker is stripped from the
+// child environment before the optional marker is added.
+func startDaemonLikeProcess(t *testing.T, root string, daemonMarker bool) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", "sleep 30 & p=$!; trap 'kill $p 2>/dev/null' TERM; wait $p", "sh", "-workdir", root)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, EnvDaemonInternal+"=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	if daemonMarker {
+		env = append(env, EnvDaemonInternal+"=1")
+	}
+	cmd.Env = env
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	})
+	return cmd
+}
+
+// TestCmdlineWorkdirMatches: the -workdir parse and Clean normalization used
+// by the stale-kill identity check (same shape as isInvisibleHolder in
+// recovery.go: first argv element exactly "-workdir", next element is the
+// value, filepath.Clean equality).
+func TestCmdlineWorkdirMatches(t *testing.T) {
+	cases := []struct {
+		cmdline string
+		root    string
+		want    bool
+	}{
+		{"codegraph-go\x00-workdir\x00/tmp/x", "/tmp/x", true},
+		{"codegraph-go\x00-workdir\x00/tmp/x/", "/tmp/x", true}, // Clean tolerates a trailing slash
+		{"codegraph-go\x00-workdir\x00/tmp/x", "/tmp/x/", true}, // ... on either side
+		{"sh\x00-c\x00sleep 30\x00sh\x00-workdir\x00/tmp/x", "/tmp/x", true},
+		{"codegraph-go\x00-workdir\x00/tmp/xy", "/tmp/x", false},                      // path prefix is not equality
+		{"codegraph-go\x00-workdir\x00/tmp/x\x00-workdir\x00/other", "/tmp/x", true},  // first occurrence wins
+		{"codegraph-go\x00-workdir\x00/other\x00-workdir\x00/tmp/x", "/tmp/x", false}, // first occurrence wins
+		{"codegraph-go\x00-workdir", "/tmp/x", false},                                 // flag without a value
+		{"codegraph-go\x00", "/tmp/x", false},                                         // no flag at all
+		{"", "/tmp/x", false},                                                         // empty cmdline (zombie)
+		{"codegraph-go\x00-workdir\x00", "/tmp/x", false},                             // empty value
+		{"codegraph-go\x00-workdir\x00/tmp/x", "", false},                             // empty root
+	}
+	for _, c := range cases {
+		if got := cmdlineWorkdirMatches(c.cmdline, c.root); got != c.want {
+			t.Errorf("cmdlineWorkdirMatches(%q, %q) = %v, want %v", c.cmdline, c.root, got, c.want)
+		}
+	}
+}
+
+// TestVerifyDaemonIdentitySameProjectDaemon (predicate-level, full real /proc
+// profile): a helper whose cmdline carries -workdir rootA and whose environ
+// carries CODEGRAPH_DAEMON_INTERNAL=1 — the exact shape SpawnDetached produces
+// — passes verification for rootA and fails for another root with the
+// workdir-binding refusal (cross-project binding).
+func TestVerifyDaemonIdentitySameProjectDaemon(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	cmd := startDaemonLikeProcess(t, rootA, true)
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(rootA), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := verifyDaemonIdentity(&info, rootA); err != nil {
+		t.Fatalf("same-project daemon must pass verification: %v", err)
+	}
+	err := verifyDaemonIdentity(&info, rootB)
+	if err == nil {
+		t.Fatal("same daemon must fail verification for another project root")
+	}
+	if !strings.Contains(err.Error(), "not a daemon of this project") {
+		t.Fatalf("expected the workdir-binding refusal, got: %v", err)
+	}
+}
+
+// TestKillStaleDaemonRefusesCrossProjectPidfile (second-round audit: the
+// cross-project harvest): project A runs a REAL daemon (marker + -workdir
+// rootA). An attacker inside project B forges B's pidfile with the daemon's
+// real pid and /proc start time — everything the pre-workdir check needed.
+// The -workdir binding must refuse the kill: A's daemon survives and B's
+// pidfile stays in place.
+func TestKillStaleDaemonRefusesCrossProjectPidfile(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	pidPathB := PidPath(rootB)
+	if err := os.MkdirAll(filepath.Dir(pidPathB), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Project A's real daemon (marker + -workdir rootA).
+	cmd := startDaemonLikeProcess(t, rootA, true)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	// Forged inside project B: real pid, real /proc start time, stale version.
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(rootB), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPathB, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(rootB)
+	if err == nil {
+		t.Fatal("expected refusal when project B's pidfile names project A's daemon")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("project A's daemon was killed via project B's forged pidfile")
+	default:
+	}
+	if _, serr := os.Stat(pidPathB); serr != nil {
+		t.Fatalf("lock removed despite cross-project mismatch: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonRefusesEnvironMarkerWithoutWorkdir (second-round audit:
+// the environ single fact no longer authorizes a kill): a live process
+// carrying CODEGRAPH_DAEMON_INTERNAL=1 (e.g. an innocent `env VAR=1 sleep`)
+// but whose cmdline has no -workdir must be refused even with a fully
+// forged-but-consistent pidfile (real pid, real /proc start time).
+func TestKillStaleDaemonRefusesEnvironMarkerWithoutWorkdir(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Innocent victim with the daemon marker but no daemon cmdline shape.
+	cmd := exec.Command("sleep", "30")
+	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for a marker-carrying process without -workdir")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("marked process was killed without the workdir binding")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite missing workdir binding: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonRefusesSameBinaryWithoutWorkdir (second-round audit: the
+// exe single fact no longer authorizes a kill): a foreground process of the
+// SAME binary — a direct-mode client — whose cmdline carries no -workdir for
+// this project must be refused even with a forged-but-consistent pidfile. The
+// exe fact is stubbed in (osExecutableFn -> the helper's real binary path),
+// so without the workdir binding this would previously have been killed.
+func TestKillStaleDaemonRefusesSameBinaryWithoutWorkdir(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	// /proc/<pid>/exe readlink yields the fully resolved binary path.
+	exe, err := filepath.EvalSymlinks(cmd.Path)
+	if err != nil {
+		t.Fatalf("resolve helper exe: %v", err)
+	}
+	origExec := osExecutableFn
+	osExecutableFn = func() (string, error) { return exe, nil }
+	defer func() { osExecutableFn = origExec }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for a same-binary process without -workdir")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("same-binary process was killed without the workdir binding")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite missing workdir binding: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
 }
 
 func TestRegistryRoundtrip(t *testing.T) {
@@ -747,23 +974,32 @@ func TestKillStaleDaemonRefusesLegacyPidfileWithoutProcStart(t *testing.T) {
 // with the correct /proc start time passes verification — /proc/<pid>/exe
 // resolves to the running binary, which is the first identity fact (a real
 // daemon is spawned from os.Executable() by SpawnDetached, so client and
-// daemon share one binary). Real /proc, no stubs; no signal is sent — this
-// exercises the predicate in isolation.
+// daemon share one binary). The test binary's own argv carries no -workdir,
+// so the cmdline reader is stubbed to the shape SpawnDetached produces; the
+// full-profile pass with real /proc data is covered by
+// TestVerifyDaemonIdentitySameProjectDaemon. Real /proc for start time and
+// exe, no signal sent — this exercises the predicate in isolation.
 func TestVerifyDaemonIdentityAcceptsSelf(t *testing.T) {
 	if procStartTime(os.Getpid()) == 0 {
 		t.Skip("no /proc on this platform; identity verification unavailable")
 	}
-	info := LockInfo{PID: os.Getpid(), Version: PackageVersion, SocketPath: PreferredSocket(t.TempDir()), StartedAt: 1, ProcStart: procStartTime(os.Getpid())}
-	if err := verifyDaemonIdentity(&info); err != nil {
+	root := t.TempDir()
+	origCmdline := procCmdlineFn
+	procCmdlineFn = func(int) string { return "codegraph-go\x00-workdir\x00" + root }
+	defer func() { procCmdlineFn = origCmdline }()
+	info := LockInfo{PID: os.Getpid(), Version: PackageVersion, SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(os.Getpid())}
+	if err := verifyDaemonIdentity(&info, root); err != nil {
 		t.Fatalf("self must pass identity verification: %v", err)
 	}
 }
 
 // TestKillStaleDaemonKillsSameBinaryDaemon (identity fact #1 — the target's
-// /proc/<pid>/exe resolves to this binary): the helper runs /usr/bin/sleep and
-// carries NO daemon marker; osExecutableFn is stubbed to the helper's real exe
-// path to model a client/daemon pair sharing one binary. Full flow:
-// SIGTERM -> exit -> lock cleared.
+// /proc/<pid>/exe resolves to this binary): the helper is a same-project
+// daemon-shaped process (-workdir root in its cmdline, no environ marker) and
+// osExecutableFn is stubbed to the helper's real exe path to model a
+// client/daemon pair sharing one binary. Full flow: SIGTERM -> exit -> lock
+// cleared. A same-binary process WITHOUT the -workdir binding is refused —
+// see TestKillStaleDaemonRefusesSameBinaryWithoutWorkdir.
 func TestKillStaleDaemonKillsSameBinaryDaemon(t *testing.T) {
 	if procStartTime(os.Getpid()) == 0 {
 		t.Skip("no /proc on this platform; identity verification unavailable")
@@ -773,11 +1009,8 @@ func TestKillStaleDaemonKillsSameBinaryDaemon(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start helper process: %v", err)
-	}
-	defer func() { _ = cmd.Process.Kill() }()
+	cmd := startDaemonLikeProcess(t, root, false)
+	defer cmd.Process.Kill() //nolint:errcheck
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 
