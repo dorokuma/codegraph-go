@@ -110,7 +110,9 @@ func ClearStaleLock(pidPath string, expectedDeadPID int) bool {
 // ErrStaleDaemonRefused is wrapped by every KillStaleDaemon error that REFUSES
 // to terminate the recorded process because its identity could not be
 // confirmed against /proc (PID-reuse guard: start time unreadable or changed,
-// or the process is not a codegraph daemon). Callers must treat it as fatal
+// exe/environ identity facts missing or mismatched, or a legacy pidfile
+// without a recorded start time that cannot be checked for PID reuse at all).
+// Callers must treat it as fatal
 // for the daemon path: neither spawn a replacement nor fall back to direct
 // mode while an unidentified live process holds the lock — both would risk
 // double-writing the index. Transient kill failures (e.g. signal sent but
@@ -121,7 +123,9 @@ var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed 
 // KillStaleDaemon terminates a live daemon whose version no longer matches
 // (B1: version-mismatch cleanup before spawning a fresh daemon). It reads the
 // pidfile, verifies the target is really the daemon we recorded (S3: PID-reuse
-// guard), SIGTERMs it when alive, polls up to 5s for exit, then escalates to
+// guard + identity bound to /proc facts outside the pidfile — see
+// verifyDaemonIdentity), SIGTERMs it when alive, polls up to 5s for exit, then
+// escalates to
 // SIGKILL when the grace expires (a daemon stuck in Stop must not keep the
 // lock, and returning a fake nil here would make the caller spawn a
 // replacement doomed to fail on the still-held lock). Identity is re-verified
@@ -222,48 +226,113 @@ func waitForExit(pid int, timeout time.Duration) bool {
 	return false
 }
 
-// procStartTimeFn/procCmdlineFn/procEnvironFn are the /proc readers used by
-// verifyDaemonIdentity and scanProcs. They are variables so tests can
-// simulate an unreadable /proc; production behavior always uses the real
+// procStartTimeFn/procCmdlineFn/procEnvironFn/procExeFn are the /proc readers
+// used by verifyDaemonIdentity and scanProcs; osExecutableFn resolves the path
+// of the running binary. They are variables so tests can simulate an unreadable
+// /proc or a different self binary; production behavior always uses the real
 // implementations.
 var (
 	procStartTimeFn = procStartTime
 	procCmdlineFn   = procCmdline
 	procEnvironFn   = procEnviron
+	procExeFn       = procExe
+	osExecutableFn  = os.Executable
 )
 
-// verifyDaemonIdentity guards the SIGTERM in KillStaleDaemon against PID
-// reuse: between reading the pidfile and signaling, the recorded pid may have
-// died and been recycled by an unrelated process. When /proc is available the
-// target must actually be the daemon we recorded — either the /proc start
-// time matches the pidfile record (strong check, for pidfiles written with
-// ProcStart) or, for older pidfiles without it, the command line must name a
-// codegraph process. Platforms without /proc cannot verify and degrade to the
-// historical probe-and-signal behavior. Returns nil when the process passes
-// verification or verification is impossible.
+// verifyDaemonIdentity guards the SIGTERM/SIGKILL in KillStaleDaemon against
+// two attack shapes:
+//
+//   - PID reuse (S3): between reading the pidfile and signaling, the recorded
+//     pid may have died and been recycled by an unrelated process. The pidfile
+//     records the /proc start time of the daemon it was written for
+//     (ProcStart); a live process whose /proc start time differs is a
+//     different incarnation and must never be signaled.
+//
+//   - Pidfile forgery (audit): the pidfile itself is UNTRUSTED — any process
+//     running as the same user can write a daemon.pid naming an arbitrary
+//     victim pid together with the victim's real /proc start time (both are
+//     world-readable) and delete the socket to manufacture a stale-daemon
+//     scenario. A matching start time therefore only proves that the pidfile
+//     points at the same incarnation it points at, which says nothing about
+//     the target being a daemon. Identity is additionally bound to facts read
+//     from the TARGET process, outside the pidfile — the kill requires at
+//     least one of:
+//
+//     1. /proc/<pid>/exe resolves to this binary (the daemon is always the
+//     same binary as the client: SpawnDetached spawns os.Executable());
+//     2. /proc/<pid>/environ carries CODEGRAPH_DAEMON_INTERNAL=1 (set by
+//     SpawnDetached on every daemon it spawns; unlike the exe path it
+//     survives a binary replacement on upgrade, where an old daemon's
+//     exe no longer resolves to the current build).
+//
+//     Both facts live in the target's own /proc entries and cannot be forged
+//     into an unrelated process by writing a pidfile.
+//
+// Fail closed: a pidfile without a recorded start time (legacy format) cannot
+// be checked for PID reuse at all, so it never enters the kill path — the
+// caller surfaces the refusal and the pidfile is removed manually or via the
+// normal ClearStaleLock path once the recorded process is dead. When identity
+// cannot be verified — exe unreadable (permission, vanished process, zombie),
+// environ unreadable, or neither fact matches — the kill is refused. Returns
+// nil only when the target process is positively identified as a codegraph
+// daemon.
 func verifyDaemonIdentity(info *LockInfo) error {
-	if info.ProcStart > 0 {
-		cur := procStartTimeFn(info.PID)
-		if cur == 0 {
-			// The pidfile records a start time but /proc no longer reports
-			// one: data is insufficient to confirm identity, so refuse rather
-			// than degrade to a weaker check (never risk SIGTERMing a process
-			// we cannot identify).
-			return fmt.Errorf("%w: pid %d: cannot read process start time", ErrStaleDaemonRefused, info.PID)
-		}
-		if cur != info.ProcStart {
-			return fmt.Errorf("%w: pid %d: process start time changed", ErrStaleDaemonRefused, info.PID)
-		}
+	if info.ProcStart <= 0 {
+		// Legacy pidfile (written before start-time records existed): the
+		// PID-reuse guard cannot work, so the kill path is unavailable —
+		// fail closed instead of degrading to the weaker cmdline check
+		// (argv[0] is trivially spoofed with `exec -a`, and an empty
+		// cmdline used to pass as "keep historical behavior").
+		return fmt.Errorf("%w: pid %d: pidfile has no recorded process start time (legacy format); cannot verify identity", ErrStaleDaemonRefused, info.PID)
+	}
+	cur := procStartTimeFn(info.PID)
+	if cur == 0 {
+		// The pidfile records a start time but /proc no longer reports
+		// one: data is insufficient to confirm identity, so refuse rather
+		// than degrade to a weaker check (never risk SIGTERMing a process
+		// we cannot identify).
+		return fmt.Errorf("%w: pid %d: cannot read process start time", ErrStaleDaemonRefused, info.PID)
+	}
+	if cur != info.ProcStart {
+		return fmt.Errorf("%w: pid %d: process start time changed", ErrStaleDaemonRefused, info.PID)
+	}
+	// Same incarnation the pidfile was written for. Now bind identity to the
+	// target process itself, not to pidfile content.
+	if exe, err := procExeFn(info.PID); err == nil && exe != "" && isSelfBinary(exe) {
 		return nil
 	}
-	if cmdline := procCmdlineFn(info.PID); cmdline != "" {
-		if !isCodegraphCmdline(cmdline) {
-			return fmt.Errorf("%w: pid %d: not a codegraph daemon (cmdline %q)", ErrStaleDaemonRefused, info.PID, cmdline)
-		}
+	if hasDaemonEnvMarker(procEnvironFn(info.PID)) {
 		return nil
 	}
-	// No /proc on this platform: cannot verify — keep historical behavior.
-	return nil
+	return fmt.Errorf("%w: pid %d: not a codegraph daemon (exe and environ identity checks failed)", ErrStaleDaemonRefused, info.PID)
+}
+
+// isSelfBinary reports whether exe is the resolved path of the running binary.
+// A real daemon is spawned by SpawnDetached from os.Executable(), so its
+// /proc/<pid>/exe always resolves to the same file as the client's.
+func isSelfBinary(exe string) bool {
+	self, err := osExecutableFn()
+	if err != nil || self == "" {
+		return false
+	}
+	return filepath.Clean(exe) == filepath.Clean(self)
+}
+
+// hasDaemonEnvMarker reports whether the NUL-joined environ read from
+// /proc/<pid>/environ carries CODEGRAPH_DAEMON_INTERNAL=1 — the marker
+// SpawnDetached sets on every daemon it spawns (same predicate as
+// isInvisibleHolder in recovery.go). An empty environ (unreadable, or a
+// zombie's) is a no-match.
+func hasDaemonEnvMarker(environ string) bool {
+	if environ == "" {
+		return false
+	}
+	for _, kv := range strings.Split(environ, "\x00") {
+		if kv == EnvDaemonInternal+"=1" {
+			return true
+		}
+	}
+	return false
 }
 
 // isCodegraphCmdline reports whether the process argv names a codegraph
@@ -330,6 +399,14 @@ func procCmdline(pid int) string {
 		return ""
 	}
 	return string(raw)
+}
+
+// procExe returns the resolved executable path of pid (readlink of
+// /proc/<pid>/exe). It fails on non-procfs platforms, on permission errors,
+// and for zombies or vanished processes — callers must treat every failure
+// as "identity unverified" (fail closed).
+func procExe(pid int) (string, error) {
+	return os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 }
 
 // IsProcessAlive probes pid with kill(2) signal 0 — zero fd allocation;
