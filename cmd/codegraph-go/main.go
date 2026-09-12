@@ -108,6 +108,36 @@ func checkDirectFallbackSafe(root string) error {
 	return nil
 }
 
+// fatalFlushTimeout bounds how long the exit paths below wait for the
+// non-blocking log buffer to drain before the process exits. Generous
+// default: stderr is normally a file or a read pipe, so the drain is
+// instant; the bound only matters for a stuck stderr, where dropping beats
+// hanging forever.
+const fatalFlushTimeout = 2 * time.Second
+
+// fatalf reports a fatal error with the exact log.Fatalf output format and
+// exit code 1, but flushes the non-blocking log buffer first. log.Fatalf
+// cannot be used on these paths: its internal os.Exit skips deferred cleanup
+// and races the asynchronous drain goroutine, so the fatal line — and
+// anything else still buffered — was silently dropped and every such failure
+// reached the user as an empty stderr (red team: `codegraph init` on a
+// symlinked .codegraph exited rc=1 with 0 bytes on stderr, 20/20 runs).
+func fatalf(format string, args ...any) {
+	log.Printf(format, args...)
+	safelog.Flush(fatalFlushTimeout)
+	os.Exit(1)
+}
+
+// flushAndExit exits with code after flushing buffered log lines. The
+// failure paths below log through slog, whose writes go through the
+// non-blocking writer, so a bare os.Exit drops the structured error line
+// (the fmt.Fprintln(os.Stderr, …) lines on the same paths are synchronous
+// and unaffected; the flush is for the slog line that follows them).
+func flushAndExit(code int) {
+	safelog.Flush(fatalFlushTimeout)
+	os.Exit(code)
+}
+
 func main() {
 	_, safelogCleanup := safelog.SetupLogger(config.LogLevel())
 	defer safelogCleanup()
@@ -119,7 +149,7 @@ func main() {
 			root = os.Args[2]
 		}
 		if err := runInit(root); err != nil {
-			log.Fatalf("init: %v", err)
+			fatalf("init: %v", err)
 		}
 		return
 	}
@@ -132,7 +162,7 @@ func main() {
 	for _, wd := range cfg.Workdirs {
 		absWd, err := filepath.Abs(wd)
 		if err != nil {
-			log.Fatalf("bad workdir %q: %v", wd, err)
+			fatalf("bad workdir %q: %v", wd, err)
 		}
 		if rp, err := filepath.EvalSymlinks(absWd); err == nil && rp != "" {
 			absWd = rp
@@ -147,7 +177,7 @@ func main() {
 	// is no -workdir/config source; indexing [0] below would panic. Fail with
 	// an actionable message instead.
 	if len(cfg.Workdirs) == 0 {
-		log.Fatalf("no workdir: current directory cannot be resolved (os.Getwd failed) and no workdirs from -workdir or config; run from an existing directory or pass -workdir")
+		fatalf("no workdir: current directory cannot be resolved (os.Getwd failed) and no workdirs from -workdir or config; run from an existing directory or pass -workdir")
 	}
 	// Primary workdir for backward compat (cfg.Workdir = workdirs[0]).
 	cfg.Workdir = cfg.Workdirs[0]
@@ -169,7 +199,7 @@ func main() {
 		msg := fmt.Sprintf("codegraph-go: %v. Fix: use a workdir inside an allowed root, or add it to the workdirs list in the config file (%s)", err, configFile)
 		fmt.Fprintln(os.Stderr, msg)
 		slog.Error("workdir outside authority roots", "error", err, "config", configFile)
-		os.Exit(1)
+		flushAndExit(1)
 	}
 	slog.Info("starting", "workdir", cfg.Workdir, "workdirs", cfg.Workdirs)
 
@@ -180,7 +210,7 @@ func main() {
 	if daemon.Internal() {
 		if err := server.RunDaemonProcess(cfg); err != nil {
 			slog.Error("daemon process failed", "error", err)
-			os.Exit(1)
+			flushAndExit(1)
 		}
 		return
 	}
@@ -195,13 +225,13 @@ func main() {
 			err = dbInUseError(err, false)
 			fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
 			slog.Error("direct mode blocked", "error", err)
-			os.Exit(1)
+			flushAndExit(1)
 		} else {
 			_ = database.Close()
 		}
 		if err := server.RunDirect(cfg); err != nil {
 			slog.Error("runDirect failed", "error", err)
-			os.Exit(1)
+			flushAndExit(1)
 		}
 		return
 	}
@@ -238,7 +268,7 @@ func main() {
 			// fallback would double-write (the daemon is alive and still owns
 			// the DB lock) and the host must know the proxy was never built.
 			slog.Error("proxy failed", "error", err)
-			os.Exit(1)
+			flushAndExit(1)
 		}
 		return
 	}
@@ -249,7 +279,7 @@ func main() {
 		// surface an actionable error and exit non-zero instead.
 		fmt.Fprintf(os.Stderr, "codegraph-go: %v; remove the pidfile manually and retry\n", err)
 		slog.Error("daemon path blocked: unidentified process holds the daemon lock", "error", err)
-		os.Exit(1)
+		flushAndExit(1)
 	}
 	if err != nil && errors.Is(err, daemon.ErrInvisibleHolderSurvived) {
 		// G3: an invisible flock holder survived SIGTERM+SIGKILL — a live
@@ -260,7 +290,7 @@ func main() {
 		// ErrStaleDaemonRefused path.
 		fmt.Fprintf(os.Stderr, "codegraph-go: %v; the lock for %s is held by a process that survived SIGTERM+SIGKILL — identify it with: pgrep -af codegraph-go (look for '-workdir %s'), kill it manually, then retry\n", err, root, root)
 		slog.Error("daemon path blocked: invisible flock holder survived SIGTERM+SIGKILL", "error", err, "root", root)
-		os.Exit(1)
+		flushAndExit(1)
 	}
 	slog.Info("mode=direct (daemon unavailable)")
 	// Never double-write: refuse direct mode while a live daemon still owns
@@ -268,10 +298,10 @@ func main() {
 	if err := checkDirectFallbackSafe(root); err != nil {
 		fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
 		slog.Error("direct fallback blocked", "error", err)
-		os.Exit(1)
+		flushAndExit(1)
 	}
 	if err := server.RunDirect(cfg); err != nil {
 		slog.Error("runDirect failed", "error", err)
-		os.Exit(1)
+		flushAndExit(1)
 	}
 }
