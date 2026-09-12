@@ -3,6 +3,18 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.7] - 2026-09-12
+
+### Fixed
+- `.codegraph` 防线的 TOCTOU（第二轮对抗审计实证击穿）：`db.Open` 校验通过后立即以 `openat` 钉扎目录 fd（`O_NOFOLLOW|O_DIRECTORY`），锁文件经 `openat(fd)` 创建，flock 后与建库后各做一次 Dev/Ino 复核；残余窗口压缩到 syscall 边界（modernc SQLite 仅收路径，无法归零，已在代码注释如实注明）。非 unix 平台退化为路径级校验。
+- daemon 侧三个 `.codegraph` 写点（spawn 的 daemon.log、TryAcquireLock 的 pidfile、Start 的 socket bind）此前完全绕过 symlink 防线：防线抽为共享包 `internal/cgdir`（`Ensure` = Lstat 拒绝 → MkdirAll → realpath 校验），四处接入，界外文件零落盘。
+- stale daemon 击杀身份绑定项目：`verifyDaemonIdentity` 在 procStart 匹配后追加要求目标进程 cmdline 的 `-workdir` 等于本项目 root（与 isInvisibleHolder 同口径），environ 单项 / exe 单项 / 跨项目伪造 pidfile 均不再放行；升级清理路径（同项目真 daemon）端到端实测不回归。
+- `KillStaleDaemon` 信号段改走 pidfd（复用 recovery 侧基建，pidfd 不可用时回退 kill(2)+recheck），封死 recheck→signal 的 PID 复用窗口。
+- 修正 recovery.go 中"为避免 import cycle 而复制 flock 探测"的不实注释（db 是叶子包，无环）。
+
+### Changed
+- Display / daemon wire version **0.9.7**。
+
 ## [0.9.6] - 2026-09-12
 
 ### Fixed
