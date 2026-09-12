@@ -387,7 +387,9 @@ echo "=== 提交 ==="
 # surprise-commit the working tree. Default: report that changes are
 # uncommitted and let the operator commit/push explicitly.
 if [ "${DEPLOY_COMMIT:-0}" = "1" ]; then
-  git add deploy.sh internal/daemon/paths.go
+  # Release commits also touch CHANGELOG.md / README.md — include them so
+  # DEPLOY_COMMIT does not produce an incomplete version commit.
+  git add deploy.sh internal/daemon/paths.go CHANGELOG.md README.md
   if git diff --cached --quiet; then
     echo "无改动，跳过提交"
   else

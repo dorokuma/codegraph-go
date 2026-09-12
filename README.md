@@ -85,6 +85,24 @@ codegraph-go -workdir /path/to/project
 | `-workdir` | current directory | Workspace root |
 | `-no-sync` | false | Disable auto-sync file watcher |
 
+### Shared daemon socket auth
+
+The optional shared daemon serves MCP sessions over a Unix socket that is
+always `chmod 0600` (bind fails otherwise) — the first line of defense. As
+a second layer, e.g. against other processes of the same user, the daemon
+accepts an optional shared secret via `CODEGRAPH_MCP_TOKEN`:
+
+- Set the same value for both the daemon and every connecting client (the
+  stdio proxy sends it in its client hello). A daemon spawned by a client
+  inherits its environment; an already-running daemon must be restarted
+  with the variable set.
+- With the token set on the daemon, a session that never sends a client
+  hello, or presents a non-matching token, is dropped before it can issue
+  any tool call. Comparison is constant-time and the token is never logged.
+- Default off: with the variable unset on the daemon, behavior is
+  unchanged. When set, clients without the token are rejected — both
+  sides must carry the same value.
+
 ## MCP Tool
 
 **One tool:** `codegraph`. Required: `action`. Optional common fields: `path`, `projectPath`, `max` / `max_results`, `glob`, etc. (see tool schema).

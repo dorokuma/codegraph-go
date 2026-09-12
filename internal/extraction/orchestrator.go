@@ -114,9 +114,6 @@ func (o *Orchestrator) isForce() bool {
 	return o.force
 }
 
-// fileNodeCount returns the stored node_count for store, honoring the
-// nodeCountFn test seam.
-
 // maxIndexFileSize skips oversized blobs (minified bundles, generated dumps).
 const maxIndexFileSize = 1 * 1024 * 1024
 
@@ -504,8 +501,6 @@ func (o *Orchestrator) markSchemaRevision() error {
 	return o.db.SetSchemaRevision()
 }
 
-// IndexFile indexes a single file.
-
 func hashContent(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
@@ -552,12 +547,6 @@ func (o *Orchestrator) IndexFailedFiles() []string {
 	copy(out, o.indexFailed)
 	return out
 }
-
-// indexFile extracts and writes the index for one file. data, when non-nil,
-// is the file content already read by the caller (indexIfNeeded's content-hash
-// gate, F4) and is reused instead of reading the file a second time; nil means
-// read from disk. contentHash is always derived from the same bytes that get
-// indexed, so the hash gate and the stored hash can never disagree.
 
 // IndexChanges indexes only files that have changed since last index.
 // files are filesystem paths (absolute from watcher/git); resolution uses storage keys.
