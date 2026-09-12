@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
+	"github.com/dorokuma/codegraph-go/internal/sync"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -989,5 +990,53 @@ func TestToolCallersImpactDashLeadingName(t *testing.T) {
 	}
 	if text := textContent(res); !strings.Contains(text, "dash.go") {
 		t.Fatalf("expected literal --version impact on dash.go, got:\n%s", text)
+	}
+}
+
+// TestToolStatusExposesWatcherBlindSpotsAndStartFailure: the blind-spot
+// counters (watcher_blind_dirs / watcher_unreadable_dirs) and the
+// post-retry "watcher_active: false" line must be visible in the status
+// output. The red-team scenario — inotify budget exhausted by another
+// process, zero or partial watch, tampered files never reindexed while the
+// stale index is served as current — used to be invisible outside the
+// one-shot startup logs. The counter mechanics themselves are covered by
+// internal/sync's own tests; real blind spots cannot be forced here without
+// exhausting the kernel inotify budget.
+func TestToolStatusExposesWatcherBlindSpotsAndStartFailure(t *testing.T) {
+	s, _ := setupToolServer(t)
+
+	w, err := sync.NewWatcher(nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	w.SetBlindSpotCountersForTest(2, 1)
+	s.Watcher.Store(w)
+
+	result, _, err := s.toolStatus(context.Background(), nil, statusArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "watcher_blind_dirs: 2") {
+		t.Fatalf("status must expose watcher_blind_dirs: 2, got:\n%s", text)
+	}
+	if !strings.Contains(text, "watcher_unreadable_dirs: 1") {
+		t.Fatalf("status must expose watcher_unreadable_dirs: 1, got:\n%s", text)
+	}
+	if strings.Contains(text, "watcher_active: false") {
+		t.Fatalf("watcher is running; status must not claim watcher_active: false, got:\n%s", text)
+	}
+
+	// Watcher start ultimately failed after retries: no running watcher and
+	// the flag set — status must say auto-sync is off instead of going quiet.
+	s.Watcher.Store(nil)
+	s.WatcherStartFailed.Store(true)
+	result, _, err = s.toolStatus(context.Background(), nil, statusArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text = textContent(result); !strings.Contains(text, "watcher_active: false") {
+		t.Fatalf("status must expose watcher_active: false after start failure, got:\n%s", text)
 	}
 }

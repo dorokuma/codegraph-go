@@ -252,6 +252,7 @@ done
 # still running (mid-spawn, or not yet dead) makes it unreachable forever
 # while it keeps holding the flock.
 mkdir -p "$WORKDIR/.codegraph"
+[ -L "$WORKDIR/.codegraph" ] && { echo "refusing: $WORKDIR/.codegraph is a symlink"; exit 1; }
 [ -f "$WORKDIR/.codegraph/codegraph.lock" ] || : >"$WORKDIR/.codegraph/codegraph.lock"
 flock_free=0
 for i in $(seq 1 50); do

@@ -1,7 +1,8 @@
 package search
 
-// BoundedEditDistance computes the Damerau-Levenshtein edit distance between
-// a and b, returning maxDist+1 as soon as the distance is known to exceed maxDist.
+// BoundedEditDistance computes the Levenshtein edit distance between a and
+// b (no transposition step), returning maxDist+1 as soon as the distance is
+// known to exceed maxDist.
 // This early-exit makes the fuzzy fallback cheap even over tens of thousands of names.
 //
 // Pure DP, O(min(len(a), len(b))) memory. Compares case-folded inputs;

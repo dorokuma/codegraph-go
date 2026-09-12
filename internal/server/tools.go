@@ -846,12 +846,15 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 	defer s.releaseProject(root)
 	var pendingFiles []string
 	var dropped uint64
+	var blindDirs, unreadableDirs int64
 	// Pending files and the permanent-drop count only apply to the default
 	// session watcher.
 	if root == s.Workdir {
 		if w := s.Watcher.Load(); w != nil {
 			pendingFiles = w.PendingFiles()
 			dropped = w.DroppedCount()
+			blindDirs = w.BlindDirs()
+			unreadableDirs = w.UnreadableDirs()
 		}
 	}
 
@@ -866,8 +869,22 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 			Content: []mcp.Content{&mcp.TextContent{Text: "error getting status"}},
 		}, nil, nil
 	}
+	text := result.Content[0].Text
+	// Watch blind-spot observability: subtrees the initial walk could not
+	// watch or read never produce fs events, so a stale index there is served
+	// as current with no error anywhere. Surface the counters the same way
+	// Dropped is surfaced — only when nonzero, remedy included in the line.
+	if blindDirs > 0 {
+		text += fmt.Sprintf("watcher_blind_dirs: %d (subtrees not watched — changes there are not reindexed; touch a file inside or restart the daemon to re-watch)\n", blindDirs)
+	}
+	if unreadableDirs > 0 {
+		text += fmt.Sprintf("watcher_unreadable_dirs: %d (subtrees unreadable during initial walk — changes there are not reindexed)\n", unreadableDirs)
+	}
+	if root == s.Workdir && s.Watcher.Load() == nil && s.WatcherStartFailed.Load() {
+		text += "watcher_active: false (watcher failed to start after retries — auto-sync is off; file changes are not reindexed until the daemon restarts)\n"
+	}
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: result.Content[0].Text}},
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}, nil, nil
 }
 

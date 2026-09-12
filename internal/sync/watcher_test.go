@@ -927,3 +927,77 @@ func TestStartFailsOnRootAddFailure(t *testing.T) {
 	}
 	w.Stop() // must not panic even after the failed Start
 }
+
+// TestStartExposesBlindSpotCounters: the degrade path exercised by
+// TestStartDegradesOnNonRootAddFailures must be observable through
+// BlindDirs/UnreadableDirs — the status tool reads these counters. Before
+// they existed, a fully-blind watcher (inotify budget exhausted by another
+// process) was visible only in the one-shot startup logs.
+func TestStartExposesBlindSpotCounters(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "pkg")
+	nested := filepath.Join(sub, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	addErr := errors.New("inotify limit reached (fake)")
+	w, err := NewWatcher(nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.addDirFn = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(dir) {
+			return nil // the root itself is watchable
+		}
+		return addErr // every subtree fails, as under max_user_watches
+	}
+
+	// Capture the summary logs (no test in this package runs in parallel).
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start must degrade on non-root Add failures, got: %v", err)
+	}
+	w.Stop()
+
+	if got := w.BlindDirs(); got != 2 {
+		t.Fatalf("BlindDirs = %d, want 2 (sub + nested unwatchable)", got)
+	}
+	if got := w.UnreadableDirs(); got != 0 {
+		t.Fatalf("UnreadableDirs = %d, want 0", got)
+	}
+	if !strings.Contains(logs.String(), "will not be tracked") {
+		t.Fatalf("degradation summary not logged: %q", logs.String())
+	}
+}
+
+// TestStartCountsUnreadableRootWalkError: a walk error on the root (e.g. the
+// workdir vanished before Start) aborts Start, but the unreadable directory
+// must still be counted so the blind spot stays observable. A retrying
+// caller builds a fresh Watcher per attempt, and each one reports its own
+// counters.
+func TestStartCountsUnreadableRootWalkError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone")
+	w, err := NewWatcher(nil, missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	if err := w.Start(); err == nil {
+		t.Fatal("Start must fail when the workdir cannot be walked")
+	}
+	w.Stop() // must not panic after the failed Start
+
+	if got := w.UnreadableDirs(); got != 1 {
+		t.Fatalf("UnreadableDirs = %d, want 1", got)
+	}
+	if got := w.BlindDirs(); got != 0 {
+		t.Fatalf("BlindDirs = %d, want 0 (the walk aborted before any Add)", got)
+	}
+}

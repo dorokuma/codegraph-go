@@ -1155,3 +1155,150 @@ func TestKillStaleDaemonRefusesZombieTarget(t *testing.T) {
 	// Reap the zombie.
 	_ = cmd.Wait()
 }
+
+// TestKillStaleDaemonRefusesRecycledPidAfterPidfdOpen (PID-reuse TOCTOU on
+// the FIRST signal): verifyDaemonIdentity passes, then the daemon dies and
+// its pid is recycled by a same-uid process BEFORE pidfd_open pins it. The
+// post-pidfdOpen recheck must detect the mismatch and refuse before the
+// first SIGTERM — the pinned innocent process must receive no signal at all.
+// Deterministic: procStartTimeFn passes the pre-pidfd verification with the
+// real start time and reports a changed start time for the post-pidfdOpen
+// recheck (simulating the recycled pid); pidfdSendSignalFn counts signals
+// and must stay at zero.
+func TestKillStaleDaemonRefusesRecycledPidAfterPidfdOpen(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Model a real spawned daemon: SpawnDetached marks it with
+	// CODEGRAPH_DAEMON_INTERNAL=1 and its cmdline carries -workdir root, so
+	// the first (pre-pidfd) verification passes on the real /proc data.
+	cmd := startDaemonLikeProcess(t, root, true)
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	// Stop the helper so a signal that slips through a broken recheck stays
+	// pending instead of terminating it — keeps the assertions below stable.
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP helper: %v", err)
+	}
+	realStart := procStartTime(cmd.Process.Pid)
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: realStart}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	origStart := procStartTimeFn
+	procStartTimeFn = func(pid int) int64 {
+		calls++
+		if calls == 1 {
+			return realStart // pre-pidfd verification passes on real data
+		}
+		return realStart + 1 // post-pidfdOpen recheck: pid "recycled"
+	}
+	defer func() { procStartTimeFn = origStart }()
+
+	signals := 0
+	origSend := pidfdSendSignalFn
+	pidfdSendSignalFn = func(fd int, sig syscall.Signal) error {
+		signals++
+		return nil
+	}
+	defer func() { pidfdSendSignalFn = origSend }()
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal when the pid was recycled between verification and pidfd_open")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	if signals != 0 {
+		t.Fatalf("post-pidfdOpen recheck failed but %d signal(s) were sent through the pidfd", signals)
+	}
+	if calls < 2 {
+		t.Fatalf("identity must be verified twice (pre-pidfd + post-pidfdOpen), got %d calls", calls)
+	}
+	// The pinned innocent process was never signaled and the lock stays.
+	select {
+	case <-done:
+		t.Fatal("helper process died despite the refusal path")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite identity mismatch: %v", serr)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonPidfdClearsLockWhenDaemonDiedBeforeFirstSignal: the
+// daemon exits between the verification and the post-pidfdOpen recheck (pid
+// NOT recycled — nothing took its place). The recheck fails on the unreadable
+// /proc start time, the pid is dead, so the stale pidfile must be cleared and
+// nil returned: no signal, no refusal that would block a fresh spawn.
+// Deterministic: the helper is killed inside the injected pidfdOpenFn — the
+// exact window this recheck covers — and the real /proc readers then see a
+// dead pid.
+func TestKillStaleDaemonPidfdClearsLockWhenDaemonDiedBeforeFirstSignal(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := startDaemonLikeProcess(t, root, true)
+	defer cmd.Process.Kill() //nolint:errcheck
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	realStart := procStartTime(cmd.Process.Pid)
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: realStart}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origOpen := pidfdOpenFn
+	origClose := pidfdCloseFn
+	pidfdOpenFn = func(pid int) (int, error) {
+		// Kill the "daemon" between verification and pidfd_open and wait
+		// for the death so the post-pidfdOpen recheck observes a dead pid.
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			t.Errorf("kill helper inside pidfd_open: %v", err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for IsProcessAlive(pid) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		return 0, nil
+	}
+	pidfdCloseFn = func(int) error { return nil } // the fake fd is never a real descriptor
+	defer func() { pidfdOpenFn = origOpen; pidfdCloseFn = origClose }()
+
+	signals := 0
+	origSend := pidfdSendSignalFn
+	pidfdSendSignalFn = func(fd int, sig syscall.Signal) error {
+		signals++
+		return nil
+	}
+	defer func() { pidfdSendSignalFn = origSend }()
+
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon: want nil after the daemon died before the first signal, got %v", err)
+	}
+	if signals != 0 {
+		t.Fatalf("%d signal(s) sent through the pidfd; the dead-daemon path must return before signaling", signals)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("stale pidfile not cleared after the daemon died: %v", err)
+	}
+	<-done
+}
