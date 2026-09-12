@@ -974,12 +974,12 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 	hash := hex.EncodeToString(h[:])
 
 	// Duplicate only when this exact target already has the same text.
-	existing, err := database.GetFactByHashAndTarget(hash, targetFile, args.TargetSymbol)
+	existing, err := database.GetFactByHashAndTargetContext(ctx, hash, targetFile, args.TargetSymbol)
 	if err != nil {
 		return nil, nil, fmt.Errorf("check hash: %w", err)
 	}
 	if existing != nil {
-		sameTarget, gerr := database.GetFactsByTarget(targetFile, args.TargetSymbol)
+		sameTarget, gerr := database.GetFactsByTargetContext(ctx, targetFile, args.TargetSymbol)
 		if gerr != nil {
 			// Read-back failure is non-fatal: still report the duplicate.
 			sameTarget = nil
@@ -996,12 +996,12 @@ func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args
 		Author:       args.Author,
 		Status:       "active",
 	}
-	if _, err := database.InsertFactSuperseding(f, args.Supersedes); err != nil {
+	if _, err := database.InsertFactSupersedingContext(ctx, f, args.Supersedes); err != nil {
 		return nil, nil, fmt.Errorf("insert fact: %w", err)
 	}
 
-	inserted, _ := database.GetFactByHashAndTarget(hash, targetFile, args.TargetSymbol)
-	sameTargetFacts, _ := database.GetFactsByTarget(targetFile, args.TargetSymbol)
+	inserted, _ := database.GetFactByHashAndTargetContext(ctx, hash, targetFile, args.TargetSymbol)
+	sameTargetFacts, _ := database.GetFactsByTargetContext(ctx, targetFile, args.TargetSymbol)
 
 	resp := map[string]interface{}{
 		"duplicate": false,
@@ -1129,7 +1129,7 @@ func (s *Server) toolSearchFacts(ctx context.Context, _ *mcp.CallToolRequest, ar
 		targetFile = norm
 	}
 
-	facts, err := database.SearchFacts(args.Query, targetFile, args.TargetSymbol, status, max)
+	facts, err := database.SearchFactsContext(ctx, args.Query, targetFile, args.TargetSymbol, status, max)
 	if err != nil {
 		return nil, nil, fmt.Errorf("search facts: %w", err)
 	}
