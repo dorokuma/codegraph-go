@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,14 @@ type Daemon struct {
 	ctx        context.Context
 	wg         sync.WaitGroup
 	stopped    chan struct{} // closed after Stop finishes cleanup
+	// dirID is the (dev, ino) fingerprint of the .codegraph directory,
+	// recorded by Start right after cgdir.Ensure. Every path-based removal
+	// (stale socket before bind, pidfile/socket in cleanupArtifacts) must
+	// re-verify it first: if the directory behind .codegraph was swapped
+	// while the daemon ran, the removals skip instead of deleting through
+	// attacker-chosen paths. nil until Start records it (and then: fail
+	// safe — removals under .codegraph are refused).
+	dirID *dirIdentity
 }
 
 // New constructs a Daemon. Call Start after TryAcquireLock succeeded.
@@ -69,6 +78,15 @@ func (d *Daemon) Start() error {
 	if err := cgdir.Ensure(CodeGraphDir(d.root)); err != nil {
 		return err
 	}
+	// Record the directory identity immediately after the jail check. From
+	// here on, every path-based deletion verifies against this fingerprint
+	// (the stale-socket remove in the bind loop below, and cleanupArtifacts
+	// at shutdown) — the removal-side counterpart of db.Open's recheckDir.
+	dirID, derr := statDirIdentity(CodeGraphDir(d.root))
+	if derr != nil {
+		return fmt.Errorf("stat %s: %w", CodeGraphDir(d.root), derr)
+	}
+	d.dirID = dirID
 	candidates := SocketCandidates(d.root)
 	if len(candidates) == 0 {
 		return errNoSocketSupport
@@ -76,7 +94,7 @@ func (d *Daemon) Start() error {
 
 	var lastErr error
 	for i, path := range candidates {
-		_ = os.Remove(path) // clear stale socket; we hold the lock
+		d.removeArtifact(path) // clear stale socket; we hold the lock
 		ln, err := listenUnixWithUmask(path)
 		if err != nil {
 			lastErr = err
@@ -89,6 +107,16 @@ func (d *Daemon) Start() error {
 			}
 			continue
 		}
+		// The runtime unlinks a Unix socket file through its PATH when the
+		// listener closes (net.UnixListener unlink-on-close) — a removal the
+		// dir-identity guard below cannot see. Disable it so the guarded
+		// removeArtifact calls are the ONLY socket removals: on the normal
+		// path they delete the just-bound socket exactly as before, and
+		// after a .codegraph swap they skip instead of deleting through the
+		// attacker's path.
+		if u, ok := ln.(*net.UnixListener); ok {
+			u.SetUnlinkOnClose(false)
+		}
 		if err := chmodSocket(path, 0o600); err != nil {
 			// Audit medium: a socket left with broader permissions than 0600
 			// would let other users connect to a full-privilege MCP endpoint
@@ -96,7 +124,7 @@ func (d *Daemon) Start() error {
 			// accepting on a mis-permissioned socket — the caller exits
 			// non-zero instead of continuing to Accept.
 			_ = ln.Close()
-			_ = os.Remove(path)
+			d.removeArtifact(path)
 			return fmt.Errorf("chmod socket %s: %w", path, err)
 		}
 		d.listener = ln
@@ -347,13 +375,44 @@ func (d *Daemon) cleanupArtifacts() {
 	// Only remove our lock if it still names us.
 	if raw, err := os.ReadFile(d.pidPath); err == nil {
 		if info := DecodeLock(raw); info != nil && info.PID == os.Getpid() {
-			_ = os.Remove(d.pidPath)
+			d.removeArtifact(d.pidPath)
 		}
 	}
 	if d.socketPath != "" {
-		_ = os.Remove(d.socketPath)
+		d.removeArtifact(d.socketPath)
 	}
 	Deregister(d.root)
+}
+
+// dirIDVerified reports whether path-based removals may proceed: the
+// .codegraph path must still resolve to the directory identity Start
+// recorded. dirID == nil (Start never ran) means unverifiable — fail safe
+// by refusing.
+func (d *Daemon) dirIDVerified() bool {
+	return d.dirID != nil && d.dirID.matches(CodeGraphDir(d.root))
+}
+
+// removeArtifact removes a daemon-created file, guarded against the
+// red-team swap: when the path sits under .codegraph and the directory
+// behind the path no longer matches the identity recorded at Start, the
+// removal is skipped with a log line instead of deleting through the
+// swapped path (a running daemon SIGTERMed after .codegraph became a
+// symlink would otherwise remove attacker-planted daemon.pid/daemon.sock
+// in the symlink target). Paths outside .codegraph (the tmpdir socket
+// fallback) are not governed by that identity and are removed
+// unconditionally, as before. Artifacts deliberately left behind by a skip
+// are handled by the next start (TryAcquireLock / ClearStaleLock /
+// stale-socket clearing).
+func (d *Daemon) removeArtifact(path string) {
+	if filepath.Dir(path) == CodeGraphDir(d.root) && !d.dirIDVerified() {
+		if d.dirID == nil {
+			log.Printf("cannot verify .codegraph directory; skipping artifact removal (%s)", path)
+		} else {
+			log.Printf("directory changed since open; skipping artifact removal (%s)", path)
+		}
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // chmodSocket applies the socket permission mask. A var so tests can inject
