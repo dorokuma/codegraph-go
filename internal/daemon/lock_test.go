@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,7 +117,10 @@ func TestKillStaleDaemonSignalsLiveProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sleep", "30")
-	cmd.Args[0] = "codegraph-go" // pass the cmdline identity check on procfs platforms
+	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
+	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
+	// (plus the pidfile start time) is what authorizes the kill — never the argv.
+	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
@@ -217,10 +222,10 @@ func TestIsCodegraphCmdline(t *testing.T) {
 	}
 }
 
-// TestKillStaleDaemonRefusesUnrelatedCmdline: an older pidfile without a
-// recorded start time (ProcStart==0) whose live process is unrelated — its
-// argv[0] is not a codegraph binary — must be refused: no signal, no lock
-// removal.
+// TestKillStaleDaemonRefusesUnrelatedCmdline: a legacy pidfile without a
+// recorded start time (ProcStart==0) never enters the kill path (fail closed:
+// PID reuse cannot be ruled out) — the live process is refused regardless of
+// its argv: no signal, no lock removal.
 func TestKillStaleDaemonRefusesUnrelatedCmdline(t *testing.T) {
 	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
 		t.Skip("no /proc on this platform; identity verification unavailable")
@@ -263,10 +268,11 @@ func TestKillStaleDaemonRefusesUnrelatedCmdline(t *testing.T) {
 	<-done
 }
 
-// TestKillStaleDaemonRefusesCodegraphSubstringCmdline: an unrelated process
-// whose argv[0] merely CONTAINS "codegraph" (e.g. an editor installed under
-// .../codegraph-editor/) must not pass the identity check — only exact
-// basename/path-segment matches count.
+// TestKillStaleDaemonRefusesCodegraphSubstringCmdline: a legacy pidfile is
+// refused even when its live process LOOKS like a codegraph binary (argv[0]
+// merely contains "codegraph", e.g. an editor installed under
+// .../codegraph-editor/) — without a recorded start time the kill path is
+// closed entirely, so no cmdline heuristic can authorize a signal.
 func TestKillStaleDaemonRefusesCodegraphSubstringCmdline(t *testing.T) {
 	if procStartTime(os.Getpid()) == 0 && procCmdline(os.Getpid()) == "" {
 		t.Skip("no /proc on this platform; identity verification unavailable")
@@ -373,6 +379,9 @@ func TestKillStaleDaemonSIGKILLFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sleep", "30")
+	// Model a real spawned daemon: identity must pass via the
+	// CODEGRAPH_DAEMON_INTERNAL=1 environ marker before the kill path runs.
+	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
@@ -428,7 +437,10 @@ func TestKillStaleDaemonRefusesPIDReuseAfterSIGTERMGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sleep", "30")
-	cmd.Args[0] = "codegraph-go" // pass the cmdline identity check on procfs platforms
+	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
+	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
+	// (plus the pidfile start time) is what authorizes the kill — never the argv.
+	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
@@ -509,7 +521,10 @@ func TestKillStaleDaemonClearsLockWhenDeadAfterGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sleep", "30")
-	cmd.Args[0] = "codegraph-go" // pass the cmdline identity check on procfs platforms
+	// Model a real spawned daemon: SpawnDetached marks it with CODEGRAPH_DAEMON_INTERNAL=1.
+	// The exe (/usr/bin/sleep) does not match this test binary, so the environ fact
+	// (plus the pidfile start time) is what authorizes the kill — never the argv.
+	cmd.Env = append(os.Environ(), EnvDaemonInternal+"=1")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
@@ -587,4 +602,261 @@ func TestRegistryRoundtrip(t *testing.T) {
 		t.Fatalf("record not in list: %+v", list)
 	}
 	Deregister(root)
+}
+
+// startInnocentProcess starts a plain helper process with NO daemon identity:
+// the ambient CODEGRAPH_DAEMON_INTERNAL marker (if any) is stripped from its
+// environment. argv0 optionally spoofs the process name, modeling attacks
+// like `exec -a codegraph-go ...`. The caller owns the process and must
+// kill (and reap) it.
+func startInnocentProcess(t *testing.T, argv0 string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if argv0 != "" {
+		cmd.Args[0] = argv0
+	}
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, EnvDaemonInternal+"=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	cmd.Env = env
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	return cmd
+}
+
+// waitZombieState polls until /proc/<pid>/stat reports state Z (exited but
+// not yet reaped), failing the test after a short deadline.
+func waitZombieState(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err == nil {
+			if i := bytes.LastIndexByte(raw, ')'); i >= 0 {
+				fields := strings.Fields(string(raw[i+2:]))
+				if len(fields) > 0 && fields[0] == "Z" {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("helper process never became a zombie")
+}
+
+// TestKillStaleDaemonRefusesForgedPidfileForInnocentProcess (audit: pidfile
+// forgery): any same-user process can write a daemon.pid naming an arbitrary
+// victim pid together with the victim's real /proc start time (pid and
+// starttime are world-readable in /proc) and delete the socket to manufacture
+// a stale-daemon scenario. The start-time match alone must NOT authorize the
+// kill: the target is a plain sleep with no daemon identity (its exe is
+// /usr/bin/sleep, its environ carries no CODEGRAPH_DAEMON_INTERNAL), so
+// KillStaleDaemon must refuse, leave the victim running, and keep the pidfile.
+func TestKillStaleDaemonRefusesForgedPidfileForInnocentProcess(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := startInnocentProcess(t, "")
+	defer func() { _ = victim.Process.Kill() }()
+	done := make(chan error, 1)
+	go func() { done <- victim.Wait() }()
+
+	// Fully forged-but-consistent pidfile: real pid, real /proc start time.
+	info := LockInfo{PID: victim.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(victim.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for a pidfile forged to name an innocent process")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("innocent process was killed via a forged pidfile")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite forged identity: %v", serr)
+	}
+	_ = victim.Process.Kill()
+	<-done
+}
+
+// TestKillStaleDaemonRefusesLegacyPidfileWithoutProcStart (audit: fail
+// closed): a legacy pidfile without a recorded start time cannot be checked
+// for PID reuse, so it must never enter the kill path — not even through the
+// old cmdline inspection, which an attacker could satisfy with
+// `exec -a codegraph-go ...` and which passed silently for empty cmdlines
+// (zombies). The live process must be refused and left running; the pidfile
+// is cleared only by the normal ClearStaleLock path once the process is dead.
+func TestKillStaleDaemonRefusesLegacyPidfileWithoutProcStart(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// argv[0] spoofed to a codegraph name — exactly the shape that passed the
+	// old cmdline identity check.
+	victim := startInnocentProcess(t, "codegraph-go")
+	defer func() { _ = victim.Process.Kill() }()
+	done := make(chan error, 1)
+	go func() { done <- victim.Wait() }()
+
+	info := LockInfo{PID: victim.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1} // no ProcStart
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for a legacy pidfile without a recorded start time")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("process was killed via a legacy pidfile")
+	default:
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite legacy pidfile: %v", serr)
+	}
+	_ = victim.Process.Kill()
+	<-done
+}
+
+// TestVerifyDaemonIdentityAcceptsSelf: a pidfile naming THIS live process
+// with the correct /proc start time passes verification — /proc/<pid>/exe
+// resolves to the running binary, which is the first identity fact (a real
+// daemon is spawned from os.Executable() by SpawnDetached, so client and
+// daemon share one binary). Real /proc, no stubs; no signal is sent — this
+// exercises the predicate in isolation.
+func TestVerifyDaemonIdentityAcceptsSelf(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	info := LockInfo{PID: os.Getpid(), Version: PackageVersion, SocketPath: PreferredSocket(t.TempDir()), StartedAt: 1, ProcStart: procStartTime(os.Getpid())}
+	if err := verifyDaemonIdentity(&info); err != nil {
+		t.Fatalf("self must pass identity verification: %v", err)
+	}
+}
+
+// TestKillStaleDaemonKillsSameBinaryDaemon (identity fact #1 — the target's
+// /proc/<pid>/exe resolves to this binary): the helper runs /usr/bin/sleep and
+// carries NO daemon marker; osExecutableFn is stubbed to the helper's real exe
+// path to model a client/daemon pair sharing one binary. Full flow:
+// SIGTERM -> exit -> lock cleared.
+func TestKillStaleDaemonKillsSameBinaryDaemon(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	// /proc/<pid>/exe readlink yields the fully resolved binary path.
+	exe, err := filepath.EvalSymlinks(cmd.Path)
+	if err != nil {
+		t.Fatalf("resolve helper exe: %v", err)
+	}
+	origExec := osExecutableFn
+	osExecutableFn = func() (string, error) { return exe, nil }
+	defer func() { osExecutableFn = origExec }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon with matching exe: %v", err)
+	}
+	select {
+	case werr := <-waited:
+		if werr == nil {
+			t.Fatal("helper process still running after KillStaleDaemon")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper process not terminated after KillStaleDaemon")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pidfile not cleared after kill")
+	}
+}
+
+// TestKillStaleDaemonRefusesZombieTarget: a zombie keeps its pid and its
+// /proc start time (stat is still readable), but neither its exe nor its
+// environ is readable — identity is unverifiable, so the kill must be
+// refused. (The old code passed empty-cmdline processes straight through for
+// legacy pidfiles, and a matching start time alone would have authorized the
+// kill for modern ones.)
+func TestKillStaleDaemonRefusesZombieTarget(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	start := procStartTime(pid)
+	// Kill the child WITHOUT reaping it: it stays as a zombie (state Z) with
+	// its /proc entry intact.
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL helper: %v", err)
+	}
+	waitZombieState(t, pid)
+	if !IsProcessAlive(pid) {
+		t.Fatal("zombie must count as alive for kill(2)")
+	}
+
+	info := LockInfo{PID: pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: start}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := KillStaleDaemon(root)
+	if err == nil {
+		t.Fatal("expected refusal for a zombie target (identity unverifiable)")
+	}
+	if !strings.Contains(err.Error(), "refusing to kill") {
+		t.Fatalf("expected a clear refusal message, got: %v", err)
+	}
+	if _, serr := os.Stat(pidPath); serr != nil {
+		t.Fatalf("lock removed despite unverifiable identity: %v", serr)
+	}
+	// Reap the zombie.
+	_ = cmd.Wait()
 }

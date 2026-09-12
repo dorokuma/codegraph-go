@@ -28,7 +28,9 @@ type LockInfo struct {
 	// ProcStart is the /proc/<pid>/stat starttime of the owning process at
 	// acquire time (0 on platforms without /proc, or for pidfiles written by
 	// older builds). KillStaleDaemon compares it against the live /proc value
-	// before signaling to detect PID reuse (S3).
+	// before signaling to detect PID reuse (S3), and refuses the kill path
+	// entirely when it is absent: a pidfile without it cannot prove which
+	// process incarnation it names, so a kill must never be based on it.
 	ProcStart int64 `json:"procStart,omitempty"`
 }
 
