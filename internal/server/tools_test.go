@@ -993,6 +993,58 @@ func TestToolCallersImpactDashLeadingName(t *testing.T) {
 	}
 }
 
+// TestToolStatusExtraRootWatcherObservability: secondary workdirs get the
+// same watcher observability as the primary — their counters (pending /
+// dropped / blind / unreadable) flow from their own ExtraWatchers entry, and
+// a watcher start failure is surfaced as "watcher_active: false" for that
+// root instead of living only in the startup log. The old toolStatus read
+// the default session watcher only (`root == s.Workdir`), so a stale or
+// dead extra-root watcher was invisible in status.
+func TestToolStatusExtraRootWatcherObservability(t *testing.T) {
+	s, _ := setupToolServer(t)
+	extra := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(extra, ".codegraph"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.Workdirs = []string{s.Workdir, extra}
+
+	// Healthy extra watcher: its own blind-spot counters must show up for a
+	// status call rooted at the secondary workdir. The counter mechanics are
+	// covered by internal/sync's own tests; Dropped/Pending flow through the
+	// same watcher handle and the same branch.
+	w, err := sync.NewWatcher(nil, extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	w.SetBlindSpotCountersForTest(3, 0)
+	s.ExtraWatchers = map[string]*sync.Watcher{extra: w}
+
+	result, _, err := s.toolStatus(context.Background(), nil, statusArgs{ProjectPath: extra})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "watcher_blind_dirs: 3") {
+		t.Fatalf("status for an extra root must expose its watcher_blind_dirs: 3, got:\n%s", text)
+	}
+	if strings.Contains(text, "watcher_active: false") {
+		t.Fatalf("extra watcher is running; status must not claim watcher_active: false, got:\n%s", text)
+	}
+
+	// Start failure on the extra root: no watcher running and the per-root
+	// failure recorded — status must say auto-sync is off for that root.
+	s.ExtraWatchers = nil
+	s.ExtraWatcherStartFailed = map[string]bool{extra: true}
+	result, _, err = s.toolStatus(context.Background(), nil, statusArgs{ProjectPath: extra})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text = textContent(result); !strings.Contains(text, "watcher_active: false") {
+		t.Fatalf("status for a failed extra root must expose watcher_active: false, got:\n%s", text)
+	}
+}
+
 // TestToolStatusExposesWatcherBlindSpotsAndStartFailure: the blind-spot
 // counters (watcher_blind_dirs / watcher_unreadable_dirs) and the
 // post-retry "watcher_active: false" line must be visible in the status

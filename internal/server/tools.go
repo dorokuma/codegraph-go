@@ -847,10 +847,29 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 	var pendingFiles []string
 	var dropped uint64
 	var blindDirs, unreadableDirs int64
-	// Pending files and the permanent-drop count only apply to the default
-	// session watcher.
+	// Pending files, the permanent-drop count, and the blind-spot counters
+	// come from the watcher that owns the resolved root: the default session
+	// watcher for the primary workdir, the matching ExtraWatchers entry for
+	// a secondary root. Secondary roots get the same observability as the
+	// primary — their watchers hit the same blind spots and drops, and
+	// their start can fail the same way.
+	var watcherUp, watcherStartFailed bool
 	if root == s.Workdir {
 		if w := s.Watcher.Load(); w != nil {
+			watcherUp = true
+			pendingFiles = w.PendingFiles()
+			dropped = w.DroppedCount()
+			blindDirs = w.BlindDirs()
+			unreadableDirs = w.UnreadableDirs()
+		}
+		watcherStartFailed = s.WatcherStartFailed.Load()
+	} else {
+		s.ExtraMu.Lock()
+		w := s.ExtraWatchers[root]
+		watcherStartFailed = s.ExtraWatcherStartFailed[root]
+		s.ExtraMu.Unlock()
+		if w != nil {
+			watcherUp = true
 			pendingFiles = w.PendingFiles()
 			dropped = w.DroppedCount()
 			blindDirs = w.BlindDirs()
@@ -880,8 +899,12 @@ func (s *Server) toolStatus(ctx context.Context, _ *mcp.CallToolRequest, args st
 	if unreadableDirs > 0 {
 		text += fmt.Sprintf("watcher_unreadable_dirs: %d (subtrees unreadable during initial walk — changes there are not reindexed)\n", unreadableDirs)
 	}
-	if root == s.Workdir && s.Watcher.Load() == nil && s.WatcherStartFailed.Load() {
-		text += "watcher_active: false (watcher failed to start after retries — auto-sync is off; file changes are not reindexed until the daemon restarts)\n"
+	if !watcherUp && watcherStartFailed {
+		if root != s.Workdir {
+			text += fmt.Sprintf("watcher_active: false for workdir %s (watcher failed to start after retries — auto-sync is off; file changes are not reindexed until the daemon restarts)\n", s.displayRoot(root))
+		} else {
+			text += "watcher_active: false (watcher failed to start after retries — auto-sync is off; file changes are not reindexed until the daemon restarts)\n"
+		}
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
