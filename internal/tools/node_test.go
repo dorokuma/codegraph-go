@@ -355,4 +355,3 @@ func TestToolNodeSymbolsOnlyTruncated(t *testing.T) {
 		t.Fatalf("default source view should not include symbolsOnly truncation notice, got:\n%s", defaultText)
 	}
 }
-
