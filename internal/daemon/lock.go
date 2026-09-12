@@ -134,7 +134,11 @@ var ErrStaleDaemonRefused = errors.New("refusing to kill: identity check failed 
 // the daemon may have exited right after SIGTERM and its pid been recycled by
 // an unrelated process, so signaling without a recheck could kill an innocent
 // process (same pre-signal recheck discipline as terminateViaKill in
-// recovery.go). If the process survives even SIGKILL, an explicit error is
+// recovery.go). Where the kernel supports it, the signals are delivered
+// through a pidfd that pins the verified incarnation, closing the residual
+// recheck→signal PID-reuse window (terminateStaleDaemon); the classic
+// kill(2)+recheck path remains as the fallback. If the process survives even
+// SIGKILL, an explicit error is
 // returned and the stale pidfile is left in place (ClearStaleLock never
 // removes a live pidfile).
 func KillStaleDaemon(projectRoot string) error {
@@ -161,56 +165,127 @@ func KillStaleDaemon(projectRoot string) error {
 			return err
 		}
 		log.Printf("killing stale daemon pid=%d (version mismatch; upgrade cleanup)", info.PID)
-		// kill(2) directly — same recheck discipline as before, but without
-		// os.FindProcess, which would allocate an unreleased pidfd per call
-		// on Go 1.24+ Linux.
-		if serr := syscall.Kill(info.PID, syscall.SIGTERM); serr != nil {
-			// The process may have died between the probe and the signal.
-			if !IsProcessAlive(info.PID) {
-				ClearStaleLock(pidPath, info.PID)
-				return nil
-			}
-			return serr
-		}
-		// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
-		if !waitForExitFn(info.PID, 5*time.Second) {
-			// SIGTERM grace expired: the daemon is stuck (e.g. Stop wedged in
-			// d.wg.Wait() behind a session that never returns). Before
-			// escalating to SIGKILL, re-verify the target is STILL the daemon
-			// we recorded: during the grace window the daemon may have exited
-			// and its pid been recycled by an unrelated process. Never SIGKILL
-			// a process whose identity cannot be confirmed. On mismatch: if
-			// the pid is dead, the daemon did exit (just not within the grace
-			// window) — clear the stale pidfile and succeed; if the pid is
-			// alive but no longer ours, leave the lock untouched and return
-			// the refusal error (never signal an innocent process).
-			if err := verifyDaemonIdentity(info, projectRoot); err != nil {
-				if !IsProcessAlive(info.PID) {
-					ClearStaleLock(pidPath, info.PID)
-					return nil
-				}
-				return err
-			}
-			log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
-			if serr := syscall.Kill(info.PID, syscall.SIGKILL); serr != nil {
-				// Died between the probe and the signal.
-				if !IsProcessAlive(info.PID) {
-					ClearStaleLock(pidPath, info.PID)
-					return nil
-				}
-				return serr
-			}
-			if !waitForExitFn(info.PID, 2*time.Second) {
-				// Still alive after SIGKILL: never report success. The lock
-				// stays (ClearStaleLock below refuses to remove a pidfile
-				// naming a live process); the caller gets an explicit error
-				// instead of a fake nil that would lead to a spawn attempt
-				// doomed to fail on the still-held lock.
-				return fmt.Errorf("stale daemon pid=%d still alive after SIGTERM+SIGKILL; lock not cleared", info.PID)
-			}
+		if err := terminateStaleDaemon(info, projectRoot, pidPath); err != nil {
+			return err
 		}
 	}
 	ClearStaleLock(pidPath, info.PID)
+	return nil
+}
+
+// terminateStaleDaemon SIGTERMs the already identity-verified daemon
+// incarnation and escalates to SIGKILL when it survives the 5s grace. Primary
+// path: the target is pinned with a pidfd so each signal reaches the verified
+// incarnation even if its pid is recycled between a recheck and the signal
+// (same window-closing principle as recovery.go's terminateInvisibleHolder,
+// which shares the pidfd primitives from pidfd.go). Any pidfd_open failure
+// (non-Linux, ENOSYS on kernels < 5.3, EPERM under seccomp, a daemon that
+// died between verification and open, ...) falls back to
+// terminateStaleViaKill — the classic kill(2)+pre-signal-recheck path, which
+// keeps the historical semantics.
+func terminateStaleDaemon(info *LockInfo, projectRoot, pidPath string) error {
+	fd, err := pidfdOpenFn(info.PID)
+	if err != nil {
+		log.Printf("pidfd path unavailable for stale daemon pid %d (%v); falling back to kill(2)+recheck", info.PID, err)
+		return terminateStaleViaKill(info, projectRoot, pidPath)
+	}
+	defer pidfdCloseFn(fd) //nolint:errcheck
+	return terminateStaleViaPidfd(fd, info, projectRoot, pidPath)
+}
+
+// terminateStaleViaPidfd delivers SIGTERM and, after the 5s grace, SIGKILL
+// through the pidfd pinning the verified daemon incarnation. The pre-SIGKILL
+// identity recheck is kept (parity with the classic path — the grace window
+// is a PID-reuse TOCTOU, and the recheck refuses escalation the moment /proc
+// no longer shows the recorded incarnation); the pin closes the residual
+// recheck→signal window: pidfd_send_signal hits the pinned process or fails
+// with ESRCH, never a recycled pid.
+func terminateStaleViaPidfd(fd int, info *LockInfo, projectRoot, pidPath string) error {
+	if serr := pidfdSendSignalFn(fd, syscall.SIGTERM); serr != nil {
+		if errors.Is(serr, syscall.ESRCH) {
+			// The pinned daemon exited between verification and signal — a
+			// safe no-op (pidfd_send_signal never hits a recycled pid); the
+			// stale pidfile can be cleared.
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return serr
+	}
+	// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
+	if waitForExitFn(info.PID, 5*time.Second) {
+		return nil
+	}
+	log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
+	// Before escalating to SIGKILL, re-verify the target is STILL the daemon
+	// we recorded: during the grace window the daemon may have exited and its
+	// pid been recycled by an unrelated process. Never SIGKILL a process whose
+	// identity cannot be confirmed. On mismatch: if the pid is dead, the
+	// daemon did exit (just not within the grace window) — clear the stale
+	// pidfile and succeed; if the pid is alive but no longer ours, leave the
+	// lock untouched and return the refusal error (never signal an innocent
+	// process).
+	if err := verifyDaemonIdentity(info, projectRoot); err != nil {
+		if !IsProcessAlive(info.PID) {
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return err
+	}
+	// The pin guarantees SIGKILL reaches the SAME incarnation that received
+	// the SIGTERM even if its pid was recycled during the grace window. ESRCH
+	// means the pinned daemon exited meanwhile — a safe no-op.
+	if serr := pidfdSendSignalFn(fd, syscall.SIGKILL); serr != nil && !errors.Is(serr, syscall.ESRCH) {
+		return serr
+	}
+	if !waitForExitFn(info.PID, 2*time.Second) {
+		// Still alive after SIGKILL: never report success. The lock stays
+		// (ClearStaleLock refuses to remove a pidfile naming a live process);
+		// the caller gets an explicit error instead of a fake nil that would
+		// lead to a spawn attempt doomed to fail on the still-held lock.
+		return fmt.Errorf("stale daemon pid=%d still alive after SIGTERM+SIGKILL; lock not cleared", info.PID)
+	}
+	return nil
+}
+
+// terminateStaleViaKill is the classic fallback for platforms and kernels
+// without pidfd support: SIGTERM → 5s wait → SIGKILL → 2s wait via kill(2),
+// with a live /proc identity recheck before the SIGKILL escalation (the
+// identity guarantee lives in the rechecks; only the last microseconds before
+// each signal remain unclosable). This is an exact extraction of the
+// historical inline signal section of KillStaleDaemon; kill(2) allocates no
+// pidfd, so the fallback leaks nothing on Go 1.24+ Linux either.
+func terminateStaleViaKill(info *LockInfo, projectRoot, pidPath string) error {
+	if serr := syscall.Kill(info.PID, syscall.SIGTERM); serr != nil {
+		// The process may have died between the probe and the signal.
+		if !IsProcessAlive(info.PID) {
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return serr
+	}
+	// Poll for exit (daemon Stop drains sessions, checkpoints WAL, closes DB).
+	if waitForExitFn(info.PID, 5*time.Second) {
+		return nil
+	}
+	log.Printf("stale daemon pid=%d did not exit within 5s of SIGTERM; sending SIGKILL", info.PID)
+	if err := verifyDaemonIdentity(info, projectRoot); err != nil {
+		if !IsProcessAlive(info.PID) {
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return err
+	}
+	if serr := syscall.Kill(info.PID, syscall.SIGKILL); serr != nil {
+		// Died between the probe and the signal.
+		if !IsProcessAlive(info.PID) {
+			ClearStaleLock(pidPath, info.PID)
+			return nil
+		}
+		return serr
+	}
+	if !waitForExitFn(info.PID, 2*time.Second) {
+		return fmt.Errorf("stale daemon pid=%d still alive after SIGTERM+SIGKILL; lock not cleared", info.PID)
+	}
 	return nil
 }
 

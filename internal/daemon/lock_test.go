@@ -812,6 +812,48 @@ func TestKillStaleDaemonRefusesSameBinaryWithoutWorkdir(t *testing.T) {
 	<-done
 }
 
+// TestKillStaleDaemonSignalsLiveProcessViaKillFallback: with the pidfd path
+// forced unavailable (pidfd_open -> ErrPidfdNotSupported — the non-Linux /
+// old-kernel condition), the classic kill(2)+recheck fallback still
+// terminates a same-project daemon (marker + -workdir) and clears the lock.
+func TestKillStaleDaemonSignalsLiveProcessViaKillFallback(t *testing.T) {
+	if procStartTime(os.Getpid()) == 0 {
+		t.Skip("no /proc on this platform; identity verification unavailable")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := startDaemonLikeProcess(t, root, true)
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	defer cmd.Process.Kill() //nolint:errcheck
+
+	origOpen := pidfdOpenFn
+	pidfdOpenFn = func(int) (int, error) { return -1, ErrPidfdNotSupported }
+	defer func() { pidfdOpenFn = origOpen }()
+
+	info := LockInfo{PID: cmd.Process.Pid, Version: "0.0.0", SocketPath: PreferredSocket(root), StartedAt: 1, ProcStart: procStartTime(cmd.Process.Pid)}
+	if err := os.WriteFile(pidPath, EncodeLock(info), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := KillStaleDaemon(root); err != nil {
+		t.Fatalf("KillStaleDaemon via kill(2) fallback: %v", err)
+	}
+	select {
+	case werr := <-waited:
+		if werr == nil {
+			t.Fatal("helper process still running after KillStaleDaemon fallback")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper process not terminated after KillStaleDaemon fallback")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pidfile not cleared after fallback kill")
+	}
+}
+
 func TestRegistryRoundtrip(t *testing.T) {
 	// Use a unique root so we don't clobber real registry entries.
 	root := filepath.Join(t.TempDir(), "proj")
