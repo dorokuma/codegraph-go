@@ -14,22 +14,6 @@ import (
 	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
-// matchLineInNode returns the file line of the first pattern occurrence in the
-// indexed body. Name-only FTS hits keep the symbol start line.
-func matchLineInNode(n db.Node, pattern string) int {
-	if n.Line <= 0 {
-		n.Line = 1
-	}
-	if pattern == "" || n.Body == "" {
-		return n.Line
-	}
-	idx := strings.Index(n.Body, pattern)
-	if idx < 0 {
-		return n.Line
-	}
-	return n.Line + strings.Count(n.Body[:idx], "\n")
-}
-
 // matchLineForNode returns the file line of the first pattern occurrence in n.
 // When n already has a body, it inspects n.Body.
 // When n has no body (lightweight ref), if n.Name matches pattern or n.Line is given,
@@ -95,27 +79,6 @@ func isSimpleIdent(s string) bool {
 		}
 	}
 	return true
-}
-
-// isWordIn reports whether word appears as a standalone word in text.
-// Word boundaries are: start/end of string, space, slash, dot, dash, underscore.
-func isWordIn(word, text string) bool {
-	idx := strings.Index(text, word)
-	if idx < 0 {
-		return false
-	}
-	end := idx + len(word)
-	leftOK := idx == 0 || isWordSep(text[idx-1])
-	rightOK := end == len(text) || isWordSep(text[end])
-	return leftOK && rightOK
-}
-
-func isWordSep(b byte) bool {
-	switch b {
-	case ' ', '/', '.', '-', '_', ',', ':', '\t', '\n', '(', ')', '[', ']', '{', '}':
-		return true
-	}
-	return false
 }
 
 // defReCacheCap bounds the compiled-definition-regex cache (M6). One entry

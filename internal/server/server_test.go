@@ -363,7 +363,7 @@ func TestResolveProjectWorkdirWhitelist(t *testing.T) {
 	s := &Server{Workdir: ws, Workdirs: []string{ws}, Database: wsDB}
 
 	// Inside → accepted.
-	root, database, err := s.resolveProject(filepath.Join(ws, "proj", "pkg"))
+	root, _, err := s.resolveProject(filepath.Join(ws, "proj", "pkg"))
 	if err != nil {
 		t.Fatalf("inside project rejected: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestResolveProjectWorkdirWhitelist(t *testing.T) {
 	}
 
 	// Default (empty projectPath) still works.
-	root, database, err = s.resolveProject("")
+	root, database, err := s.resolveProject("")
 	if err != nil || root != ws || database != wsDB {
 		t.Fatalf("default: root=%q err=%v", root, err)
 	}

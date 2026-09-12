@@ -1,7 +1,6 @@
 package safelog
 
 import (
-	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -88,16 +87,4 @@ func parseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
-}
-
-// writer returns the current global non-blocking writer, or os.Stderr if unset.
-// This is a convenience for tests that need to verify log output.
-func writer() io.Writer {
-	globalMu.Lock()
-	w := globalWriter
-	globalMu.Unlock()
-	if w != nil {
-		return w
-	}
-	return os.Stderr
 }

@@ -177,12 +177,8 @@ func (d *DB) edgesUniqueKeyCols(table string) ([]string, error) {
 	}
 	rows.Close()
 	// edges has at most one unique index (the UNIQUE constraint); first wins.
-	for _, name := range uniq {
-		cols, cerr := d.indexColumns(name)
-		if cerr != nil {
-			return nil, cerr
-		}
-		return cols, nil
+	if len(uniq) > 0 {
+		return d.indexColumns(uniq[0])
 	}
 	return nil, nil
 }
