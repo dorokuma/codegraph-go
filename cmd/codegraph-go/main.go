@@ -75,7 +75,14 @@ func dbInUseError(err error, suggestNoDaemon bool) error {
 	if err == nil {
 		return nil
 	}
-	if strings.Contains(err.Error(), "in use") || strings.Contains(err.Error(), "locked") {
+	// Preferred detection: the db layer wraps its own lock conflict in
+	// db.ErrIndexInUse, so this does not depend on message wording. The
+	// string fallbacks stay for errors that cannot be pre-wrapped by the
+	// db layer: driver-level SQLITE_BUSY ("database is locked") and older
+	// binary "in use" wording still in flight.
+	if errors.Is(err, db.ErrIndexInUse) ||
+		strings.Contains(err.Error(), "in use") ||
+		strings.Contains(err.Error(), "locked") {
 		return errors.New(dbInUseMessage(err.Error(), suggestNoDaemon))
 	}
 	return err
