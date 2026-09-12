@@ -259,10 +259,6 @@ func (e *Extractor) extractRust(source string, filePath string) ([]ExtractedNode
 // readParenGroup scans s from its first '(' to the matching ')' (depth-aware,
 // honoring string literals) and returns the full parenthesized group plus the
 // remainder after it. Returns ("", "") when no group starts in s.
-
-// readParenGroup scans s from its first '(' to the matching ')' (depth-aware,
-// honoring string literals) and returns the full parenthesized group plus the
-// remainder after it. Returns ("", "") when no group starts in s.
 func readParenGroup(s string) (group, rest string) {
 	open := strings.IndexByte(s, '(')
 	if open < 0 {
@@ -298,8 +294,6 @@ func readParenGroup(s string) (group, rest string) {
 	}
 	return "", ""
 }
-
-// splitRustUsePaths expands `use a::{b, c::d}` / `use a::b` into import specs.
 
 // splitRustUsePaths expands `use a::{b, c::d}` / `use a::b` into import specs.
 func splitRustUsePaths(spec string) []string {

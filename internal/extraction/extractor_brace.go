@@ -13,10 +13,6 @@ const maxBraceScanLines = 20000
 // braceScanner is the shared line scanner behind findBraceEnd and
 // extractJSClassMethods: it tracks brace depth while ignoring braces inside
 // strings, comments and JS regex literals.
-
-// braceScanner is the shared line scanner behind findBraceEnd and
-// extractJSClassMethods: it tracks brace depth while ignoring braces inside
-// strings, comments and JS regex literals.
 type braceScanner struct {
 	depth          int
 	inString       bool
@@ -25,9 +21,6 @@ type braceScanner struct {
 	inLineComment  bool
 	inBlockComment bool
 }
-
-// scan advances the scanner over one line and reports whether the brace
-// depth dropped to zero inside it (i.e. the tracked block closed).
 
 // scan advances the scanner over one line and reports whether the brace
 // depth dropped to zero inside it (i.e. the tracked block closed).
@@ -122,11 +115,6 @@ func (s *braceScanner) scan(line string) bool {
 // rather than a division. Heuristic: a '/' directly after an operand
 // (identifier, number, closing bracket/quote, or a ++/-- prefix) is division;
 // after operators, openers or at line start it is a regex literal.
-
-// isRegexStart reports whether the '/' at line[j] starts a JS regex literal
-// rather than a division. Heuristic: a '/' directly after an operand
-// (identifier, number, closing bracket/quote, or a ++/-- prefix) is division;
-// after operators, openers or at line start it is a regex literal.
 func isRegexStart(line string, j int) bool {
 	k := j - 1
 	for k >= 0 && (line[k] == ' ' || line[k] == '\t') {
@@ -154,10 +142,6 @@ func isRegexStart(line string, j int) bool {
 	}
 	return true
 }
-
-// scanRegexLiteral scans a JS regex literal starting at the '/' in line[j]
-// and returns the index of its closing '/'. Escapes and character classes
-// are honored; an unterminated regex consumes the rest of the line.
 
 // scanRegexLiteral scans a JS regex literal starting at the '/' in line[j]
 // and returns the index of its closing '/'. Escapes and character classes
@@ -193,15 +177,6 @@ func scanRegexLiteral(line string, j int) int {
 // The forward scan is capped at maxBraceScanLines: an unterminated block
 // returns start+1 (the declaration line only) instead of scanning a
 // pathological file to EOF.
-
-// findBraceEnd finds the line where the matching closing brace is (returned
-// as the 1-based line of the closing brace, i.e. an exclusive end index).
-// Braces inside strings, char literals, line comments (//), block comments
-// (/* */) and JS regex literals are ignored, so a comment/string/regex
-// containing '{' or '}' can no longer truncate or stretch a symbol's range.
-// The forward scan is capped at maxBraceScanLines: an unterminated block
-// returns start+1 (the declaration line only) instead of scanning a
-// pathological file to EOF.
 func findBraceEnd(lines []string, start int) int {
 	sc := braceScanner{}
 	limit := start + maxBraceScanLines
@@ -215,11 +190,6 @@ func findBraceEnd(lines []string, start int) int {
 	}
 	return start + 1
 }
-
-// findIndentEnd finds the end of an indented block (Python). Blank lines and
-// comment-only lines after the header are skipped when measuring the block's
-// base indent, so `def f():` followed by an empty line (or a docstring/comment
-// line) no longer collapses the body to a single line.
 
 // findIndentEnd finds the end of an indented block (Python). Blank lines and
 // comment-only lines after the header are skipped when measuring the block's

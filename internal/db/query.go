@@ -22,8 +22,6 @@ const (
 )
 
 // EdgeKind constants
-
-// EdgeKind constants
 const (
 	EdgeCalls      = "calls"
 	EdgeImports    = "imports"
@@ -33,8 +31,6 @@ const (
 	EdgeContains   = "contains"
 	EdgeBridge     = "bridge"
 )
-
-// Node represents a code symbol.
 
 // Node represents a code symbol.
 type Node struct {
@@ -58,8 +54,6 @@ type Node struct {
 }
 
 // Edge represents a relationship between two nodes.
-
-// Edge represents a relationship between two nodes.
 type Edge struct {
 	ID         int64
 	SourceID   int64
@@ -73,8 +67,6 @@ type Edge struct {
 }
 
 // FileRecord is an indexed source file row.
-
-// FileRecord is an indexed source file row.
 type FileRecord struct {
 	Path        string
 	Size        int64
@@ -83,8 +75,6 @@ type FileRecord struct {
 	Language    string
 	NodeCount   int
 }
-
-// Fact is an agent-annotated fact attached to a code symbol.
 
 // Fact is an agent-annotated fact attached to a code symbol.
 type Fact struct {
@@ -100,8 +90,6 @@ type Fact struct {
 	CreatedAt    int64  // unix seconds
 	UpdatedAt    int64  // unix seconds
 }
-
-// UnresolvedRef is a pending/failed reference awaiting resolution.
 
 // UnresolvedRef is a pending/failed reference awaiting resolution.
 type UnresolvedRef struct {
@@ -130,8 +118,6 @@ func escapeLikePattern(s string) string {
 }
 
 // statusOrDefault returns "active" when s is empty.
-
-// statusOrDefault returns "active" when s is empty.
 func statusOrDefault(s string) string {
 	if s == "" {
 		return "active"
@@ -140,16 +126,12 @@ func statusOrDefault(s string) string {
 }
 
 // nullString returns nil for empty strings so SQLite stores NULL.
-
-// nullString returns nil for empty strings so SQLite stores NULL.
 func nullString(s string) interface{} {
 	if s == "" {
 		return nil
 	}
 	return s
 }
-
-// nullInt64 returns nil for 0 so SQLite stores NULL.
 
 // nullInt64 returns nil for 0 so SQLite stores NULL.
 func nullInt64(v int64) interface{} {

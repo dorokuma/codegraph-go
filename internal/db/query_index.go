@@ -186,13 +186,9 @@ func (d *DB) ReplaceFileIndex(store string, nodes []Node, edges []Edge, refs []U
 }
 
 // CountNodes returns the total number of nodes in the index.
-
-// CountNodes returns the total number of nodes in the index.
 func (d *DB) CountNodes() (int, error) {
 	return d.CountNodesContext(context.Background())
 }
-
-// CountNodesContext is the context-aware variant of CountNodes.
 
 // CountNodesContext is the context-aware variant of CountNodes.
 func (d *DB) CountNodesContext(ctx context.Context) (int, error) {
@@ -205,8 +201,6 @@ func (d *DB) CountNodesContext(ctx context.Context) (int, error) {
 }
 
 // Stats returns index statistics.
-
-// Stats returns index statistics.
 type Stats struct {
 	NodeCount  int
 	EdgeCount  int
@@ -215,13 +209,9 @@ type Stats struct {
 }
 
 // GetStats returns index statistics.
-
-// GetStats returns index statistics.
 func (d *DB) GetStats() (*Stats, error) {
 	return d.GetStatsContext(context.Background())
 }
-
-// GetStatsContext is the context-aware variant of GetStats.
 
 // GetStatsContext is the context-aware variant of GetStats.
 func (d *DB) GetStatsContext(ctx context.Context) (*Stats, error) {
@@ -278,14 +268,7 @@ type GraphSnapshot struct {
 // very large indexes. Exceeding it truncates the snapshot instead of failing.
 // Test-only mutation: tests that change this value must restore it and must
 // not run in parallel with other tests in this package.
-
-// graphSnapshotCap bounds the rows loaded per collection to prevent OOM on
-// very large indexes. Exceeding it truncates the snapshot instead of failing.
-// Test-only mutation: tests that change this value must restore it and must
-// not run in parallel with other tests in this package.
 var graphSnapshotCap = 500_000
-
-// SetGraphSnapshotCapForTest overrides graphSnapshotCap for testing and returns the previous value.
 
 // SetGraphSnapshotCapForTest overrides graphSnapshotCap for testing and returns the previous value.
 func SetGraphSnapshotCapForTest(newCap int) int {
@@ -293,11 +276,6 @@ func SetGraphSnapshotCapForTest(newCap int) int {
 	graphSnapshotCap = newCap
 	return old
 }
-
-// GetGraphSnapshot returns all nodes and edges in one call, protected by RLock.
-// When the index exceeds graphSnapshotCap rows in either collection the result
-// is truncated and GraphSnapshot.Truncated is set (callers report it, they
-// never crash on the partial view).
 
 // GetGraphSnapshot returns all nodes and edges in one call, protected by RLock.
 // When the index exceeds graphSnapshotCap rows in either collection the result

@@ -38,13 +38,7 @@ func (d *DB) InsertUnresolvedRef(r *UnresolvedRef) (int64, error) {
 // inboundParkKinds are symbol-level edges that CASCADE-delete when the
 // callee node is replaced. Structural kinds (contains, imports) are rebuilt
 // by the owning file and are not parked.
-
-// inboundParkKinds are symbol-level edges that CASCADE-delete when the
-// callee node is replaced. Structural kinds (contains, imports) are rebuilt
-// by the owning file and are not parked.
 var inboundParkKinds = []string{EdgeCalls, EdgeReferences, EdgeBridge, EdgeExtends, EdgeImplements}
-
-// refNameTail matches extraction.NameTail (last segment after . / # @).
 
 // refNameTail matches extraction.NameTail (last segment after . / # @).
 func refNameTail(name string) string {
@@ -57,12 +51,6 @@ func refNameTail(name string) string {
 	}
 	return name
 }
-
-// ParkInboundRefsForFile writes pending unresolved_refs for edges that point
-// at nodes in file from a different file. Call this before ReplaceFileIndex
-// so CASCADE-deleted inbound edges can be rebuilt by ResolveForFiles.
-// Do not call this on a deleted file: the callee is gone, inbound edges
-// should disappear.
 
 // ParkInboundRefsForFile writes pending unresolved_refs for edges that point
 // at nodes in file from a different file. Call this before ReplaceFileIndex
@@ -113,9 +101,6 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 
 // CountUnresolvedRefs returns how many unresolved_refs rows match status
 // (empty status = all rows).
-
-// CountUnresolvedRefs returns how many unresolved_refs rows match status
-// (empty status = all rows).
 func (d *DB) CountUnresolvedRefs(status string) (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -129,9 +114,6 @@ func (d *DB) CountUnresolvedRefs(status string) (int, error) {
 	}
 	return n, err
 }
-
-// ListUnresolvedRefs returns unresolved_refs rows, optionally filtered by file path
-// and/or status (empty string = no filter).
 
 // ListUnresolvedRefs returns unresolved_refs rows, optionally filtered by file path
 // and/or status (empty string = no filter).
@@ -167,14 +149,6 @@ func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error
 	}
 	return out, rows.Err()
 }
-
-// ListUnresolvedRefsByFiles returns unresolved_refs rows for multiple file
-// paths, optionally filtered by status (empty string = no filter).
-// This avoids loading all unresolved refs into memory and filtering in Go.
-// The IN list is chunked so it stays under SQLite's variable-number ceiling
-// (999), mirroring ListUnresolvedRefsByNames; each chunk carries the status
-// filter. A row can only match one chunk (each path appears once), so no
-// dedup is needed.
 
 // ListUnresolvedRefsByFiles returns unresolved_refs rows for multiple file
 // paths, optionally filtered by status (empty string = no filter).
@@ -234,14 +208,6 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 	}
 	return out, nil
 }
-
-// ListUnresolvedRefsByNames returns unresolved_refs rows whose reference_name
-// or name_tail exactly matches one of names, optionally filtered by status
-// (empty statuses = no status filter). The name filter is pushed down to SQL
-// instead of loading every row and matching in Go (F1), reusing
-// idx_unresolved_name and idx_unresolved_failed_tail. Names are chunked so
-// the IN lists stay under SQLite's variable-number ceiling; a row matching
-// both branches is returned once.
 
 // ListUnresolvedRefsByNames returns unresolved_refs rows whose reference_name
 // or name_tail exactly matches one of names, optionally filtered by status
@@ -348,16 +314,6 @@ func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]Unr
 // rows are rare, so this is deliberately a simple filtered scan (it can use
 // idx_unresolved_status); the normal extraction path always writes a non-empty
 // name_tail and is never touched by it.
-
-// ListUnresolvedRefsEmptyTail returns unresolved_refs rows whose name_tail is
-// empty (historical/anomalous rows that store the full qualified name in
-// reference_name), optionally filtered by status (empty statuses = no status
-// filter). The F1 SQL pushdown in ListUnresolvedRefsByNames matches stored
-// name_tail exactly and cannot see these rows through their tail segment;
-// callers re-apply nameTail(reference_name) matching in Go (S2). Empty-tail
-// rows are rare, so this is deliberately a simple filtered scan (it can use
-// idx_unresolved_status); the normal extraction path always writes a non-empty
-// name_tail and is never touched by it.
 func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -417,8 +373,6 @@ func (d *DB) DeleteUnresolvedRef(id int64) error {
 	_, err := d.conn.Exec(`DELETE FROM unresolved_refs WHERE id = ?`, id)
 	return err
 }
-
-// MarkUnresolvedFailed parks a ref as failed so a later pass can retry.
 
 // MarkUnresolvedFailed parks a ref as failed so a later pass can retry.
 func (d *DB) MarkUnresolvedFailed(id int64, nameTail string) error {

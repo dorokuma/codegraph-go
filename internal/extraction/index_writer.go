@@ -29,9 +29,6 @@ func splitNameLineKey(key string) (name string, line int, ok bool) {
 
 // bareRank scores node kinds for same-file bare-name lookup.
 // Higher wins so listUsers(function) beats a coincidental non-callable.
-
-// bareRank scores node kinds for same-file bare-name lookup.
-// Higher wins so listUsers(function) beats a coincidental non-callable.
 func bareRank(kind string) int {
 	switch kind {
 	case "function", "method", "component", "constructor":
@@ -44,9 +41,6 @@ func bareRank(kind string) int {
 		return 0
 	}
 }
-
-// simplifyHandlerName turns framework handler expressions into a bare symbol.
-// Examples: listUsers, pkg.Handler, (*User).Create, UsersController@index, h.Serve
 
 // simplifyHandlerName turns framework handler expressions into a bare symbol.
 // Examples: listUsers, pkg.Handler, (*User).Create, UsersController@index, h.Serve
@@ -496,16 +490,6 @@ func (o *Orchestrator) indexFile(path string, lang string, data []byte) (int, er
 // a non-empty result, the sentinel is returned as the error so callers can
 // tell "timeout" from a genuine parse verdict and keep a good old index
 // instead of overwriting it with weak regex partial results (must-fix).
-
-// extractFile runs the extraction pipeline: tree-sitter preferred, regex
-// fallback when tree-sitter fails. Returns the result, whether tree-sitter
-// itself errored (false when it succeeded, was unavailable, or regex is the
-// only extractor), and an error only when every extractor failed (A4) —
-// callers then keep the previous index for the file. One exception: when
-// tree-sitter TIMED OUT (ErrTSParseTimeout) and the regex fallback produced
-// a non-empty result, the sentinel is returned as the error so callers can
-// tell "timeout" from a genuine parse verdict and keep a good old index
-// instead of overwriting it with weak regex partial results (must-fix).
 func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, bool, error) {
 	if o.extractFn != nil {
 		return o.extractFn(lang, source, store)
@@ -530,10 +514,6 @@ func (o *Orchestrator) extractFile(lang, source, store string) (ExtractResult, b
 	res, err := NewExtractor(lang).Extract(source, store)
 	return res, false, err
 }
-
-// resolveSourceIdx finds the dbNodes index for a ref/edge source name.
-// Returns 0 for the file node when name is empty, -1 when no node matches
-// (callers decide whether to skip or fall back to the file node).
 
 // resolveSourceIdx finds the dbNodes index for a ref/edge source name.
 // Returns 0 for the file node when name is empty, -1 when no node matches
