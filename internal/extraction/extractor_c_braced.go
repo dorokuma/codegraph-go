@@ -212,14 +212,6 @@ func (e *Extractor) extractJS(source string, filePath string) ([]ExtractedNode, 
 // without a depth check they would be misread as sibling methods with fake
 // contains edges (must-fix: the previous version scanned the whole class
 // range without tracking brace depth).
-
-// extractJSClassMethods extracts method definitions inside a class body
-// (regex fallback; the tree-sitter path handles methods natively). Only
-// class-body members at brace depth 1 are treated as methods: method bodies
-// can contain bare calls like `helper();` that satisfy jsMethodRe, and
-// without a depth check they would be misread as sibling methods with fake
-// contains edges (must-fix: the previous version scanned the whole class
-// range without tracking brace depth).
 func (e *Extractor) extractJSClassMethods(nodes *[]ExtractedNode, edges *[]ExtractedEdge, lines []string, startIdx, endIdx int, filePath, className string) {
 	sc := braceScanner{depth: 1} // class body members live at depth 1
 	for li := startIdx; li < endIdx && li < len(lines); li++ {
@@ -278,10 +270,6 @@ func isGoKeyword(s string) bool {
 	}
 	return false
 }
-
-// isJSKeyword is ONLY syntactic keywords / literals. Host builtins (console,
-// Promise, Array…) are not filtered here — unresolved noise is scrubbed after
-// resolve when no project symbol matches.
 
 // isJSKeyword is ONLY syntactic keywords / literals. Host builtins (console,
 // Promise, Array…) are not filtered here — unresolved noise is scrubbed after

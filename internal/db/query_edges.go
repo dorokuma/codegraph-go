@@ -69,8 +69,6 @@ func (d *DB) GetIncomingEdges(nodeID int64, kinds []string) ([]Edge, error) {
 }
 
 // GetOutgoingEdges returns edges originating at nodeID, optionally filtered by kinds.
-
-// GetOutgoingEdges returns edges originating at nodeID, optionally filtered by kinds.
 func (d *DB) GetOutgoingEdges(nodeID int64, kinds []string) ([]Edge, error) {
 	return d.listEdges(`source_id = ?`, nodeID, kinds)
 }
@@ -115,10 +113,6 @@ func (d *DB) listEdges(endpointClause string, nodeID int64, kinds []string) ([]E
 // DeleteSynthesizedEdges removes edges created by synthesis passes so a re-run
 // is idempotent and doesn't keep stale dispatcher→callback links. Resolution
 // heuristic edges (no synthesizedBy metadata) are left alone.
-
-// DeleteSynthesizedEdges removes edges created by synthesis passes so a re-run
-// is idempotent and doesn't keep stale dispatcher→callback links. Resolution
-// heuristic edges (no synthesizedBy metadata) are left alone.
 func (d *DB) DeleteSynthesizedEdges() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -130,14 +124,6 @@ func (d *DB) DeleteSynthesizedEdges() error {
 	`)
 	return err
 }
-
-// ReplaceSynthesizedEdges atomically replaces all synthesized edges in one
-// transaction (F2): it deletes the old heuristic/synthesizedBy edges and then
-// upserts the new edge set. Previously the delete and the per-edge upserts ran
-// in separate autocommit transactions, so a mid-batch failure left a partially
-// cleared graph and, between delete and first upsert, a window where the
-// synthesized edges were missing entirely. On any error the whole batch rolls
-// back and the old synthesized edges stay intact.
 
 // ReplaceSynthesizedEdges atomically replaces all synthesized edges in one
 // transaction (F2): it deletes the old heuristic/synthesizedBy edges and then
@@ -192,19 +178,7 @@ const structuralEdgeSQL = `('calls','references','bridge')`
 // silently dropped (no flag available on these signatures) — the cap is far
 // above practical hotspot sizes, it bounds memory, not results. A var so
 // tests can lower it.
-
-// graphQueryRowLimit bounds graph-query results (callers/callees/impact). Hot
-// symbols can have tens of thousands of edges; without a cap a single query
-// would load them all (with bodies) under RLock. Rows beyond the cap are
-// silently dropped (no flag available on these signatures) — the cap is far
-// above practical hotspot sizes, it bounds memory, not results. A var so
-// tests can lower it.
 var graphQueryRowLimit = 50_000
-
-// GetCallers returns nodes that call/reference the given node ID.
-// Includes: call sites, route→handler references (reversed), bridge sources.
-// A3: multiple call-site edges to the same node exist now; callers are the
-// DISTINCT source nodes (use GetIncomingEdges for per-call-site rows).
 
 // GetCallers returns nodes that call/reference the given node ID.
 // Includes: call sites, route→handler references (reversed), bridge sources.
@@ -233,10 +207,6 @@ func (d *DB) GetCallers(nodeID int64) ([]Node, error) {
 // GetCallees returns nodes that the given node ID calls/references.
 // For a route node this surfaces the handler via references edges.
 // A3: distinct callee nodes (per-call-site rows via GetOutgoingEdges).
-
-// GetCallees returns nodes that the given node ID calls/references.
-// For a route node this surfaces the handler via references edges.
-// A3: distinct callee nodes (per-call-site rows via GetOutgoingEdges).
 func (d *DB) GetCallees(nodeID int64) ([]Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -258,13 +228,9 @@ func (d *DB) GetCallees(nodeID int64) ([]Node, error) {
 }
 
 // GetCallersWithKind is like GetCallers but also returns the edge kind per hit.
-
-// GetCallersWithKind is like GetCallers but also returns the edge kind per hit.
 func (d *DB) GetCallersWithKind(nodeID int64) ([]NodeRef, error) {
 	return d.GetCallersWithKindContext(context.Background(), nodeID)
 }
-
-// GetCallersWithKindContext is the context-aware variant of GetCallersWithKind.
 
 // GetCallersWithKindContext is the context-aware variant of GetCallersWithKind.
 func (d *DB) GetCallersWithKindContext(ctx context.Context, nodeID int64) ([]NodeRef, error) {
@@ -290,13 +256,9 @@ func (d *DB) GetCallersWithKindContext(ctx context.Context, nodeID int64) ([]Nod
 }
 
 // GetCalleesWithKind is like GetCallees but also returns the edge kind per hit.
-
-// GetCalleesWithKind is like GetCallees but also returns the edge kind per hit.
 func (d *DB) GetCalleesWithKind(nodeID int64) ([]NodeRef, error) {
 	return d.GetCalleesWithKindContext(context.Background(), nodeID)
 }
-
-// GetCalleesWithKindContext is the context-aware variant of GetCalleesWithKind.
 
 // GetCalleesWithKindContext is the context-aware variant of GetCalleesWithKind.
 func (d *DB) GetCalleesWithKindContext(ctx context.Context, nodeID int64) ([]NodeRef, error) {
@@ -320,8 +282,6 @@ func (d *DB) GetCalleesWithKindContext(ctx context.Context, nodeID int64) ([]Nod
 }
 
 // NodeRef is a node plus the edge kind that connected it.
-
-// NodeRef is a node plus the edge kind that connected it.
 type NodeRef struct {
 	Node
 	EdgeKind string
@@ -338,10 +298,6 @@ func scanNodeRefs(rows *sql.Rows) ([]NodeRef, error) {
 	}
 	return out, rows.Err()
 }
-
-// GetImpact returns files that reference the given node, with match counts.
-// A3: COUNT(*) counts call sites (one source may hit the node many times);
-// for distinct referencing files use GetFileDependents.
 
 // GetImpact returns files that reference the given node, with match counts.
 // A3: COUNT(*) counts call sites (one source may hit the node many times);

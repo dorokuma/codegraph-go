@@ -44,16 +44,9 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 
 // DeleteFile removes a file from the index.
 // path may be absolute (watcher) or relative; both map to the storage key.
-
-// DeleteFile removes a file from the index.
-// path may be absolute (watcher) or relative; both map to the storage key.
 func (o *Orchestrator) DeleteFile(path string) error {
 	return o.db.ClearFile(o.storePath(path))
 }
-
-// DeleteTree removes every indexed file whose storage key is path or lives
-// under path/ (directory rename/delete). ListFilesInDir only matches
-// direct children and cannot prune a whole tree.
 
 // DeleteTree removes every indexed file whose storage key is path or lives
 // under path/ (directory rename/delete). ListFilesInDir only matches
@@ -86,10 +79,6 @@ func (o *Orchestrator) DeleteTree(path string) error {
 	}
 	return errors.Join(errs...)
 }
-
-// pruneMissingFiles drops files-table rows (and their nodes) that are no
-// longer among this pass's walk jobs. Caller must not invoke this when
-// the walk itself failed — an incomplete job set would wipe the index.
 
 // pruneMissingFiles drops files-table rows (and their nodes) that are no
 // longer among this pass's walk jobs. Caller must not invoke this when

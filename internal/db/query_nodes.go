@@ -55,8 +55,6 @@ func (d *DB) UpsertNode(n *Node) (int64, error) {
 }
 
 // nullInt stores 0 columns as NULL so "unset" stays distinguishable later if needed.
-
-// nullInt stores 0 columns as NULL so "unset" stays distinguishable later if needed.
 func nullInt(v int) interface{} {
 	if v == 0 {
 		return nil
@@ -73,8 +71,6 @@ const nodeSelectCols = `id, kind, name, file, line, end_line, body, language,
 	visibility, is_exported, return_type`
 
 // nodeLightSelectCols is the lightweight column list for Node scans omitting body.
-
-// nodeLightSelectCols is the lightweight column list for Node scans omitting body.
 const nodeLightSelectCols = `id, kind, name, file, line, end_line, '' AS body, language,
 	qualified_name, signature, docstring, start_column, end_column,
 	visibility, is_exported, return_type`
@@ -87,15 +83,11 @@ const nodeLightSelectCols = `id, kind, name, file, line, end_line, '' AS body, l
 var getNodesByFileCap = 10_000
 
 // SetGetNodesByFileCapForTest overrides getNodesByFileCap for testing and returns the previous value.
-
-// SetGetNodesByFileCapForTest overrides getNodesByFileCap for testing and returns the previous value.
 func SetGetNodesByFileCapForTest(newCap int) int {
 	old := getNodesByFileCap
 	getNodesByFileCap = newCap
 	return old
 }
-
-// GetNodesByFile returns nodes defined in a file path WITH bodies, capped at getNodesByFileCap.
 
 // GetNodesByFile returns nodes defined in a file path WITH bodies, capped at getNodesByFileCap.
 func (d *DB) GetNodesByFile(file string) ([]Node, error) {
@@ -104,16 +96,10 @@ func (d *DB) GetNodesByFile(file string) ([]Node, error) {
 
 // GetNodesByFileContext is the context-aware variant of GetNodesByFile (loads bodies).
 // Delegates to the truncation-aware limited variant; the flag is discarded.
-
-// GetNodesByFileContext is the context-aware variant of GetNodesByFile (loads bodies).
-// Delegates to the truncation-aware limited variant; the flag is discarded.
 func (d *DB) GetNodesByFileContext(ctx context.Context, file string) ([]Node, error) {
 	nodes, _, err := d.GetNodesByFileBodiesLimitedContext(ctx, file, getNodesByFileCap)
 	return nodes, err
 }
-
-// GetNodesByFileLightLimitedContext returns up to limit nodes defined in file (omitting body)
-// and reports whether more nodes exist for that file.
 
 // GetNodesByFileLightLimitedContext returns up to limit nodes defined in file (omitting body)
 // and reports whether more nodes exist for that file.
@@ -145,23 +131,15 @@ func (d *DB) GetNodesByFileLightLimitedContext(ctx context.Context, file string,
 }
 
 // GetNodesByFileLight returns nodes defined in a file path without bodies, capped at getNodesByFileCap.
-
-// GetNodesByFileLight returns nodes defined in a file path without bodies, capped at getNodesByFileCap.
 func (d *DB) GetNodesByFileLight(file string) ([]Node, error) {
 	return d.GetNodesByFileLightContext(context.Background(), file)
 }
-
-// GetNodesByFileLightContext is the context-aware variant of GetNodesByFileLight (omits body).
 
 // GetNodesByFileLightContext is the context-aware variant of GetNodesByFileLight (omits body).
 func (d *DB) GetNodesByFileLightContext(ctx context.Context, file string) ([]Node, error) {
 	nodes, _, err := d.GetNodesByFileLightLimitedContext(ctx, file, getNodesByFileCap)
 	return nodes, err
 }
-
-// GetNodesByFileBodiesLimitedContext returns up to limit nodes defined in
-// file WITH bodies and reports whether more nodes exist for that file.
-// limit <= 0 defaults to getNodesByFileCap.
 
 // GetNodesByFileBodiesLimitedContext returns up to limit nodes defined in
 // file WITH bodies and reports whether more nodes exist for that file.
@@ -195,21 +173,14 @@ func (d *DB) GetNodesByFileBodiesLimitedContext(ctx context.Context, file string
 
 // GetNodesByFileBodiesLimited is the background-context variant of
 // GetNodesByFileBodiesLimitedContext.
-
-// GetNodesByFileBodiesLimited is the background-context variant of
-// GetNodesByFileBodiesLimitedContext.
 func (d *DB) GetNodesByFileBodiesLimited(file string, limit int) ([]Node, bool, error) {
 	return d.GetNodesByFileBodiesLimitedContext(context.Background(), file, limit)
 }
 
 // ForEachNodeByFileLight iterates through all nodes in file without bodies using keyset pagination.
-
-// ForEachNodeByFileLight iterates through all nodes in file without bodies using keyset pagination.
 func (d *DB) ForEachNodeByFileLight(file string, fn func(n Node) error) error {
 	return d.ForEachNodeByFileLightContext(context.Background(), file, fn)
 }
-
-// ForEachNodeByFileLightContext iterates through all nodes in file without bodies using keyset pagination.
 
 // ForEachNodeByFileLightContext iterates through all nodes in file without bodies using keyset pagination.
 func (d *DB) ForEachNodeByFileLightContext(ctx context.Context, file string, fn func(n Node) error) error {
@@ -253,18 +224,12 @@ func (d *DB) ForEachNodeByFileLightContext(ctx context.Context, file string, fn 
 }
 
 // getNodeByNameCap bounds GetNodeByName results to prevent unbounded reads.
-
-// getNodeByNameCap bounds GetNodeByName results to prevent unbounded reads.
 var getNodeByNameCap = 10_000
-
-// GetNodeByNameLimited finds nodes by name (exact match) up to limit, and reports truncation.
 
 // GetNodeByNameLimited finds nodes by name (exact match) up to limit, and reports truncation.
 func (d *DB) GetNodeByNameLimited(name string, limit int) ([]Node, bool, error) {
 	return d.GetNodeByNameLimitedContext(context.Background(), name, limit)
 }
-
-// GetNodeByNameLimitedContext finds nodes by name up to limit, and reports truncation.
 
 // GetNodeByNameLimitedContext finds nodes by name up to limit, and reports truncation.
 func (d *DB) GetNodeByNameLimitedContext(ctx context.Context, name string, limit int) ([]Node, bool, error) {
@@ -295,13 +260,9 @@ func (d *DB) GetNodeByNameLimitedContext(ctx context.Context, name string, limit
 }
 
 // GetNodeByName finds nodes by name (exact match).
-
-// GetNodeByName finds nodes by name (exact match).
 func (d *DB) GetNodeByName(name string) ([]Node, error) {
 	return d.GetNodeByNameContext(context.Background(), name)
 }
-
-// GetNodeByNameContext is the context-aware variant of GetNodeByName.
 
 // GetNodeByNameContext is the context-aware variant of GetNodeByName.
 func (d *DB) GetNodeByNameContext(ctx context.Context, name string) ([]Node, error) {
@@ -310,13 +271,9 @@ func (d *DB) GetNodeByNameContext(ctx context.Context, name string) ([]Node, err
 }
 
 // ForEachNodeByName iterates through all nodes matching name using keyset pagination.
-
-// ForEachNodeByName iterates through all nodes matching name using keyset pagination.
 func (d *DB) ForEachNodeByName(name string, fn func(n Node) error) error {
 	return d.ForEachNodeByNameContext(context.Background(), name, fn)
 }
-
-// ForEachNodeByNameContext iterates through all nodes matching name using keyset pagination.
 
 // ForEachNodeByNameContext iterates through all nodes matching name using keyset pagination.
 func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(n Node) error) error {
@@ -360,8 +317,6 @@ func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(
 }
 
 // GetNodeByID loads one node by primary key.
-
-// GetNodeByID loads one node by primary key.
 func (d *DB) GetNodeByID(id int64) (*Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -374,17 +329,7 @@ func (d *DB) GetNodeByID(id int64) (*Node, error) {
 // hundreds of thousands of rows (each with a body up to MaxBodyChars) in very
 // large indexes; whole-graph synthesis passes call this per kind. A var so
 // tests can lower it to exercise truncation.
-
-// getNodesByKindCap bounds GetNodesByKind results. A single kind can hold
-// hundreds of thousands of rows (each with a body up to MaxBodyChars) in very
-// large indexes; whole-graph synthesis passes call this per kind. A var so
-// tests can lower it to exercise truncation.
 var getNodesByKindCap = 50_000
-
-// GetNodesByKind returns nodes of a given kind (for whole-graph synthesis
-// passes), capped at getNodesByKindCap rows to bound memory and RLock hold
-// time. Callers that need the full set with explicit truncation reporting
-// should use GetNodesByKindLimited.
 
 // GetNodesByKind returns nodes of a given kind (for whole-graph synthesis
 // passes), capped at getNodesByKindCap rows to bound memory and RLock hold
@@ -394,10 +339,6 @@ func (d *DB) GetNodesByKind(kind string) ([]Node, error) {
 	nodes, _, err := d.GetNodesByKindLimited(kind, getNodesByKindCap)
 	return nodes, err
 }
-
-// GetNodesByKindLimited returns up to limit nodes of a given kind (ordered by
-// id for deterministic truncation) plus whether more rows exist. limit <= 0
-// falls back to the getNodesByKindCap default.
 
 // GetNodesByKindLimited returns up to limit nodes of a given kind (ordered by
 // id for deterministic truncation) plus whether more rows exist. limit <= 0
@@ -482,10 +423,6 @@ func escapeFTS5Query(query string) string {
 // ftsNameOrBodyQuery wraps escapeFTS5Query tokens so MATCH only hits the
 // name and body columns, not language (searching "go" must not match every
 // Go node). Each token becomes (name:tok OR body:tok); multiple tokens AND.
-
-// ftsNameOrBodyQuery wraps escapeFTS5Query tokens so MATCH only hits the
-// name and body columns, not language (searching "go" must not match every
-// Go node). Each token becomes (name:tok OR body:tok); multiple tokens AND.
 func ftsNameOrBodyQuery(escaped string) string {
 	escaped = strings.TrimSpace(escaped)
 	if escaped == "" {
@@ -503,13 +440,9 @@ func ftsNameOrBodyQuery(escaped string) string {
 }
 
 // FullTextSearch performs a full-text search using FTS5.
-
-// FullTextSearch performs a full-text search using FTS5.
 func (d *DB) FullTextSearch(query string, limit int) ([]Node, error) {
 	return d.FullTextSearchContext(context.Background(), query, limit)
 }
-
-// FullTextSearchContext is the context-aware variant of FullTextSearch.
 
 // FullTextSearchContext is the context-aware variant of FullTextSearch.
 func (d *DB) FullTextSearchContext(ctx context.Context, query string, limit int) ([]Node, error) {
@@ -546,17 +479,9 @@ func (d *DB) FullTextSearchContext(ctx context.Context, query string, limit int)
 // []Node shape but WITHOUT bodies — bodies can be up to MaxBodyChars each and
 // dominate the memory cost of a result set. Use FullTextSearch when the body
 // is actually needed.
-
-// FullTextSearchRefs is a lightweight FullTextSearch for callers that only
-// need file:line references (search result listings). It returns the same
-// []Node shape but WITHOUT bodies — bodies can be up to MaxBodyChars each and
-// dominate the memory cost of a result set. Use FullTextSearch when the body
-// is actually needed.
 func (d *DB) FullTextSearchRefs(query string, limit int) ([]Node, error) {
 	return d.FullTextSearchRefsContext(context.Background(), query, limit)
 }
-
-// FullTextSearchRefsContext is the context-aware variant of FullTextSearchRefs.
 
 // FullTextSearchRefsContext is the context-aware variant of FullTextSearchRefs.
 func (d *DB) FullTextSearchRefsContext(ctx context.Context, query string, limit int) ([]Node, error) {
@@ -589,8 +514,6 @@ func (d *DB) FullTextSearchRefsContext(ctx context.Context, query string, limit 
 	defer rows.Close()
 	return scanNodes(rows)
 }
-
-// rowScanner is shared by *sql.Rows and *sql.Row.
 
 // rowScanner is shared by *sql.Rows and *sql.Row.
 type rowScanner interface {

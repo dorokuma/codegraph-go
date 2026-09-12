@@ -39,8 +39,9 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 	st.Retried = len(retry)
 
 	batch := append(pending, retry...)
+	w := newEdgeWriter(database)
 	for _, r := range batch {
-		ok, err := resolveOne(database, workdir, r)
+		plan, err := resolveOne(database, workdir, r)
 		if err != nil {
 			// A per-ref resolution error is a failure for THIS ref this pass:
 			// count it and park the ref as failed (failed rows are retried by
@@ -48,30 +49,33 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 			// semantics are preserved and stats no longer under-report).
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
 			st.Failed++
-			tail := r.NameTail
-			if tail == "" {
-				tail = nameTail(r.ReferenceName)
-			}
-			_ = database.MarkUnresolvedFailed(r.ID, tail)
+			markRefFailed(database, r)
 			continue
 		}
-		if ok {
-			st.Resolved++
-		} else {
+		if plan == nil {
 			st.Failed++
-			tail := r.NameTail
-			if tail == "" {
-				tail = nameTail(r.ReferenceName)
-			}
-			_ = database.MarkUnresolvedFailed(r.ID, tail)
+			markRefFailed(database, r)
+			continue
 		}
+		w.add(*plan)
+	}
+	w.flush()
+	st.Resolved += w.resolved
+	for _, p := range w.failed {
+		st.Failed++
+		markRefFailed(database, p.ref)
 	}
 	return st, nil
 }
 
-func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, error) {
+// resolveOne decides the resolution outcome for one ref without writing:
+// it returns the plan to persist (edge upsert + pending-ref delete), nil
+// when the ref has no resolvable match (the caller parks it as failed), or
+// an error when the read-side lookups fail. Persistence itself is batched
+// through edgeWriter so a pass does not commit per ref.
+func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan, error) {
 	if r.FromNode == 0 || r.ReferenceName == "" {
-		return false, nil
+		return nil, nil
 	}
 	kind := r.ReferenceKind
 	if kind == "" {
@@ -81,10 +85,10 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 
 	candidates, err := CollectCandidates(database, r.ReferenceName)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if len(candidates) == 0 {
-		return false, nil
+		return nil, nil
 	}
 
 	// Never link a node to itself.
@@ -96,7 +100,7 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 	}
 	candidates = filtered
 	if len(candidates) == 0 {
-		return false, nil
+		return nil, nil
 	}
 
 	lang := r.Language
@@ -106,7 +110,7 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 	if imp, ok := FilterByImports(database, workdir, fromFile, lang, candidates); ok {
 		m := MatchName(imp, r.ReferenceName, fromFile, preferCall)
 		if m.TargetID != 0 {
-			return writeEdge(database, r, m.TargetID, kind, ProvImport)
+			return &edgePlan{ref: r, targetID: m.TargetID, kind: kind, provenance: ProvImport}, nil
 		}
 	}
 
@@ -141,30 +145,121 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (bool, erro
 		}
 	}
 	if m.TargetID == 0 {
-		return false, nil
+		return nil, nil
 	}
 	if m.Provenance == "" {
 		m.Provenance = ProvHeuristic
 	}
-	return writeEdge(database, r, m.TargetID, kind, m.Provenance)
+	return &edgePlan{ref: r, targetID: m.TargetID, kind: kind, provenance: m.Provenance}, nil
 }
 
-func writeEdge(database *db.DB, r db.UnresolvedRef, targetID int64, kind, provenance string) (bool, error) {
-	if _, err := database.UpsertEdge(&db.Edge{
-		SourceID:   r.FromNode,
-		TargetID:   targetID,
-		Kind:       kind,
-		File:       r.FilePath,
-		Line:       r.Line,
-		Col:        r.Col,
-		Provenance: provenance,
+// resolveBatchSize is how many resolved refs are persisted per write
+// transaction. Batching replaced two implicit autocommit transactions per
+// ref (edge upsert + ref delete): a full-table ResolveAll over a 100k-ref
+// backlog used to issue ~200k commits, each an fsync under the single-writer
+// lock. 500 keeps each transaction (and its lock hold) short while
+// amortizing the commit cost ~1000x. A var so tests can shrink it.
+var resolveBatchSize = 500
+
+// edgePlan is one resolved ref whose persistence is still pending: upsert
+// the edge, then delete the unresolved_ref.
+type edgePlan struct {
+	ref        db.UnresolvedRef
+	targetID   int64
+	kind       string
+	provenance string
+}
+
+// edgeWriter accumulates resolved refs and persists them in batched write
+// transactions (db.ApplyResolvedRefs) instead of two autocommit writes per
+// ref. Flush keeps the per-ref contract of the pre-batching path: when the
+// batch transaction fails, every plan in it is retried individually to
+// isolate the offending row, so one bad ref can neither fail the whole pass
+// nor take good refs down with it. Persisted plans are counted in resolved;
+// plans that still fail the per-ref retry are recorded in failed (the
+// caller logs, counts them as failures and parks their refs).
+type edgeWriter struct {
+	database *db.DB
+	batch    []edgePlan
+	resolved int
+	failed   []edgePlan
+}
+
+func newEdgeWriter(database *db.DB) *edgeWriter {
+	return &edgeWriter{database: database, batch: make([]edgePlan, 0, resolveBatchSize)}
+}
+
+// add queues a plan, flushing a full batch first when the buffer is at cap.
+func (w *edgeWriter) add(p edgePlan) {
+	w.batch = append(w.batch, p)
+	if len(w.batch) >= resolveBatchSize {
+		w.flush()
+	}
+}
+
+// applyOne persists a single plan with the pre-batching per-ref semantics:
+// the edge is upserted, then the pending ref row is deleted.
+func (w *edgeWriter) applyOne(p edgePlan) error {
+	if _, err := w.database.UpsertEdge(&db.Edge{
+		SourceID:   p.ref.FromNode,
+		TargetID:   p.targetID,
+		Kind:       p.kind,
+		File:       p.ref.FilePath,
+		Line:       p.ref.Line,
+		Col:        p.ref.Col,
+		Provenance: p.provenance,
 	}); err != nil {
-		return false, err
+		return err
 	}
-	if err := database.DeleteUnresolvedRef(r.ID); err != nil {
-		return false, err
+	return w.database.DeleteUnresolvedRef(p.ref.ID)
+}
+
+// flush persists the buffered plans atomically: the whole batch upserts and
+// deletes inside one transaction, so a crash mid-batch leaves the graph
+// consistent (either both sides of every ref landed or none did). If the
+// batch fails, each plan is retried individually so a single bad row (e.g.
+// an edge violating a constraint) is isolated instead of poisoning the batch.
+func (w *edgeWriter) flush() {
+	if len(w.batch) == 0 {
+		return
 	}
-	return true, nil
+	refs := make([]db.ResolvedRef, len(w.batch))
+	for i, p := range w.batch {
+		refs[i] = db.ResolvedRef{
+			UnresolvedID: p.ref.ID,
+			Edge: db.Edge{
+				SourceID:   p.ref.FromNode,
+				TargetID:   p.targetID,
+				Kind:       p.kind,
+				File:       p.ref.FilePath,
+				Line:       p.ref.Line,
+				Col:        p.ref.Col,
+				Provenance: p.provenance,
+			},
+		}
+	}
+	if err := w.database.ApplyResolvedRefs(refs); err != nil {
+		for _, p := range w.batch {
+			if w.applyOne(p) == nil {
+				w.resolved++
+			} else {
+				w.failed = append(w.failed, p)
+			}
+		}
+	} else {
+		w.resolved += len(w.batch)
+	}
+	w.batch = w.batch[:0]
+}
+
+// markRefFailed parks a ref as failed for later retry passes, backfilling an
+// empty stored name_tail from the reference name.
+func markRefFailed(database *db.DB, r db.UnresolvedRef) {
+	tail := r.NameTail
+	if tail == "" {
+		tail = nameTail(r.ReferenceName)
+	}
+	_ = database.MarkUnresolvedFailed(r.ID, tail)
 }
 
 // ResolveForFiles re-runs resolution focusing on refs from the given files
@@ -254,35 +349,36 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	}
 	// Dedupe by id
 	seen := map[int64]bool{}
+	w := newEdgeWriter(database)
 	for _, r := range batch {
 		if seen[r.ID] {
 			continue
 		}
 		seen[r.ID] = true
-		ok, err := resolveOne(database, workdir, r)
+		plan, err := resolveOne(database, workdir, r)
 		if err != nil {
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
 			st.Failed++
 			if r.Status == "pending" || r.Status == "" {
-				tail := r.NameTail
-				if tail == "" {
-					tail = nameTail(r.ReferenceName)
-				}
-				_ = database.MarkUnresolvedFailed(r.ID, tail)
+				markRefFailed(database, r)
 			}
 			continue
 		}
-		if ok {
-			st.Resolved++
-		} else {
+		if plan == nil {
 			st.Failed++
 			if r.Status == "pending" || r.Status == "" {
-				tail := r.NameTail
-				if tail == "" {
-					tail = nameTail(r.ReferenceName)
-				}
-				_ = database.MarkUnresolvedFailed(r.ID, tail)
+				markRefFailed(database, r)
 			}
+			continue
+		}
+		w.add(*plan)
+	}
+	w.flush()
+	st.Resolved += w.resolved
+	for _, p := range w.failed {
+		st.Failed++
+		if p.ref.Status == "pending" || p.ref.Status == "" {
+			markRefFailed(database, p.ref)
 		}
 	}
 	return st, nil

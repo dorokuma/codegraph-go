@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -171,6 +173,26 @@ func (d *Daemon) Stop(reason string) {
 	d.cleanupArtifacts()
 }
 
+// isTemporaryAcceptError reports whether an accept error is transient and
+// the accept loop should keep serving: a timeout, or an underlying errno the
+// runtime classes as temporary (EINTR, EMFILE, ENFILE, EAGAIN/ETIMEDOUT).
+// It replaces the deprecated net.Error.Temporary with equivalent semantics
+// for accept errors.
+func isTemporaryAcceptError(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		return false
+	}
+	if opErr.Timeout() {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(opErr.Err, &errno) {
+		return errno.Temporary()
+	}
+	return false
+}
+
 func (d *Daemon) acceptLoop() {
 	defer d.wg.Done()
 	var permErrs int
@@ -180,7 +202,7 @@ func (d *Daemon) acceptLoop() {
 			if d.stopping.Load() || d.ctx.Err() != nil {
 				return
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			if isTemporaryAcceptError(err) {
 				// Temporary accept errors: keep going.
 				log.Printf("daemon accept (temporary): %v", err)
 				permErrs = 0

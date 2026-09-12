@@ -76,8 +76,6 @@ type Orchestrator struct {
 }
 
 // NewOrchestrator creates a new extraction orchestrator.
-
-// NewOrchestrator creates a new extraction orchestrator.
 func NewOrchestrator(database *db.DB, workdir string) *Orchestrator {
 	return &Orchestrator{db: database, workdir: workdir}
 }
@@ -85,16 +83,9 @@ func NewOrchestrator(database *db.DB, workdir string) *Orchestrator {
 // SetDone wires a shutdown signal channel into the index loops. After the
 // channel is closed, in-flight index passes wind down within one unit of work
 // (one file, one walk callback).
-
-// SetDone wires a shutdown signal channel into the index loops. After the
-// channel is closed, in-flight index passes wind down within one unit of work
-// (one file, one walk callback).
 func (o *Orchestrator) SetDone(done <-chan struct{}) {
 	o.done = done
 }
-
-// interrupted reports whether the shutdown channel has been closed. nil
-// channel → never interrupted.
 
 // interrupted reports whether the shutdown channel has been closed. nil
 // channel → never interrupted.
@@ -109,8 +100,6 @@ func (o *Orchestrator) interrupted() bool {
 		return false
 	}
 }
-
-// SetForceReindex makes the next IndexAll/IndexChanges ignore mtime short-circuit.
 
 // SetForceReindex makes the next IndexAll/IndexChanges ignore mtime short-circuit.
 func (o *Orchestrator) SetForceReindex(v bool) {
@@ -137,13 +126,6 @@ const maxIndexFileSize = 1 * 1024 * 1024
 // success: the schema revision must not be marked, or the next startup would
 // trust a half index (NeedsRebuild would stay false).
 // errors.Is(err, ErrIndexInterrupted) identifies it through any wrapping.
-
-// ErrIndexInterrupted aborts an in-flight index pass when the shutdown
-// channel (SetDone) is closed. Callers must treat it as "shutdown happened;
-// partial results are on disk" — never as a retryable failure and never as
-// success: the schema revision must not be marked, or the next startup would
-// trust a half index (NeedsRebuild would stay false).
-// errors.Is(err, ErrIndexInterrupted) identifies it through any wrapping.
 var ErrIndexInterrupted = errors.New("index interrupted by shutdown")
 
 // ErrKeepOldIndex marks a file whose extraction failed but whose previous
@@ -152,18 +134,7 @@ var ErrIndexInterrupted = errors.New("index interrupted by shutdown")
 // partial failure (M7) instead of a hard error, and because the file meta is
 // deliberately NOT refreshed on this path (M2) the next index pass retries
 // the file — a broken file self-heals once the parser can read it again.
-
-// ErrKeepOldIndex marks a file whose extraction failed but whose previous
-// index was kept (A4/S1). It is non-fatal: the pass continues with other
-// files and the old symbols stay queryable. runIndexJobs counts it as a
-// partial failure (M7) instead of a hard error, and because the file meta is
-// deliberately NOT refreshed on this path (M2) the next index pass retries
-// the file — a broken file self-heals once the parser can read it again.
 var ErrKeepOldIndex = errors.New("extraction failed, keeping old index")
-
-// visitIndexable walks the workspace once, applying the shared skip rules, and
-// invokes fn for each language-supported source file under the size limit.
-// Walk errors on individual paths are skipped so one bad path cannot abort the scan.
 
 // visitIndexable walks the workspace once, applying the shared skip rules, and
 // invokes fn for each language-supported source file under the size limit.
@@ -203,24 +174,9 @@ func (o *Orchestrator) visitIndexable(fn func(path string, info os.FileInfo, lan
 }
 
 // storePath is the workdir-relative index key for a filesystem path.
-
-// storePath is the workdir-relative index key for a filesystem path.
 func (o *Orchestrator) storePath(path string) string {
 	return db.StoragePath(o.workdir, path)
 }
-
-// indexIfNeeded reindexes path when the DB says it is stale.
-// Returns (1, nodeCount) on success; (0,0,nil) when skipped; a non-nil error
-// when the file failed to index (callers aggregate errors, keep going — A8).
-// path is a filesystem path (usually absolute from Walk/watcher); the DB key is relative.
-//
-// A5 incremental gate: when size+mtime are unchanged the cheap metadata check
-// cannot see same-size same-mtime edits, so the file content is hashed and
-// compared with the stored hash — identical content skips, anything else
-// reindexes. Metadata changes reindex directly without an extra read.
-//
-// F4: the bytes read for the content-hash gate are handed to indexFile so the
-// file is never read twice on the same pass.
 
 // indexIfNeeded reindexes path when the DB says it is stale.
 // Returns (1, nodeCount) on success; (0,0,nil) when skipped; a non-nil error
@@ -276,9 +232,6 @@ func (o *Orchestrator) indexIfNeeded(path string, info os.FileInfo, lang string)
 
 // indexWorkerCount picks how many files to extract/index in parallel.
 // DB writes are serialized by db.DB's mutex; only CPU-bound extract runs free.
-
-// indexWorkerCount picks how many files to extract/index in parallel.
-// DB writes are serialized by db.DB's mutex; only CPU-bound extract runs free.
 func indexWorkerCount() int {
 	return config.IndexWorkers()
 }
@@ -288,10 +241,6 @@ type indexJob struct {
 	info os.FileInfo
 	lang string
 }
-
-// runIndexJobs fans out indexIfNeeded across a small worker pool.
-// Errors are aggregated (A8): indexing continues file-by-file, partial results
-// stay written, and the joined error is returned at the end.
 
 // runIndexJobs fans out indexIfNeeded across a small worker pool.
 // Errors are aggregated (A8): indexing continues file-by-file, partial results
@@ -410,11 +359,6 @@ func (o *Orchestrator) runIndexJobs(jobs []indexJob, onEach func(done, total int
 // An interrupted walk returns the partial job list wrapped in
 // ErrIndexInterrupted; the caller surfaces the sentinel instead of treating
 // the partial list as a complete pass.
-
-// collectIndexJobs walks the workspace once into a job list.
-// An interrupted walk returns the partial job list wrapped in
-// ErrIndexInterrupted; the caller surfaces the sentinel instead of treating
-// the partial list as a complete pass.
 func (o *Orchestrator) collectIndexJobs() (jobs []indexJob, walkErrs int, err error) {
 	walkErrs, err = o.visitIndexable(func(path string, info os.FileInfo, lang string) error {
 		jobs = append(jobs, indexJob{path: path, info: info, lang: lang})
@@ -422,15 +366,6 @@ func (o *Orchestrator) collectIndexJobs() (jobs []indexJob, walkErrs int, err er
 	})
 	return jobs, walkErrs, err
 }
-
-// IndexAll indexes all files in the workspace (skips unchanged unless force).
-// A8: per-file failures are aggregated — indexing continues, partial results
-// are kept, and a non-nil error is returned when any file failed.
-// Shutdown (done closed) winds the pass down within one unit of work and
-// skips the resolution/synthesis tail. Every interrupted exit returns
-// ErrIndexInterrupted (possibly joined with per-file errors) so callers can
-// tell "shutdown aborted the pass" from a clean partial success — and must
-// NOT mark the schema revision on it.
 
 // IndexAll indexes all files in the workspace (skips unchanged unless force).
 // A8: per-file failures are aggregated — indexing continues, partial results
@@ -499,10 +434,6 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 // runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
 // When files is non-nil only refs related to those files are scrubbed;
 // nil means scrub all. SynthesizeAll is always full-table (its bottom pass).
-
-// runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
-// When files is non-nil only refs related to those files are scrubbed;
-// nil means scrub all. SynthesizeAll is always full-table (its bottom pass).
 func (o *Orchestrator) runSynthesis(files []string) error {
 	// Drop pure-noise failed/pending refs with no project symbol first.
 	o.scrubNoise(files)
@@ -520,10 +451,6 @@ func (o *Orchestrator) runSynthesis(files []string) error {
 // scrubNoise drops failed/pending pure-noise refs with no matching symbol.
 // When files is non-nil, only refs belonging to those files are examined;
 // nil means scrub all. hasProjectSymbol results are cached per-call.
-
-// scrubNoise drops failed/pending pure-noise refs with no matching symbol.
-// When files is non-nil, only refs belonging to those files are examined;
-// nil means scrub all. hasProjectSymbol results are cached per-call.
 func (o *Orchestrator) scrubNoise(files []string) {
 	n, err := ScrubNoisyFailedRefsForFiles(o.db, files)
 	if err != nil {
@@ -534,8 +461,6 @@ func (o *Orchestrator) scrubNoise(files []string) {
 		log.Printf("scrubbed %d noisy unresolved refs", n)
 	}
 }
-
-// RebuildAll wipes the symbol index and force-reindexes everything.
 
 // RebuildAll wipes the symbol index and force-reindexes everything.
 func (o *Orchestrator) RebuildAll() (int, int, error) {
@@ -572,9 +497,6 @@ func (o *Orchestrator) RebuildAll() (int, int, error) {
 
 // markSchemaRevision records that the index matches the current extractor
 // semantics, honoring the setSchemaRevisionFn test seam.
-
-// markSchemaRevision records that the index matches the current extractor
-// semantics, honoring the setSchemaRevisionFn test seam.
 func (o *Orchestrator) markSchemaRevision() error {
 	if o.setSchemaRevisionFn != nil {
 		return o.setSchemaRevisionFn()
@@ -590,19 +512,12 @@ func hashContent(data []byte) string {
 }
 
 // readFile returns file contents, honoring the readFileFn test seam.
-
-// readFile returns file contents, honoring the readFileFn test seam.
 func (o *Orchestrator) readFile(path string) ([]byte, error) {
 	if o.readFileFn != nil {
 		return o.readFileFn(path)
 	}
 	return os.ReadFile(path)
 }
-
-// PartialFailures returns how many files failed extraction (old index kept,
-// ErrKeepOldIndex) during the most recent index pass. Reset at the start of
-// every IndexAll/IndexAllWithProgress/IndexChanges pass, so the value is only
-// meaningful right after a pass returned (M7).
 
 // PartialFailures returns how many files failed extraction (old index kept,
 // ErrKeepOldIndex) during the most recent index pass. Reset at the start of
@@ -618,23 +533,11 @@ func (o *Orchestrator) PartialFailures() int {
 // IndexFailedFiles list. Only called from IndexChanges (the watcher's
 // reindex path); IndexAll/IndexAllWithProgress run parallel jobs whose
 // failures are reported via PartialFailures only.
-
-// recordIndexFailure appends one failed path to the current pass's
-// IndexFailedFiles list. Only called from IndexChanges (the watcher's
-// reindex path); IndexAll/IndexAllWithProgress run parallel jobs whose
-// failures are reported via PartialFailures only.
 func (o *Orchestrator) recordIndexFailure(path string) {
 	o.partialMu.Lock()
 	o.indexFailed = append(o.indexFailed, path)
 	o.partialMu.Unlock()
 }
-
-// IndexFailedFiles returns the paths that failed during the most recent
-// IndexChanges pass: extraction partial failures (ErrKeepOldIndex), stat
-// errors, and index-delete errors. Reset at the start of every pass like
-// PartialFailures, so the value is only meaningful right after a pass
-// returned. The watcher requeues only these paths instead of burning the
-// whole batch's retry budget on one permanent failure.
 
 // IndexFailedFiles returns the paths that failed during the most recent
 // IndexChanges pass: extraction partial failures (ErrKeepOldIndex), stat
@@ -736,15 +639,7 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 }
 
 // ProgressFunc is called during indexing to report progress.
-
-// ProgressFunc is called during indexing to report progress.
 type ProgressFunc func(phase string, current, total int)
-
-// IndexAllWithProgress indexes all files with progress reporting.
-// Same walk/skip/index path as IndexAll (collect jobs, then parallel pool).
-//
-// Thread safety: onProgress may be called concurrently by multiple worker
-// goroutines. Callers must ensure their implementation is thread-safe.
 
 // IndexAllWithProgress indexes all files with progress reporting.
 // Same walk/skip/index path as IndexAll (collect jobs, then parallel pool).

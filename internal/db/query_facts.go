@@ -31,10 +31,6 @@ func (d *DB) InsertFact(f *Fact) (int64, error) {
 // InsertFactSuperseding inserts f and, when supersedes != 0, marks that
 // existing fact superseded by the new row. Both writes share one transaction
 // so a failed supersede does not leave an orphan insert.
-
-// InsertFactSuperseding inserts f and, when supersedes != 0, marks that
-// existing fact superseded by the new row. Both writes share one transaction
-// so a failed supersede does not leave an orphan insert.
 func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
 	if f == nil {
 		return 0, fmt.Errorf("insert fact: nil fact")
@@ -95,8 +91,6 @@ func (d *DB) InsertFactSuperseding(f *Fact, supersedes int64) (int64, error) {
 }
 
 // GetFactByHash looks up a fact by its content hash. Returns nil when not found.
-
-// GetFactByHash looks up a fact by its content hash. Returns nil when not found.
 func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -108,9 +102,6 @@ func (d *DB) GetFactByHash(hash string) (*Fact, error) {
 	`, hash)
 	return scanFact(row)
 }
-
-// GetFactByHashAndTarget looks up a fact by content hash pinned to one
-// target. Same text on a different file/symbol is a different fact.
 
 // GetFactByHashAndTarget looks up a fact by content hash pinned to one
 // target. Same text on a different file/symbol is a different fact.
@@ -131,18 +122,7 @@ func (d *DB) GetFactByHashAndTarget(hash, file, symbol string) (*Fact, error) {
 // large pile of agent facts, each with content; loading all of them just to
 // show a few would balloon memory (the display layer caps separately). A var
 // so tests can lower it.
-
-// maxFactsByTarget caps GetFactsByTarget rows. A target can accumulate a
-// large pile of agent facts, each with content; loading all of them just to
-// show a few would balloon memory (the display layer caps separately). A var
-// so tests can lower it.
 var maxFactsByTarget = 500
-
-// GetFactsByTarget returns up to maxFactsByTarget facts for a given
-// target_file and optionally target_symbol, newest first, and logs when more
-// exist (truncation is reported so a capped read is never mistaken for the
-// full pile). Pass symbol="" to ignore symbol filter. Callers that need the
-// truncation flag explicitly should use GetFactsByTargetLimited.
 
 // GetFactsByTarget returns up to maxFactsByTarget facts for a given
 // target_file and optionally target_symbol, newest first, and logs when more
@@ -160,11 +140,6 @@ func (d *DB) GetFactsByTarget(file, symbol string) ([]Fact, error) {
 	}
 	return facts, err
 }
-
-// GetFactsByTargetLimited returns up to limit facts for a given target_file
-// and optionally target_symbol, newest first, plus whether more rows exist.
-// limit <= 0 falls back to maxFactsByTarget. Unlike GetFactsByTarget,
-// truncation is explicit here so callers can surface it in responses.
 
 // GetFactsByTargetLimited returns up to limit facts for a given target_file
 // and optionally target_symbol, newest first, plus whether more rows exist.
@@ -202,11 +177,6 @@ func (d *DB) GetFactsByTargetLimited(file, symbol string, limit int) ([]Fact, bo
 	}
 	return facts, truncated, nil
 }
-
-// SearchFacts searches facts by content substring (case-insensitive LIKE),
-// optionally filtered by target_file, target_symbol, status, and max rows.
-// status "" returns all statuses. % and _ in query are matched literally
-// (escaped with ESCAPE '\') so a user search never expands into wildcards.
 
 // SearchFacts searches facts by content substring (case-insensitive LIKE),
 // optionally filtered by target_file, target_symbol, status, and max rows.
@@ -258,12 +228,6 @@ func (d *DB) SearchFacts(query, file, symbol, status string, max int) ([]Fact, e
 // active: a supersede chain must never point at a missing or already-dead
 // fact, or agents reading facts hit a broken link. Validation and the update
 // run in ONE transaction so the invariant holds atomically.
-
-// SupersedeFact marks oldID as superseded and links it to newID (the replacing fact).
-// Both IDs must exist, oldID must be active, and newID must exist and be
-// active: a supersede chain must never point at a missing or already-dead
-// fact, or agents reading facts hit a broken link. Validation and the update
-// run in ONE transaction so the invariant holds atomically.
 func (d *DB) SupersedeFact(oldID, newID int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -301,8 +265,6 @@ func (d *DB) SupersedeFact(oldID, newID int64) error {
 }
 
 // RetractFact marks a fact as retracted (agent later determined it was wrong).
-
-// RetractFact marks a fact as retracted (agent later determined it was wrong).
 func (d *DB) RetractFact(id int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -320,8 +282,6 @@ func (d *DB) RetractFact(id int64) error {
 	}
 	return nil
 }
-
-// scanFact scans a single fact row. Returns nil when the row is sql.ErrNoRows.
 
 // scanFact scans a single fact row. Returns nil when the row is sql.ErrNoRows.
 func scanFact(row *sql.Row) (*Fact, error) {
@@ -342,8 +302,6 @@ func scanFact(row *sql.Row) (*Fact, error) {
 	f.SupersededBy = supersededBy.Int64
 	return &f, nil
 }
-
-// scanFacts scans fact rows.
 
 // scanFacts scans fact rows.
 func scanFacts(rows *sql.Rows) ([]Fact, error) {

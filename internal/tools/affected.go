@@ -282,12 +282,8 @@ func resolveRealAncestor(path string) (string, error) {
 	}
 }
 
-// findImporters finds files that import the given file's package.
-func findImporters(database *db.DB, targetFile string) ([]string, error) {
-	return findImportersCtx(context.Background(), database, targetFile)
-}
-
-// findImportersCtx is like findImporters but accepts a context for cancellation.
+// findImportersCtx finds files that import the package/module of targetFile;
+// the context allows cancellation of the underlying queries.
 func findImportersCtx(ctx context.Context, database *db.DB, targetFile string) ([]string, error) {
 	// Get the package/module path from the file
 	targetPkg := fileToPackage(targetFile)

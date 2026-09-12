@@ -506,5 +506,3 @@ func TestJSXChildPicksSameDirectoryOverFirstWins(t *testing.T) {
 		t.Fatalf("JSX child should pick same-dir Card (%s), got file=%q", wantDir, hit.File)
 	}
 }
-
-

@@ -506,4 +506,3 @@ func TestToolSearchSimpleIdentLightweight(t *testing.T) {
 		t.Fatalf("expected calc.go:3 in search results, got:\n%s", text)
 	}
 }
-

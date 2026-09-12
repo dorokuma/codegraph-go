@@ -425,4 +425,3 @@ func TestNameResolution10001SameNameCandidates(t *testing.T) {
 		t.Fatalf("expected call to CommonService in %s, got %+v", targetFile, callees[0])
 	}
 }
-

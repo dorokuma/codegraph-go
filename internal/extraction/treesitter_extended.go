@@ -10,10 +10,6 @@ import (
 // initExtendedLanguages registers additional language grammars into the
 // tree-sitter extractor factory. The actual grammar imports live in treesitter.go
 // to avoid duplicate import paths.
-
-// initExtendedLanguages registers additional language grammars into the
-// tree-sitter extractor factory. The actual grammar imports live in treesitter.go
-// to avoid duplicate import paths.
 //
 //nolint:unused // called via init() registration pattern
 func init() {

@@ -29,10 +29,6 @@ type ExtractedNode struct {
 // ExtractedEdge represents a relationship found in source code.
 // Prefer imports/extends/implements here. Call sites should go into
 // UnresolvedReference so the resolution pass owns cross-file linking.
-
-// ExtractedEdge represents a relationship found in source code.
-// Prefer imports/extends/implements here. Call sites should go into
-// UnresolvedReference so the resolution pass owns cross-file linking.
 type ExtractedEdge struct {
 	SourceName string
 	TargetName string
@@ -41,9 +37,6 @@ type ExtractedEdge struct {
 	Line       int
 	Col        int
 }
-
-// UnresolvedReference is a named reference awaiting resolution.
-// from-symbol is identified by name (+ optional def line) until nodes are inserted.
 
 // UnresolvedReference is a named reference awaiting resolution.
 // from-symbol is identified by name (+ optional def line) until nodes are inserted.
@@ -60,8 +53,6 @@ type UnresolvedReference struct {
 }
 
 // ExtractResult is the full extractor output (step 2 model).
-
-// ExtractResult is the full extractor output (step 2 model).
 type ExtractResult struct {
 	Nodes []ExtractedNode
 	Edges []ExtractedEdge       // imports etc.; same-file calls may remain briefly
@@ -69,22 +60,14 @@ type ExtractResult struct {
 }
 
 // Extractor extracts symbols and edges from source code.
-
-// Extractor extracts symbols and edges from source code.
 type Extractor struct {
 	language string
 }
 
 // NewExtractor creates an extractor for the given language.
-
-// NewExtractor creates an extractor for the given language.
 func NewExtractor(language string) *Extractor {
 	return &Extractor{language: language}
 }
-
-// Extract parses the source code and returns nodes, structural edges, and pending refs.
-// The regex extractor is best-effort and never fails; the error return keeps
-// the signature uniform with TreeSitterExtractor so callers can fall back.
 
 // Extract parses the source code and returns nodes, structural edges, and pending refs.
 // The regex extractor is best-effort and never fails; the error return keeps
@@ -122,10 +105,6 @@ func (e *Extractor) Extract(source string, filePath string) (ExtractResult, erro
 // normalizeSource strips a UTF-8 BOM and normalizes CRLF line endings to LF
 // so regex anchors (^func …), string comparisons and line-based scanners see
 // the same bytes regardless of file encoding (audit: BOM/CRLF handling).
-
-// normalizeSource strips a UTF-8 BOM and normalizes CRLF line endings to LF
-// so regex anchors (^func …), string comparisons and line-based scanners see
-// the same bytes regardless of file encoding (audit: BOM/CRLF handling).
 func normalizeSource(source string) string {
 	source = strings.TrimPrefix(source, "\uFEFF")
 	if strings.Contains(source, "\r\n") {
@@ -133,9 +112,6 @@ func normalizeSource(source string) string {
 	}
 	return source
 }
-
-// promoteCallsToRefs moves call edges into UnresolvedReference so the
-// orchestrator can same-file-link or park them as pending (step 2).
 
 // promoteCallsToRefs moves call edges into UnresolvedReference so the
 // orchestrator can same-file-link or park them as pending (step 2).
@@ -185,12 +161,6 @@ func promoteCallsToRefs(nodes []ExtractedNode, edges []ExtractedEdge, filePath, 
 // or before the call line, then to the first definition, so a wrong end-line
 // never degrades attribution to a file-level ref. Returns 0 when no definition
 // exists for the name (caller treats the ref as file-level).
-
-// enclosingDefLine picks the definition line of the symbol whose source range
-// contains callLine (innermost wins). Falls back to the nearest definition at
-// or before the call line, then to the first definition, so a wrong end-line
-// never degrades attribution to a file-level ref. Returns 0 when no definition
-// exists for the name (caller treats the ref as file-level).
 func enclosingDefLine(nodes []ExtractedNode, callLine int) int {
 	var contain *ExtractedNode
 	for i := range nodes {
@@ -225,8 +195,6 @@ func enclosingDefLine(nodes []ExtractedNode, callLine int) int {
 }
 
 // NameTail returns the last segment of a dotted/qualified reference name.
-
-// NameTail returns the last segment of a dotted/qualified reference name.
 func NameTail(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -237,12 +205,6 @@ func NameTail(name string) string {
 	}
 	return name
 }
-
-// appendCallEdges scans body lines [startIdx, endIdx) for call sites and
-// appends one calls edge per distinct name:line hit, stamped with the
-// absolute call-site line (not the enclosing function's definition line).
-// exclude holds names that must not become targets (the function's own name,
-// matching the tree-sitter path); isKeyword filters language keywords.
 
 // appendCallEdges scans body lines [startIdx, endIdx) for call sites and
 // appends one calls edge per distinct name:line hit, stamped with the

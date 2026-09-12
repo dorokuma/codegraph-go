@@ -15,8 +15,6 @@ func (d *DB) UpsertFile(path string, size int64, mtime float64) error {
 }
 
 // UpsertFileRecord writes a full files row including content_hash / language / node_count.
-
-// UpsertFileRecord writes a full files row including content_hash / language / node_count.
 func (d *DB) UpsertFileRecord(f *FileRecord) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -60,9 +58,6 @@ func (d *DB) FileNeedsReindex(path string, size int64, mtime float64) (bool, err
 
 // FileHasContentHash reports whether path is already indexed with the given content hash.
 // Empty hash never matches (forces reindex when caller has no hash).
-
-// FileHasContentHash reports whether path is already indexed with the given content hash.
-// Empty hash never matches (forces reindex when caller has no hash).
 func (d *DB) FileHasContentHash(path, hash string) (bool, error) {
 	if hash == "" {
 		return false, nil
@@ -84,10 +79,6 @@ func (d *DB) FileHasContentHash(path, hash string) (bool, error) {
 // TouchFileMeta refreshes size/mtime/content_hash without changing node_count.
 // Used when content is unchanged but the filesystem timestamp moved.
 // mtime is milliseconds since epoch (UnixMilli) stored as REAL.
-
-// TouchFileMeta refreshes size/mtime/content_hash without changing node_count.
-// Used when content is unchanged but the filesystem timestamp moved.
-// mtime is milliseconds since epoch (UnixMilli) stored as REAL.
 func (d *DB) TouchFileMeta(path string, size int64, mtime float64, contentHash string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -98,8 +89,6 @@ func (d *DB) TouchFileMeta(path string, size int64, mtime float64, contentHash s
 	`, size, mtime, contentHash, float64(time.Now().Unix()), path)
 	return err
 }
-
-// GetFileNodeCount returns the stored node_count for path (0 when missing).
 
 // GetFileNodeCount returns the stored node_count for path (0 when missing).
 func (d *DB) GetFileNodeCount(path string) (int, error) {
@@ -116,8 +105,6 @@ func (d *DB) GetFileNodeCount(path string) (int, error) {
 	}
 	return int(n.Int64), nil
 }
-
-// GetFileContentHash returns the stored content hash for path, or "" if missing.
 
 // GetFileContentHash returns the stored content hash for path, or "" if missing.
 func (d *DB) GetFileContentHash(path string) (string, error) {
@@ -137,11 +124,6 @@ func (d *DB) GetFileContentHash(path string) (string, error) {
 	}
 	return dbHash.String, nil
 }
-
-// ClearFile removes all nodes, edges, and unresolved_refs for a file (before reindexing).
-// Foreign keys are ON via DSN pragma; deleting nodes cascades to edges and
-// unresolved_refs (by from_node FK). unresolved_refs.file_path has no FK so we
-// delete it explicitly.
 
 // ClearFile removes all nodes, edges, and unresolved_refs for a file (before reindexing).
 // Foreign keys are ON via DSN pragma; deleting nodes cascades to edges and
@@ -201,8 +183,6 @@ func (d *DB) ListFiles() ([]string, error) {
 }
 
 // ListFilesContext is the context-aware variant of ListFiles.
-
-// ListFilesContext is the context-aware variant of ListFiles.
 func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -227,14 +207,7 @@ func (d *DB) ListFilesContext(ctx context.Context) ([]string, error) {
 // pattern-match candidate cap. Generous on purpose: basename collisions in
 // the thousands are possible on big indexes, and candidates are re-filtered
 // by fileHintMatches afterwards. A var (not const) so tests can lower it.
-
-// pattern-match candidate cap. Generous on purpose: basename collisions in
-// the thousands are possible on big indexes, and candidates are re-filtered
-// by fileHintMatches afterwards. A var (not const) so tests can lower it.
 var findFileCandidatesPatternLimit = 10_000
-
-// FindFileCandidatesContext finds candidate file paths in the files table
-// matching a path or basename hint without scanning the full table.
 
 // FindFileCandidatesContext finds candidate file paths in the files table
 // matching a path or basename hint without scanning the full table.
@@ -338,20 +311,14 @@ func (d *DB) FindFileCandidatesContext(ctx context.Context, hint string) ([]stri
 }
 
 // FindFileCandidates is the background context variant of FindFileCandidatesContext.
-
-// FindFileCandidates is the background context variant of FindFileCandidatesContext.
 func (d *DB) FindFileCandidates(hint string) ([]string, error) {
 	return d.FindFileCandidatesContext(context.Background(), hint)
 }
 
 // ListFilesInDir returns all indexed files whose parent directory matches dir.
-
-// ListFilesInDir returns all indexed files whose parent directory matches dir.
 func (d *DB) ListFilesInDir(dir string) ([]string, error) {
 	return d.ListFilesInDirContext(context.Background(), dir)
 }
-
-// ListFilesInDirContext is the context-aware variant of ListFilesInDir.
 
 // ListFilesInDirContext is the context-aware variant of ListFilesInDir.
 func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, error) {
@@ -418,10 +385,6 @@ func (d *DB) ListFilesInDirContext(ctx context.Context, dir string) ([]string, e
 // CountFilesUnderContext returns the number of indexed files whose path
 // is under prefix (same directory or descendant). Prefix may be absolute
 // (legacy) or workdir-relative (current storage). Empty/"." means whole index.
-
-// CountFilesUnderContext returns the number of indexed files whose path
-// is under prefix (same directory or descendant). Prefix may be absolute
-// (legacy) or workdir-relative (current storage). Empty/"." means whole index.
 func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -450,14 +413,9 @@ func (d *DB) CountFilesUnderContext(ctx context.Context, prefix string) (int, er
 
 // GetFileDependents returns distinct other files that have a structural edge
 // into a symbol defined in filePath (who depends on this file).
-
-// GetFileDependents returns distinct other files that have a structural edge
-// into a symbol defined in filePath (who depends on this file).
 func (d *DB) GetFileDependents(filePath string) ([]string, error) {
 	return d.GetFileDependentsContext(context.Background(), filePath)
 }
-
-// GetFileDependentsContext is the context-aware variant of GetFileDependents.
 
 // GetFileDependentsContext is the context-aware variant of GetFileDependents.
 func (d *DB) GetFileDependentsContext(ctx context.Context, filePath string) ([]string, error) {
@@ -493,13 +451,9 @@ func (d *DB) GetFileDependentsContext(ctx context.Context, filePath string) ([]s
 }
 
 // DeleteFile removes a file and its nodes/edges from the index.
-
-// DeleteFile removes a file and its nodes/edges from the index.
 func (d *DB) DeleteFile(path string) error {
 	return d.ClearFile(path)
 }
-
-// GetImportTargetNames returns module/symbol names imported by a source file.
 
 // GetImportTargetNames returns module/symbol names imported by a source file.
 func (d *DB) GetImportTargetNames(filePath string) ([]string, error) {
@@ -529,14 +483,9 @@ func (d *DB) GetImportTargetNames(filePath string) ([]string, error) {
 
 // FindImporters finds files that import the given package.
 // Escapes _ and % in targetPkg so they are not treated as LIKE wildcards.
-
-// FindImporters finds files that import the given package.
-// Escapes _ and % in targetPkg so they are not treated as LIKE wildcards.
 func (d *DB) FindImporters(targetPkg string) ([]string, error) {
 	return d.FindImportersContext(context.Background(), targetPkg)
 }
-
-// FindImportersContext is the context-aware variant of FindImporters.
 
 // FindImportersContext is the context-aware variant of FindImporters.
 func (d *DB) FindImportersContext(ctx context.Context, targetPkg string) ([]string, error) {
