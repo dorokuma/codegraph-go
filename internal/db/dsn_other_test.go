@@ -23,7 +23,8 @@ func TestPinnedDBPathUsesPlainPath(t *testing.T) {
 	defer func() { _ = p.close() }()
 
 	want := filepath.Join(dir, "codegraph.db")
-	if got := pinnedDBPath(p, dir); got != want {
-		t.Fatalf("pinnedDBPath = %q, want %q", got, want)
+	got, gerr := pinnedDBPath(p, dir)
+	if gerr != nil || got != want {
+		t.Fatalf("pinnedDBPath = %q, %v, want %q", got, gerr, want)
 	}
 }

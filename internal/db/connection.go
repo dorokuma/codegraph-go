@@ -124,10 +124,16 @@ func Open(workdir string) (db *DB, err error) {
 	// On Linux the path part is /proc/self/fd/<pinned fd>/codegraph.db (see
 	// pinnedDBPath): SQLite's own file resolutions — db, -wal, -shm — then
 	// always land in the pinned directory, whatever the .codegraph path does
-	// after validation. On other platforms (and when procfs is unavailable)
-	// this is the validated plain path. Escape URI-special characters in the
-	// path so spaces / # / ? / & work.
-	dsn := sqliteFileDSN(pinnedDBPath(pinned, dir))
+	// after validation. An unusable procfs magic link fails closed there
+	// unless CODEGRAPH_ALLOW_PLAIN_DB=1 opts into the degraded plain path
+	// (see pinnedDBPath); on other platforms this is the validated plain
+	// path. Escape URI-special characters in the path so spaces / # / ? / &
+	// work.
+	dsnPath, dsnErr := pinnedDBPath(pinned, dir)
+	if dsnErr != nil {
+		return nil, dsnErr
+	}
+	dsn := sqliteFileDSN(dsnPath)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
