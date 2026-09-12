@@ -3,6 +3,19 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.10] - 2026-09-12
+
+### Fixed
+- **无 procfs 环境 fail closed（第四轮对抗审计实证的条件性残留）**：linux 上 `/proc/self/fd` 不可用时 `db.Open` 默认拒绝启动并给出可操作错误，不再静默回退到仅检测的 plain path（unshare+tmpfs 遮 /proc 下 5/5 越界后检出的路径）；`CODEGRAPH_ALLOW_PLAIN_DB=1` 作为逃生门保留降级并打告警。
+- `RunAsDaemon` Start 失败路径的 pidfile 删除改走 artifact 守卫（dirID 复核），与 SIGTERM 清理同纪律——换手后不再经路径删除界外文件。
+- 运行期新增目录的 watch 失败统一计入 `watcher_blind_dirs`（此前 watchTree 直连 Add 不计数，status 低估盲区）。
+- extra workdir 的 watcher 状态可观测：启动失败按根记录并在 status 输出 `watcher_active: false for workdir ...`，pending/dropped/blind/unreadable 计数对 extra roots 同样输出。
+- pidfile 新增可选 `dirDev`/`dirIno` 字段（omitempty 向后兼容）+ daemon 启动日志记录 `.codegraph` 目录身份——同 inode 目录搬移留下审计线索。
+
+### Changed
+- pin_other.go 注明非 unix（含 windows）平台整仓构建不受支持（tree-sitter cgo 上游限制，0.9.5 前即如此）。
+- Display / daemon wire version **0.9.10**。
+
 ## [0.9.9] - 2026-09-12
 
 ### Fixed
