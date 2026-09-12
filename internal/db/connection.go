@@ -103,12 +103,26 @@ func Open(workdir string) (db *DB, err error) {
 	}
 	dbPath := filepath.Join(dir, "codegraph.db")
 
+	// TOCTOU hardening: the validation above and every path resolution below
+	// it are independent — the red team won by polling for codegraph.lock and
+	// swapping .codegraph for a symlink inside the gap, sending codegraph.db
+	// to the symlink target. Pin the validated directory with a dirfd and
+	// create the lock file through it: whatever the path does afterwards, the
+	// pin holds the very inode that passed the checks, and the dev/ino
+	// rechecks below detect any swap that happened in between.
+	pinned, perr := pinDir(dir)
+	if perr != nil {
+		return nil, perr
+	}
+	defer func() { _ = pinned.close() }()
+
 	// A1: single-writer lock. SQLite WAL allows one writer; a second process
 	// opening the same index would fight over the write lock (busy errors,
 	// lost updates). Take a process-level exclusive flock on codegraph.lock
-	// before touching the db; fail fast with a clear error when held.
-	lockPath := filepath.Join(dir, "codegraph.lock")
-	lockFile, lerr := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	// before touching the db; fail fast with a clear error when held. The
+	// file is created through the pinned dirfd (O_NOFOLLOW), so creation
+	// cannot escape the validated directory.
+	lockFile, lerr := pinned.openLockFile(dir, "codegraph.lock")
 	if lerr != nil {
 		return nil, fmt.Errorf("open lock file: %w", lerr)
 	}
@@ -123,6 +137,15 @@ func Open(workdir string) (db *DB, err error) {
 			_ = lockFile.Close()
 		}
 	}()
+
+	// The flock is ours through the pinned directory: verify the .codegraph
+	// path still resolves to the pinned inode. Anything else means the
+	// directory was swapped between validation and locking — abort before a
+	// single db byte is written. (The deferred cleanup above releases the
+	// lock and closes both fds on every error path below.)
+	if err := pinned.recheckDir(dir); err != nil {
+		return nil, err
+	}
 
 	// DSN pragmas ensure every connection gets foreign_keys + busy_timeout,
 	// not just the first one in the pool (database/sql may open new connections
@@ -143,6 +166,18 @@ func Open(workdir string) (db *DB, err error) {
 	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+
+	// Post-creation recheck: modernc SQLite only receives dbPath, so its file
+	// creations re-resolved the path independently of the pin. Now that
+	// codegraph.db exists, verify through the pinned fd that the file the
+	// path names is the one inside the pinned directory. Detection, not
+	// prevention: if this fires, stray files already exist outside and are
+	// deliberately NOT unlinked (deleting through a freshly swapped path
+	// would touch attacker-chosen names).
+	if err := pinned.recheckChild(dir, "codegraph.db", dbPath); err != nil {
+		conn.Close()
+		return nil, err
 	}
 
 	// Set busy timeout
