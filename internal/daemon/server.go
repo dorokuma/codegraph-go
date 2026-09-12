@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/dorokuma/codegraph-go/internal/cgdir"
 )
 
 // SessionHandler serves one MCP client over rwc (already past the hello handshake).
@@ -60,6 +62,13 @@ func New(root string, handler SessionHandler) *Daemon {
 // Resolves once listening. Blocks in Accept loop on a background goroutine;
 // the process stays alive via the listener + client sessions + idle timer.
 func (d *Daemon) Start() error {
+	// Guard .codegraph before the bind creates an inode in it: bind(2)
+	// mknods the socket, and the os.Remove of a stale socket below would
+	// delete through a symlink. Same jail line as db.Open, which runs later
+	// in onReady — this covers the write points that happen before it.
+	if err := cgdir.Ensure(CodeGraphDir(d.root)); err != nil {
+		return err
+	}
 	candidates := SocketCandidates(d.root)
 	if len(candidates) == 0 {
 		return errNoSocketSupport

@@ -337,8 +337,11 @@ func terminateViaKill(root string, pid int) (bool, error) {
 // directory, run schema/FTS backfill work, and — when the flock is actually
 // free — briefly take the write lock itself, which both slows the common
 // path and can make a concurrent spawn fail once transiently. (db.Open has
-// the same flock logic in its own package; it is duplicated here only to
-// avoid an import cycle.)
+// the same flock logic in its own package. It is duplicated here not to
+// avoid an import cycle — db is a leaf package, a daemon → db import would
+// be acyclic — but because only a bare flock(2) probe has zero side
+// effects, while a full Open would create the directory and take the very
+// lock being probed.)
 //
 // Semantics: LOCK_EX|LOCK_NB failing with EWOULDBLOCK/EAGAIN means another
 // process holds the lock → true (held). A successful acquisition is

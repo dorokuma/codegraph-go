@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/dorokuma/codegraph-go/internal/cgdir"
 )
 
 // AcquireResult is the outcome of TryAcquireLock.
@@ -27,7 +29,10 @@ type AcquireResult struct {
 // when the filesystem has no hard links.
 func TryAcquireLock(projectRoot string) (AcquireResult, error) {
 	pidPath := PidPath(projectRoot)
-	if err := os.MkdirAll(filepath.Dir(pidPath), 0o700); err != nil {
+	// Same .codegraph guard as db.Open, fail closed before any file write:
+	// the temp pidfile and the hard link below must land in the real
+	// .codegraph, never through a symlink at its target.
+	if err := cgdir.Ensure(filepath.Dir(pidPath)); err != nil {
 		return AcquireResult{}, err
 	}
 

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/dorokuma/codegraph-go/internal/cgdir"
 )
 
 // SpawnOpts carries parent CLI flags the detached daemon should inherit.
@@ -82,11 +84,15 @@ func isGoRunTempPath(p string) bool {
 }
 
 func SpawnDetached(root string, opts *SpawnOpts) error {
-	self, err := resolveDaemonBinary()
-	if err != nil {
+	// The .codegraph guard runs before anything under the project is
+	// touched: daemon.log below — and everything the daemon writes later —
+	// must land in the real .codegraph, never through a symlink at its
+	// target. On failure nothing under the project is written.
+	if err := cgdir.Ensure(CodeGraphDir(root)); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(CodeGraphDir(root), 0o700); err != nil {
+	self, err := resolveDaemonBinary()
+	if err != nil {
 		return err
 	}
 	logPath := filepath.Join(CodeGraphDir(root), "daemon.log")
