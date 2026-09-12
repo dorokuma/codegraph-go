@@ -374,6 +374,55 @@ func (d *DB) DeleteUnresolvedRef(id int64) error {
 	return err
 }
 
+// ResolvedRef is one resolved unresolved_ref awaiting persistence: the edge
+// to upsert plus the id of the pending ref row to delete.
+type ResolvedRef struct {
+	Edge         Edge
+	UnresolvedID int64
+}
+
+// ApplyResolvedRefs persists a batch of resolved refs inside ONE transaction:
+// per entry it upserts the edge (same statement and conflict key as
+// UpsertEdge) and deletes the pending unresolved_ref (same statement as
+// DeleteUnresolvedRef). The per-ref pair used to run as two implicit
+// autocommit transactions, so a full-table ResolveAll over a large backlog
+// committed once per write; the batched form commits once per batch. On any
+// error the whole batch rolls back — the caller falls back to per-ref writes
+// to isolate the offending row — so the final per-ref state is identical to
+// the per-ref path.
+func (d *DB) ApplyResolvedRefs(batch []ResolvedRef) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for i := range batch {
+		e := &batch[i].Edge
+		if _, err := tx.Exec(`
+			INSERT INTO edges (source_id, target_id, kind, file, line, col, provenance, metadata)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(source_id, target_id, kind, line, col) DO UPDATE SET
+				col = excluded.col,
+				file = excluded.file,
+				provenance = excluded.provenance,
+				metadata = excluded.metadata
+		`, e.SourceID, e.TargetID, e.Kind, e.File, e.Line, e.Col, e.Provenance, e.Metadata); err != nil {
+			return fmt.Errorf("resolve batch upsert edge: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM unresolved_refs WHERE id = ?`, batch[i].UnresolvedID); err != nil {
+			return fmt.Errorf("resolve batch delete ref %d: %w", batch[i].UnresolvedID, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // MarkUnresolvedFailed parks a ref as failed so a later pass can retry.
 func (d *DB) MarkUnresolvedFailed(id int64, nameTail string) error {
 	d.mu.Lock()
