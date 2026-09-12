@@ -601,6 +601,26 @@ func startDaemonLikeProcess(t *testing.T, root string, daemonMarker bool) *exec.
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start helper process: %v", err)
 	}
+	// /proc/<pid>/stat starttime is fixed at fork and survives exec, but
+	// /proc/<pid>/cmdline shows the pre-exec (test binary's) argv until
+	// execve lands. A reader inside that fork->exec window sees no
+	// "-workdir" and verifyDaemonIdentity refuses with "not a daemon of
+	// this project" even though the helper is healthy — observed as a CI
+	// flake on slow 2-core runners (fast machines mask the window). Wait
+	// for the target argv to become visible before handing the Cmd out.
+	if procStartTime(os.Getpid()) != 0 {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", cmd.Process.Pid))
+			if err == nil && cmdlineWorkdirMatches(string(raw), root) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("helper cmdline never showed -workdir %s (last %q, err %v)", root, string(raw), err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
 	t.Cleanup(func() {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	})
