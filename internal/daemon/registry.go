@@ -19,19 +19,29 @@ type Record struct {
 	StartedAt  int64  `json:"startedAt"`
 }
 
-// RegistryDir is ~/.codegraph/daemons.
+// RegistryDir is ~/.codegraph/daemons, or "" when the home directory cannot
+// be resolved. The registry is best-effort discovery metadata; the old
+// os.TempDir() fallback wrote daemon records into /tmp/.codegraph/daemons —
+// a world-writable-prefix location anyone can pre-create and poison, and
+// exactly the walk-up misidentification pollution the .codegraph guards
+// elsewhere in this package exist to prevent. Callers skip registry I/O on
+// "" instead: no records written, none discovered.
 func RegistryDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		home = os.TempDir()
+		return ""
 	}
 	return filepath.Join(home, ".codegraph", "daemons")
 }
 
 func recordPath(root string) string {
+	dir := RegistryDir()
+	if dir == "" {
+		return ""
+	}
 	sum := sha256.Sum256([]byte(filepath.Clean(root)))
 	h := hex.EncodeToString(sum[:])[:16]
-	return filepath.Join(RegistryDir(), h+".json")
+	return filepath.Join(dir, h+".json")
 }
 
 // Register writes a discovery record (best-effort).
@@ -39,6 +49,9 @@ func recordPath(root string) string {
 // overwriting an unrelated file.
 func Register(rec Record) {
 	dir := RegistryDir()
+	if dir == "" {
+		return // home unresolvable: best-effort registry is skipped entirely
+	}
 	_ = os.MkdirAll(dir, 0o700)
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
@@ -71,6 +84,9 @@ func Register(rec Record) {
 // an unrelated file.
 func Deregister(root string) {
 	path := recordPath(root)
+	if path == "" {
+		return
+	}
 	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		// Symlink at the record path — refuse to follow it.
 		return
@@ -81,6 +97,9 @@ func Deregister(root string) {
 // List returns live registered daemons, newest first. Dead records are pruned.
 func List() []Record {
 	dir := RegistryDir()
+	if dir == "" {
+		return nil
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
