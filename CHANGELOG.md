@@ -3,6 +3,16 @@
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.12] - 2026-09-13
+
+### Fixed
+- **未解析引用重试上限**：`unresolved_refs` 新增 `attempts` 列（addMissingColumns 增量迁移，不触发索引重建），解析失败累计 20 轮后置为 `abandoned`（保留审计行、退出重试池）——终结标准库/内建调用积压（生产实测每轮 ~1.4 万次注定失败的重复解析）。
+- **增量索引的 inbound refs parking 收进单事务**（全程持 d.mu）：消除与并发 `ReplaceFileIndex` 级联删除竞争时的 FOREIGN KEY 失败窗口（原 M7 容忍路径关闭），park 失败整体回滚不留半截（触发器注入 + -race 压测验证）。
+- 解析统计行扩为 `resolved N edges (failed, retried, abandoned)`，三类计数语义见代码注释。
+
+### Changed
+- Display / daemon wire version **0.9.12**。
+
 ## [0.9.11] - 2026-09-12
 
 ### Changed
