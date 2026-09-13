@@ -58,46 +58,163 @@ func refNameTail(name string) string {
 // so CASCADE-deleted inbound edges can be rebuilt by ResolveForFiles.
 // Do not call this on a deleted file: the callee is gone, inbound edges
 // should disappear.
+//
+// The whole read+write sequence runs in ONE transaction with the write lock
+// held from the first read to commit (ReplaceFileIndex's single-transaction
+// precedent). The previous form released d.mu between reading an inbound
+// edge and inserting its ref (per-ref autocommit writes), so a concurrent
+// ReplaceFileIndex of the SOURCE file could cascade-delete the parked ref's
+// from_node inside that window and fail the insert with a FOREIGN KEY error
+// (M7). Holding d.mu across the snapshot and the inserts makes parking
+// atomic with respect to every in-process writer, the batch commits once
+// instead of once per ref, and a mid-park failure rolls back the whole park
+// instead of leaving a partial one behind.
 func (d *DB) ParkInboundRefsForFile(file string) error {
 	if file == "" {
 		return nil
 	}
-	return d.ForEachNodeByFileLight(file, func(target Node) error {
-		if target.Kind == KindFile || target.Kind == "module" {
-			return nil
-		}
-		incoming, err := d.GetIncomingEdges(target.ID, inboundParkKinds)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("park inbound refs begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	type parkTarget struct {
+		id   int64
+		kind string
+		name string
+	}
+	// Snapshot this file's parkable targets in id-paginated chunks
+	// (ForEachNodeByFileLight's bounding) so memory stays bounded on files
+	// with many nodes; file/module targets never park.
+	const targetBatchSize = 1000
+	var lastID int64
+	for {
+		rows, err := tx.Query(`
+			SELECT id, kind, name FROM nodes
+			WHERE file = ? AND id > ? ORDER BY id LIMIT ?
+		`, file, lastID, targetBatchSize)
 		if err != nil {
-			return err
+			return fmt.Errorf("park inbound refs targets: %w", err)
 		}
-		for _, e := range incoming {
-			src, err := d.GetNodeByID(e.SourceID)
-			if err != nil {
-				return err
+		var targets []parkTarget
+		for rows.Next() {
+			var t parkTarget
+			if err := rows.Scan(&t.id, &t.kind, &t.name); err != nil {
+				rows.Close()
+				return fmt.Errorf("park inbound refs targets: %w", err)
 			}
-			if src == nil || src.File == file {
+			targets = append(targets, t)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("park inbound refs targets: %w", err)
+		}
+		rows.Close()
+		if len(targets) == 0 {
+			break
+		}
+		for _, t := range targets {
+			lastID = t.id
+			if t.kind == KindFile || t.kind == "module" {
 				continue
 			}
-			refFile := e.File
-			if refFile == "" {
-				refFile = src.File
-			}
-			if _, err := d.InsertUnresolvedRef(&UnresolvedRef{
-				FromNode:      e.SourceID,
-				ReferenceName: target.Name,
-				ReferenceKind: e.Kind,
-				Line:          e.Line,
-				Col:           e.Col,
-				FilePath:      refFile,
-				Language:      src.Language,
-				Status:        "pending",
-				NameTail:      refNameTail(target.Name),
-			}); err != nil {
+			if err := parkInboundEdgesForNode(tx, t.id, t.name, file); err != nil {
 				return err
 			}
 		}
-		return nil
-	})
+		if len(targets) < targetBatchSize {
+			break
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("park inbound refs commit: %w", err)
+	}
+	return nil
+}
+
+// parkInboundEdgesForNode inserts pending refs for one target node's inbound
+// edges of parkable kinds, skipping edges whose source is gone or lives in
+// the same file (same-file edges are rebuilt by the owning file's index).
+// Runs on the caller's transaction; see ParkInboundRefsForFile for the
+// locking and transaction contract. The insert statement is the same
+// upsert InsertUnresolvedRef uses, so re-parking an existing pending/failed
+// row refreshes it to pending without resetting its attempts count.
+func parkInboundEdgesForNode(tx *sql.Tx, targetID int64, targetName, file string) error {
+	ph := make([]string, len(inboundParkKinds))
+	args := make([]interface{}, 0, len(inboundParkKinds)+1)
+	args = append(args, targetID)
+	for i, k := range inboundParkKinds {
+		ph[i] = "?"
+		args = append(args, k)
+	}
+	rows, err := tx.Query(`SELECT source_id, kind, file, line, col FROM edges
+		WHERE target_id = ? AND kind IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("park inbound refs edges: %w", err)
+	}
+	type inboundEdge struct {
+		sourceID  int64
+		kind      string
+		file      string
+		line, col int
+	}
+	var edges []inboundEdge
+	for rows.Next() {
+		var e inboundEdge
+		var f sql.NullString
+		var line, col sql.NullInt64
+		if err := rows.Scan(&e.sourceID, &e.kind, &f, &line, &col); err != nil {
+			rows.Close()
+			return fmt.Errorf("park inbound refs edges: %w", err)
+		}
+		e.file = f.String
+		e.line = int(line.Int64)
+		e.col = int(col.Int64)
+		edges = append(edges, e)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("park inbound refs edges: %w", err)
+	}
+	rows.Close()
+
+	for _, e := range edges {
+		var srcFile, srcLang sql.NullString
+		err := tx.QueryRow(`SELECT file, language FROM nodes WHERE id = ?`, e.sourceID).Scan(&srcFile, &srcLang)
+		if err == sql.ErrNoRows {
+			continue // source node already gone: nothing to rebuild
+		}
+		if err != nil {
+			return fmt.Errorf("park inbound refs source: %w", err)
+		}
+		if !srcFile.Valid || srcFile.String == file {
+			continue
+		}
+		refFile := e.file
+		if refFile == "" {
+			refFile = srcFile.String
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO unresolved_refs (
+				from_node, reference_name, reference_kind, line, col,
+				file_path, language, status, name_tail, candidates
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(from_node, reference_name, reference_kind, line, col) DO UPDATE SET
+				file_path = excluded.file_path,
+				language = excluded.language,
+				status = excluded.status,
+				name_tail = excluded.name_tail,
+				candidates = excluded.candidates
+		`, e.sourceID, targetName, e.kind, e.line, e.col,
+			refFile, srcLang.String, "pending", refNameTail(targetName), ""); err != nil {
+			return fmt.Errorf("park inbound refs insert: %w", err)
+		}
+	}
+	return nil
 }
 
 // CountUnresolvedRefs returns how many unresolved_refs rows match status
