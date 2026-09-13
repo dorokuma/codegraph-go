@@ -405,7 +405,11 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 		log.Printf("resolve all: %v", rerr)
 		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 || st.Failed > 0 {
-		log.Printf("resolved %d edges (%d failed, %d retried)", st.Resolved, st.Failed, st.Retried)
+		// failed = refs that failed an attempt this pass (pending and retried
+		// alike); retried = previously failed refs re-attempted this pass;
+		// abandoned = refs that hit maxResolveAttempts this pass — their rows
+		// are kept for audit but are no longer retried on later passes.
+		log.Printf("resolved %d edges (%d failed, %d retried, %d abandoned)", st.Resolved, st.Failed, st.Retried, st.Abandoned)
 	}
 	if o.interrupted() {
 		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)

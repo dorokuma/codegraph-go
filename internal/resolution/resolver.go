@@ -12,7 +12,19 @@ type Stats struct {
 	Resolved int
 	Failed   int
 	Retried  int
+	// Abandoned is how many refs hit maxResolveAttempts this pass: their rows
+	// were parked as 'abandoned' (kept for audit, no longer retried). A
+	// subset of Failed — abandoning happens on a failed attempt.
+	Abandoned int
 }
+
+// maxResolveAttempts is how many failed resolution attempts a ref may
+// accumulate before it stops being retried: the failure that reaches the cap
+// parks the row as 'abandoned' instead of 'failed' (kept for audit,
+// excluded from every retry query). This bounds the per-pass work spent on
+// refs whose targets can never exist in the index (e.g. standard-library and
+// builtin calls). Var, not const, so tests can shrink it.
+var maxResolveAttempts = 20
 
 // ResolveAll turns pending (and retryable failed) unresolved_refs into edges.
 // Cross-file graph edges are born here — not during extraction (step 2/3 split).
@@ -46,15 +58,21 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 			// A per-ref resolution error is a failure for THIS ref this pass:
 			// count it and park the ref as failed (failed rows are retried by
 			// later passes whenever a candidate name exists, so retry
-			// semantics are preserved and stats no longer under-report).
+			// semantics are preserved and stats no longer under-report). Each
+			// failure bumps attempts; once maxResolveAttempts is reached the
+			// row is parked as 'abandoned' and later passes stop selecting it.
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
 			st.Failed++
-			markRefFailed(database, r)
+			if markRefFailed(database, r, maxResolveAttempts) {
+				st.Abandoned++
+			}
 			continue
 		}
 		if plan == nil {
 			st.Failed++
-			markRefFailed(database, r)
+			if markRefFailed(database, r, maxResolveAttempts) {
+				st.Abandoned++
+			}
 			continue
 		}
 		w.add(*plan)
@@ -63,7 +81,9 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 	st.Resolved += w.resolved
 	for _, p := range w.failed {
 		st.Failed++
-		markRefFailed(database, p.ref)
+		if markRefFailed(database, p.ref, maxResolveAttempts) {
+			st.Abandoned++
+		}
 	}
 	return st, nil
 }
@@ -252,14 +272,22 @@ func (w *edgeWriter) flush() {
 	w.batch = w.batch[:0]
 }
 
-// markRefFailed parks a ref as failed for later retry passes, backfilling an
-// empty stored name_tail from the reference name.
-func markRefFailed(database *db.DB, r db.UnresolvedRef) {
+// markRefFailed records one failed attempt for a ref (backfilling an empty
+// stored name_tail from the reference name): the row is parked as 'failed'
+// for later retry passes, or as 'abandoned' when the attempt reaches
+// maxAttempts — abandoned rows stay in the table for audit but are no longer
+// selected by the pending/failed retry queries. Reports whether this call
+// abandoned the row.
+func markRefFailed(database *db.DB, r db.UnresolvedRef, maxAttempts int) bool {
 	tail := r.NameTail
 	if tail == "" {
 		tail = nameTail(r.ReferenceName)
 	}
-	_ = database.MarkUnresolvedFailed(r.ID, tail)
+	abandoned, err := database.MarkUnresolvedFailed(r.ID, tail, maxAttempts)
+	if err != nil {
+		return false
+	}
+	return abandoned
 }
 
 // ResolveForFiles re-runs resolution focusing on refs from the given files
@@ -359,15 +387,18 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		if err != nil {
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
 			st.Failed++
-			if r.Status == "pending" || r.Status == "" {
-				markRefFailed(database, r)
+			// Previously failed refs are marked too (not only pending ones):
+			// every attempted-and-failed ref must age, or rows that keep
+			// failing on incremental passes would never reach the cap.
+			if markRefFailed(database, r, maxResolveAttempts) {
+				st.Abandoned++
 			}
 			continue
 		}
 		if plan == nil {
 			st.Failed++
-			if r.Status == "pending" || r.Status == "" {
-				markRefFailed(database, r)
+			if markRefFailed(database, r, maxResolveAttempts) {
+				st.Abandoned++
 			}
 			continue
 		}
@@ -377,8 +408,8 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	st.Resolved += w.resolved
 	for _, p := range w.failed {
 		st.Failed++
-		if p.ref.Status == "pending" || p.ref.Status == "" {
-			markRefFailed(database, p.ref)
+		if markRefFailed(database, p.ref, maxResolveAttempts) {
+			st.Abandoned++
 		}
 	}
 	return st, nil

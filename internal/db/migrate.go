@@ -48,6 +48,17 @@ func (d *DB) ensureSchema() error {
 	}); err != nil {
 		return err
 	}
+	// Unresolved-ref retry cap (0.9.12): attempts counts failed resolve
+	// passes per row so refs that can never resolve age out to 'abandoned'
+	// instead of being retried on every pass forever. Column-only migration
+	// (content_hash/language/node_count precedent): no IndexSchemaRevision
+	// bump — existing rows start at attempts=0 and age naturally, and the
+	// index stays valid (no wipe+rebuild).
+	if err := d.addMissingColumns("unresolved_refs", []colDef{
+		{"attempts", "INTEGER NOT NULL DEFAULT 0"},
+	}); err != nil {
+		return err
+	}
 	// unresolved_refs is created by schema.sql; re-assert indexes for older
 	// embeds that only had the CREATE TABLE without later indexes.
 	for _, q := range []string{

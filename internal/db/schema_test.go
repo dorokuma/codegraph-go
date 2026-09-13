@@ -28,7 +28,7 @@ func TestSchemaHasV7Columns(t *testing.T) {
 		"files": {"content_hash", "language", "node_count"},
 		"unresolved_refs": {
 			"from_node", "reference_name", "reference_kind", "line", "col",
-			"file_path", "language", "status", "name_tail", "candidates",
+			"file_path", "language", "attempts", "status", "name_tail", "candidates",
 		},
 	}
 	for table, cols := range want {

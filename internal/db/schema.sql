@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
     status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
     name_tail TEXT NOT NULL DEFAULT '',
     candidates TEXT,           -- JSON array
     UNIQUE(from_node, reference_name, reference_kind, line, col)

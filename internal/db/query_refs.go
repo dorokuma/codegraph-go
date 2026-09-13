@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -366,6 +367,21 @@ func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, er
 
 // GetEdgeByEndpoints loads one edge by endpoints + kind (for tests / inspection).
 
+// UnresolvedRefAttempts reads the attempts counter of one unresolved_refs
+// row. attempts is not part of the UnresolvedRef list results (list callers
+// never branch on it); this serves tests and audit tooling over abandoned
+// rows.
+func (d *DB) UnresolvedRefAttempts(id int64) (int, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	var attempts int
+	err := d.conn.QueryRow(`SELECT attempts FROM unresolved_refs WHERE id = ?`, id).Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("unresolved_ref attempts: %w", err)
+	}
+	return attempts, nil
+}
+
 // DeleteUnresolvedRef removes one unresolved_refs row (resolved successfully).
 func (d *DB) DeleteUnresolvedRef(id int64) error {
 	d.mu.Lock()
@@ -423,14 +439,33 @@ func (d *DB) ApplyResolvedRefs(batch []ResolvedRef) error {
 	return tx.Commit()
 }
 
-// MarkUnresolvedFailed parks a ref as failed so a later pass can retry.
-func (d *DB) MarkUnresolvedFailed(id int64, nameTail string) error {
+// MarkUnresolvedFailed records one failed resolution attempt for a ref: it
+// bumps attempts, parks the row as 'failed' so a later pass can retry, and —
+// once the attempt count reaches maxAttempts — parks it as 'abandoned'
+// instead: the row is kept for audit/statistics but the retry queries
+// (status 'pending'/'failed') no longer select it. An empty nameTail is
+// stored as-is; callers backfill it from the reference name. A missing row
+// is a no-op (the ref was resolved or deleted meanwhile). Reports whether
+// this call abandoned the row.
+func (d *DB) MarkUnresolvedFailed(id int64, nameTail string, maxAttempts int) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.conn.Exec(`
-		UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?
-	`, nameTail, id)
-	return err
+	var status string
+	err := d.conn.QueryRow(`
+		UPDATE unresolved_refs SET
+			attempts = attempts + 1,
+			status = CASE WHEN attempts + 1 >= ? THEN 'abandoned' ELSE 'failed' END,
+			name_tail = ?
+		WHERE id = ?
+		RETURNING status
+	`, maxAttempts, nameTail, id).Scan(&status)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("mark unresolved_ref failed: %w", err)
+	}
+	return status == "abandoned", nil
 }
 
 // getNodesByFileCap bounds GetNodesByFile results to prevent unbounded reads.

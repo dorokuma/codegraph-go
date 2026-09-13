@@ -359,13 +359,24 @@ func TestMarkUnresolvedFailed(t *testing.T) {
 		Status:        "pending",
 	})
 
-	if err := database.MarkUnresolvedFailed(rid, "tail"); err != nil {
+	abandoned, err := database.MarkUnresolvedFailed(rid, "tail", 20)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if abandoned {
+		t.Fatal("first failure below the cap must not abandon the row")
 	}
 
 	refs, _ := database.ListUnresolvedRefs("", "failed")
 	if len(refs) != 1 || refs[0].NameTail != "tail" {
 		t.Fatalf("want 1 failed ref with tail='tail', got %v", refs)
+	}
+	var attempts int
+	if err := database.conn.QueryRow(`SELECT attempts FROM unresolved_refs WHERE id = ?`, rid).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("want attempts=1 after one failed attempt, got %d", attempts)
 	}
 }
 
