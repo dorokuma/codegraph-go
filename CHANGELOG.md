@@ -8,6 +8,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Added
 - **Agent 协作骨架**：接入 `AGENTS.md` 协作规范、`.agents/notes/` 决策与踩坑笔记机制及 `scripts/notes-index.sh` 索引生成工具。
 
+### Changed
+- 统一 scripts/notes-index.sh 索引脚本，并在 AGENTS.md 补充索引刷新指引。
+
 ## [0.9.12] - 2026-09-13
 
 ### Fixed

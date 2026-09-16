@@ -10,6 +10,7 @@
 ## 索引
 - 现状与架构文档：[README.md](README.md)、[CONTRIBUTING.md](CONTRIBUTING.md)
 - 决策与踩坑笔记：[.agents/notes/](.agents/notes/)
+- 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git）
 
 ## 关联仓库
 - `ctxmode`：同为 MCP 工具链组件
