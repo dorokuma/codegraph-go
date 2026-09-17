@@ -24,6 +24,17 @@ Given a version number `MAJOR.MINOR.PATCH`:
 4. Update `CHANGELOG.md`.
 5. Open a pull request against `main`.
 
+## Commit messages
+
+Commit messages must follow Conventional Commits (`TYPE: subject` or `TYPE(scope): subject`).
+
+- **Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert` (lowercase).
+- **Scope**: Optional (`[a-z0-9._-]+`).
+- **Subject**: Non-empty, ≤ 72 characters (supports mixed English and Chinese).
+- **Exemptions**: Merge, revert, `fixup!`, and `squash!` commits.
+
+Enforced locally by the `commit-msg` hook with secret scanning and noise-word checks.
+
 ## Code style
 
 - Standard Go conventions (`gofmt`, `go vet`).
