@@ -10,6 +10,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Changed
 - 统一 scripts/notes-index.sh 索引脚本，并在 AGENTS.md 补充索引刷新指引。
+- AGENTS.md 补充全局 commit-msg hook 提交规范。
 
 ## [0.9.12] - 2026-09-13
 

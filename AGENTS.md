@@ -6,6 +6,7 @@
 3. 接口契约：单一 MCP 工具暴露原则（`codegraph` + `action`），严禁破坏已发布的 action 与参数契约。
 4. 架构分层：严格遵守 `cmd/` 入口与 `internal/` 业务分层，禁止在 `cmd/` 堆积业务逻辑。
 5. 变更记录：功能改动与契约变更必须在 `CHANGELOG.md` 的 `[Unreleased]` 中登记。
+6. 提交规范：commit message 须过全局 commit-msg hook（Conventional Commits：feat/fix/docs/style/refactor/perf/test/build/ci/chore/revert，主题 ≤72 字，冒号后一空格，禁止噪声词与密钥，违者被 hook 拒绝）。
 
 ## 索引
 - 现状与架构文档：[README.md](README.md)、[CONTRIBUTING.md](CONTRIBUTING.md)
