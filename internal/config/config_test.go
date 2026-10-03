@@ -288,6 +288,16 @@ func TestWorkdirAllowlist(t *testing.T) {
 // TestWorkdirAllowlistHomeFallback: with no config file the allowlist
 // defaults to $HOME — workdirs inside $HOME pass, outside are rejected.
 func TestWorkdirAllowlistHomeFallback(t *testing.T) {
+	// Host-env isolation: redirect $HOME into a fresh temp dir so the third
+	// ConfigPath candidate (~/.config/codegraph/config.yaml) cannot resolve to
+	// a host-global file. This machine ships one with workdirs:
+	// [/root/workspace], which would otherwise be read as the authoritative
+	// config and win over the $HOME fallback this test asserts. On Linux
+	// os.UserHomeDir() reads $HOME, so the redirect also becomes the $HOME the
+	// fallback must return below. The lookup hardcodes $HOME/.config (it does
+	// not consult $XDG_CONFIG_HOME), so isolating $HOME alone is sufficient.
+	t.Setenv("HOME", t.TempDir())
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Skipf("no $HOME: %v", err)

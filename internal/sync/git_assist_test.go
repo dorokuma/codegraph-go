@@ -4,8 +4,33 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// isolatedGitEnv builds the environment for the throwaway git repositories
+// these tests create. Pointing GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM at
+// /dev/null makes git read an EMPTY global/system config, so a host-global
+// core.hooksPath (a commit-msg hook that rejects non-conventional messages)
+// or init.templatedir cannot bleed into the repo. Any incoming copies of
+// these variables are dropped first so the override always wins: the
+// isolation must not depend on the host (or a deliberately hostile one)
+// happening to leave them unset.
+func isolatedGitEnv() []string {
+	const (
+		globalKey = "GIT_CONFIG_GLOBAL"
+		systemKey = "GIT_CONFIG_SYSTEM"
+	)
+	base := os.Environ()
+	out := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		if key, _, ok := strings.Cut(kv, "="); ok && (key == globalKey || key == systemKey) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, globalKey+"=/dev/null", systemKey+"=/dev/null")
+}
 
 func TestGitDirtySourceFiles(t *testing.T) {
 	root := t.TempDir()
@@ -13,6 +38,7 @@ func TestGitDirtySourceFiles(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = root
+		cmd.Env = isolatedGitEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s (%v)", args, out, err)
 		}
@@ -71,6 +97,7 @@ func TestGitDirtySourceFilesRename(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = root
+		cmd.Env = isolatedGitEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s (%v)", args, out, err)
 		}
