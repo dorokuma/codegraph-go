@@ -8,9 +8,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Added
 - **Agent 协作骨架**：接入 `AGENTS.md` 协作规范、`.agents/notes/` 决策与踩坑笔记机制及 `scripts/notes-index.sh` 索引生成工具。
 
+### Fixed
+- **Pi 扩展漏同步（部署副本落后仓库一个提交）**：deploy.sh 此前只替换 Go 二进制，Pi 扩展靠 `integrations/pi/README.md` 手工 install——在跑的旧版缺 `wantsKeepCode` 逃生口，会把 `action=node` / `includeCode=true` / `skipCode=false` 返回的代码围栏与 `file:line:content` 二次剥掉，源码正文丢失。新增 `integrations/pi/install.sh`（`install -m 644` 到 `~/.pi/agent/extensions/codegraph-go.ts`，md5 一致即跳过、不重写）并由 deploy.sh 调用，打印源/目标 md5 与是否变化；Pi 侧需 `/reload` 或新会话生效。同步失败不阻断 daemon 部署，但在 deploy.sh 结尾 WARN 汇总重打；install.sh 对 md5sum 缺失 / HOME 未设置 / 目标为目录 / md5 取空一律显式 `FAILED` 并非零退出，不再有静默失败路径。根因与后续项见 `.agents/notes/20261003-pi-ext-deploy-sync.md`。
+
 ### Changed
 - 统一 scripts/notes-index.sh 索引脚本，并在 AGENTS.md 补充索引刷新指引。
 - AGENTS.md 补充全局 commit-msg hook 提交规范。
+- `integrations/pi/codegraph-go.ts` 注释中的过时仓库路径回灌修正（`/root/codegraph-go` → `/root/workspace/codegraph-go`，仅注释，无逻辑改动）。
 
 ## [0.9.12] - 2026-09-13
 

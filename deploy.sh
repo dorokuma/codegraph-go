@@ -50,6 +50,23 @@ else
   echo "cleaned build output $ROOT/bin"
 fi
 
+echo "=== 同步 Pi 扩展 ==="
+# Pi 扩展（integrations/pi/codegraph-go.ts）此前只靠 README 手工 install，
+# deploy.sh 只换二进制，部署副本落后仓库一个提交的事故就是这么来的（旧版
+# 缺 wantsKeepCode 逃生口，把 action=node / includeCode=true 的源码正文二
+# 次剥掉）。同步收进独立小脚本，与二进制/daemon 流程解耦，也可单独执行：
+#   integrations/pi/install.sh
+# 幂等：目标 md5 与源一致即跳过、不重写。失败不阻断部署主体（二进制与
+# daemon 照常完成），仅记账——结尾 WARN 汇总段会重打，确保「部署看似成功
+# 但扩展没同步」在最后一行输出里可见。需要硬失败请单独运行该脚本。
+PI_EXT_SYNC_FAILED=0
+if bash "$ROOT/integrations/pi/install.sh"; then
+  :
+else
+  PI_EXT_SYNC_FAILED=1
+  echo "WARN: Pi 扩展同步失败（非阻断）——可单独运行 integrations/pi/install.sh 排查" >&2
+fi
+
 echo "=== 停止旧进程 ==="
 # Resolve the daemon workdir BEFORE any artifact handling. The pidfile
 # always sits at <workdir>/.codegraph/daemon.pid, so the workdir is exactly
@@ -390,7 +407,7 @@ echo "=== 提交 ==="
 if [ "${DEPLOY_COMMIT:-0}" = "1" ]; then
   # Release commits also touch CHANGELOG.md / README.md — include them so
   # DEPLOY_COMMIT does not produce an incomplete version commit.
-  git add deploy.sh internal/daemon/paths.go CHANGELOG.md README.md
+  git add deploy.sh integrations/pi/install.sh integrations/pi/codegraph-go.ts internal/daemon/paths.go CHANGELOG.md README.md
   if git diff --cached --quiet; then
     echo "无改动，跳过提交"
   else
@@ -407,3 +424,10 @@ else
 fi
 
 echo "=== 完成 ==="
+
+# 扩展同步 WARN 汇总：失败不改退出码（二进制/daemon 成功路径仍为 0），但必须在
+# 结尾重打一次——原事故的本质是「漂移发生时没有任何信号」，只在中段打一行
+# WARN 会被后续输出冲掉、运维看完 `=== 完成 ===` 就认为无事发生。
+if [ "$PI_EXT_SYNC_FAILED" = "1" ]; then
+  echo "WARN: Pi 扩展未同步（见上方 WARN）——部署副本可能仍是旧版，action=node / includeCode=true 的源码正文会被旧扩展二次剥掉。请单独运行 integrations/pi/install.sh 修复，Pi 侧 /reload 或新会话生效" >&2
+fi
