@@ -28,17 +28,26 @@ command -v md5sum >/dev/null 2>&1 || fail "md5sum not found in PATH (PATH=$PATH)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC="$ROOT/integrations/pi/codegraph-go.ts"
 
-# HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
-HOME_DIR="${HOME:-}"
-[ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
-DEST="${PI_EXT_DEST:-$HOME_DIR/.pi/agent/extensions/codegraph-go.ts}"
+# 目标解析顺序：优先采纳显式覆盖 PI_EXT_DEST，仅在未指定时才校验 HOME、
+# 回落到默认路径。修前顺序倒挂（先校验 HOME 再取 PI_EXT_DEST），导致显式设了
+# PI_EXT_DEST 也照样被「HOME is not set」拦下，而报错文案偏又教用户「set
+# PI_EXT_DEST explicitly」——文案与行为自相矛盾（实测：env -u HOME
+# PI_EXT_DEST=/tmp/x.ts bash install.sh 修复前 FAILED、exit 1）。
+if [ -n "${PI_EXT_DEST:-}" ]; then
+  DEST="$PI_EXT_DEST"
+else
+  # HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
+  HOME_DIR="${HOME:-}"
+  [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
+  DEST="$HOME_DIR/.pi/agent/extensions/codegraph-go.ts"
+fi
 [ -n "$DEST" ] || fail "destination is empty"
 case "$DEST" in
   /*) ;;
   *) fail "destination is not an absolute path: $DEST" ;;
 esac
 if [ -d "$DEST" ]; then
-  fail "destination is a directory: $DEST — expected the extension file path (dirname 而非目录本体)"
+  fail "destination is a directory: $DEST — expected the extension file path (须指定文件名而非目录本体)"
 fi
 
 [ -f "$SRC" ] || fail "source not found: $SRC"

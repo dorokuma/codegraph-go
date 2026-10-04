@@ -20,6 +20,8 @@ install -m 755 codegraph-go ~/.local/bin/codegraph-go
 install -m 644 integrations/pi/codegraph-go.ts ~/.pi/agent/extensions/codegraph-go.ts
 ```
 
+The extension is synced by [`integrations/pi/install.sh`](install.sh) (also invoked by `./deploy.sh`): it copies `integrations/pi/codegraph-go.ts` to the destination and is md5-idempotent (an already-matching target is not rewritten, so its mtime is preserved). The destination defaults to `$HOME/.pi/agent/extensions/codegraph-go.ts`. Set **`PI_EXT_DEST`** to an absolute **file path** — not a directory — to override the destination (verification / multi-machine deploys). When `PI_EXT_DEST` is set, `HOME` is not consulted at all; `HOME` is only used to derive the default path when `PI_EXT_DEST` is unset.
+
 Restart Pi or `/reload`. **Requires codegraph-go ≥ 0.9.0** (MCP only exposes
 `codegraph`; 0.9.0 changed `search` defaults — literal matching and
 `.gitignore`-aware by default, with `regex` / `no_ignore` opt-in flags — so
