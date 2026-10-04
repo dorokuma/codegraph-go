@@ -207,8 +207,8 @@ export type WorkdirDecision =
  * 统一 workdir 决议（方案 2）：config 文件 workdirs 非空时，所有会话无论
  * cwd 在哪都决议到同一个 workdir（config 声明的第一个授权根），不再按 cwd
  * 各自 spawn per-root daemon。原因：
- * - 双 daemon flock 冲突：cwd=/root/codegraph-go 的会话会 spawn 独立的
- *   per-root daemon，持有 /root/codegraph-go/.codegraph/codegraph.db 的
+ * - 双 daemon flock 冲突：cwd=/root/workspace/codegraph-go 的会话会 spawn 独立的
+ *   per-root daemon，持有 /root/workspace/codegraph-go/.codegraph/codegraph.db 的
  *   flock；主 daemon（workdir=/root）跨项目查询 path=codegraph-go 时要
  *   打开子项目 db，撞锁报 "codegraph.db in use by another process"。
  * - 索引数据单源：同一 workdir 决议 = 同一 daemon = 同一份索引，避免同一
