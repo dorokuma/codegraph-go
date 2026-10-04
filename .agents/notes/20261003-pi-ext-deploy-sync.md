@@ -14,7 +14,7 @@ supersedes: ""
 - deploy.sh 只做：编译 → 替换二进制 → 停旧 daemon → 预热 → （可选）提交。Pi 扩展的同步只写在 integrations/pi/README.md 的手工 install 一行，没有任何机制保证它被执行。
 - 事故实证：`/root/.pi/agent/extensions/codegraph-go.ts` 实际落后仓库一个提交——旧版 `formatCleanText` 无条件剥代码围栏与 rg fallback 的 `file:line:content`，把 `action=node` / `includeCode=true` / `skipCode=false` 本应保留的源码正文二次剥掉，用户在 Pi 里拿不到代码。而仓库 HEAD 版已带 `wantsKeepCode` 逃生口（`cleanOpts` 在调用点按 action/参数决定 keepCode）。
 - 部署副本里还有一处注释路径修正（`/root/codegraph-go` → `/root/workspace/codegraph-go`）从未回灌仓库——手工同步是双向腐烂的。
-- R2 双审（reviewer + oracle）对 install.sh 失效路径实测出三个静默形态：PATH 无 md5sum 时静默 exit 127、stdout/stderr 全空；HOME 未导出时被 `set -u` 一句晦涩报错打死；`PI_EXT_DEST` 指向目录时 `install` 把文件静默拷进目录、打印 `changed: installed /tmp` 且 exit 0。
+- R2 双审（reviewer + oracle）对 install.sh 失效路径实测出多个静默形态，其中「md5 取不到」一类有两种：PATH 无 md5sum 时静默 exit 127、stdout/stderr 全空；md5sum 存在但 md5 仍取空时（如源文件读不出）——bash 的 `set -e` 并不拦命令替换内部的管道失败，旧脚本会带着空的 `SRC_MD5` 走进 unchanged 分支、静默跳过同步（来源：oracle 复审实测：`no-set-e: SRC_MD5=[] reached exit=0` 与 `set-e on: REACHED after assignment exit=0`）。新版 guard 对两种形态分别防住：形态①由 `command -v md5sum` 预检在算 md5 之前直接显式 FAILED（不再是 exit 127、输出全空）；形态②由 `SRC_MD5`/`DEST_MD5` 赋值后立即 `[ -n ... ] || fail` 断言非空、且 `md5_of` 不再吞 stderr/退出码，脚本根本走不到 unchanged 比较。其余形态：HOME 未导出时被 `set -u` 一句晦涩报错打死；`PI_EXT_DEST` 指向目录时 `install` 把文件静默拷进目录、打印 `changed: installed /tmp` 且 exit 0。
 
 ## 决策
 - 同步逻辑放独立小脚本 `integrations/pi/install.sh`（与 scripts/notes-index.sh 的惯例一致，且可单独触发验证），deploy.sh 在「替换二进制」之后插入 `=== 同步 Pi 扩展 ===` 段调用它。
