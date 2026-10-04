@@ -10,6 +10,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Fixed
 - **Pi 扩展漏同步（部署副本落后仓库一个提交）**：deploy.sh 此前只替换 Go 二进制，Pi 扩展靠 `integrations/pi/README.md` 手工 install——在跑的旧版缺 `wantsKeepCode` 逃生口，会把 `action=node` / `includeCode=true` / `skipCode=false` 返回的代码围栏与 `file:line:content` 二次剥掉，源码正文丢失。新增 `integrations/pi/install.sh`（`install -m 644` 到 `~/.pi/agent/extensions/codegraph-go.ts`，md5 一致即跳过、不重写）并由 deploy.sh 调用，打印源/目标 md5 与是否变化；Pi 侧需 `/reload` 或新会话生效。同步失败不阻断 daemon 部署，但在 deploy.sh 结尾 WARN 汇总重打；install.sh 对 md5sum 缺失 / HOME 未设置 / 目标为目录 / md5 取空一律显式 `FAILED` 并非零退出，不再有静默失败路径。根因与后续项见 `.agents/notes/20261003-pi-ext-deploy-sync.md`。
+- **`integrations/pi/install.sh` 覆盖变量与 HOME 校验顺序倒挂**：修前先校验 `HOME` 再取 `PI_EXT_DEST`，导致显式设了 `PI_EXT_DEST` 也照样被「HOME is not set」拦下，而报错文案偏又教用户「set PI_EXT_DEST explicitly」，文案与行为自相矛盾（实测 `env -u HOME PI_EXT_DEST=/tmp/x.ts bash install.sh` 修复前 FAILED、exit 1）。改为优先采纳 `PI_EXT_DEST`、仅在未指定时才校验 `HOME` 推导默认路径；顺带把目标为目录的报错文案由 `(dirname 而非目录本体)` 统一为 `(须指定文件名而非目录本体)`（前者在 shell 语境下易被读成「父目录」）。仅此两处改动，其余契约（`command -v md5sum` 预检、`md5_of` 不吞 stderr/退出码、源或目标 md5 取空即败、DEST 必须绝对路径、md5 幂等不重写不动 mtime、结尾 `/reload` 提示）不变。四处 `install.sh` 契约副本同款，本修复对齐权威口径，详见 `.agents/notes/20261003-pi-ext-deploy-sync.md`。
 
 ### Changed
 - 统一 scripts/notes-index.sh 索引脚本，并在 AGENTS.md 补充索引刷新指引。

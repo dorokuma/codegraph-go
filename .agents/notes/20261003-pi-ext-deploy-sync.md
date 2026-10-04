@@ -33,6 +33,52 @@ supersedes: ""
 - 方案 B：install.sh 对 `PI_EXT_DEST` 指向目录时自动补全为 `<dir>/codegraph-go.ts`。放弃理由：静默改写用户给的路径是另一种歧义（显式失败优于魔法），且 `install` 拷进目录的行为正是要消灭的静默形态。
 - 方案 C：同步失败让 deploy.sh 整体 exit 非零。放弃理由：硬边界要求「不影响现有二进制与 daemon 部署流程」；改为结尾 WARN 汇总 + 退出码保持 0，把「可区分性」放在输出而非码上。
 
+## 追加修复（2026-10-04）：PI_EXT_DEST 与 HOME 校验顺序倒挂 + 目录报错文案
+
+> 双审在 `pi-cache-guardian` 副本上发现，本样板逐字对齐、缺陷同款存在。仅修 install.sh 两处，未重构脚本。分支 `fix/pi-ext-install-home-order`（双审第二轮：reviewer 判「可放行」、oracle 判「放行」，随本分支提交一并登记）。
+
+### 缺陷形态
+- 目标解析「先校验 HOME 再取 PI_EXT_DEST」，顺序倒挂：
+
+  ```bash
+  HOME_DIR="${HOME:-}"
+  [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
+  DEST="${PI_EXT_DEST:-$HOME_DIR/.pi/agent/extensions/codegraph-go.ts}"
+  ```
+
+  `HOME` 未设置时先 `fail`，**显式设置 `PI_EXT_DEST` 也照样被拦**，而报错文案偏偏教用户「set PI_EXT_DEST explicitly」——文案与行为自相矛盾。实测 `env -u HOME PI_EXT_DEST=/tmp/x.ts bash install.sh` → FAILED、exit 1。
+- 目录报错文案 `(dirname 而非目录本体)` 在 shell 语境下易被读成「父目录」，语义含糊。
+
+### 影响面
+- 四处 `install.sh` 契约副本同款：`pi-cache-guardian`、`ctxmode`、本样板（本仓）、在建新仓 `/root/workspace/pi-extensions`（后者以 `DEST_DIR` 形态，其「仅未指定覆盖时才校验 HOME」已是正确顺序）。**「四处同款」是对缺陷历史的陈述，不等于四处都已修复**：各副本由其归属仓的修复轮分别对齐，本仓（codegraph-go）已完成（见下「修复口径」），其余副本以其各自归属仓的提交为准；本条作为契约权威记录登记。
+
+### 实测证据
+- 修复前：`env -u HOME PI_EXT_DEST=/tmp/pi-ext-fix/codegraph-go.ts bash integrations/pi/install.sh` → FAILED、exit 1。
+- 修复后：同命令 → `changed`（exit 0）；同目标再跑一次 → `unchanged`（exit 0）；临时目标 md5 与源一致（`fc35f79118e4b655f07a4fadf793f5dd`）。
+- 仍须失败（四条均 stderr 显式 FAILED、exit 1、stdout 空）：`env -u HOME`（未给 PI_EXT_DEST）；`PI_EXT_DEST=relative/x.ts`（非绝对路径）；`PI_EXT_DEST=/tmp`（目录，新文案 `(须指定文件名而非目录本体)`）；受限 PATH 无 md5sum（`md5sum not found in PATH`）。
+- 真实目标幂等：不带覆盖变量跑一次 → `unchanged`，`/root/.pi/agent/extensions/codegraph-go.ts` mtime 前后不变（`2026-10-03 22:34:06.492614208 +0800`，inode `19959456`）。
+
+### 修复口径
+- 目标解析改为「优先采纳显式覆盖，仅在未指定时才回落 HOME」：
+
+  ```bash
+  if [ -n "${PI_EXT_DEST:-}" ]; then
+    DEST="$PI_EXT_DEST"
+  else
+    HOME_DIR="${HOME:-}"
+    [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
+    DEST="$HOME_DIR/.pi/agent/extensions/codegraph-go.ts"
+  fi
+  ```
+
+- 目录报错文案统一为 `expected the extension file path (须指定文件名而非目录本体)`。
+- 其余语义一律不动：`command -v md5sum` 预检、`md5_of` 不吞 stderr/退出码、源或目标 md5 取空即败、DEST 必须绝对路径、目标为目录显式 FAILED、md5 幂等不重写不动 mtime、结尾 `/reload` 提示。
+
+### 遗留项（双审第二轮要求登记，2026-10-04）
+1. **`ctxmode` 副本尚未对齐**：仍是旧倒挂顺序 + 旧文案 `(dirname 而非目录本体)`；且它是新仓 `/root/workspace/pi-extensions` 的**联邦级联宿主**——中枢级联会显式传覆盖变量（形如 `env PI_CTXMODE_EXT=... <宿主脚本>`），在 `HOME` 缺失环境下旧顺序会被直接拦死，即「级联显式给了覆盖变量、却被 HOME 校验拒之门外」。该副本由其归属仓的修复轮处理，不阻塞本仓本次提交。
+2. **目标带尾部斜杠且父目录不存在时，报错口径不统一**（既有缺陷，非本次引入）：`PI_EXT_DEST=/tmp/x/` 时 `mkdir -p "$(dirname '/tmp/x/')"` 建的是父级 `/tmp`，随后 `install -m 644 ... '/tmp/x/'` 原样报错，**不是统一的 `FAILED:` 前缀**——实测 `env -u HOME PI_EXT_DEST=/tmp/pi-ext-fix-banana/ bash integrations/pi/install.sh` 在打完 `destination: /tmp/pi-ext-fix-banana/` 的 stdout 块后，stderr 为 `install: 无法创建普通文件 '/tmp/pi-ext-fix-banana/': 不是目录`，exit 1。修前同样形态（`install` 调用一直未被包裹），不属本次修复范围；若后续要把失败语义收敛成统一口径，需同时顾及 `dirname` 对尾部斜杠的剥除行为。
+3. **新仓 `pi-extensions` 的 registry 级联契约**：应把「覆盖变量优先于 `HOME`」写成显式级联契约（含每个宿主脚本的覆盖变量名），并考虑在 `--audit` 增加契约探针——以 `env -u HOME PI_EXT_DEST=<临时目标> <宿主脚本>` 干跑探测顺序倒挂，把「逐字对齐样板」从人肉纪律变成可巡检项。
+
 ## 来源
 - 关联：分支 chore/pi-ext-sync（未提交）；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003。
 - 后续项（不阻断本次但不该被忘）：
