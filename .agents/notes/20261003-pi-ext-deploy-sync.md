@@ -74,15 +74,32 @@ supersedes: ""
 - 目录报错文案统一为 `expected the extension file path (须指定文件名而非目录本体)`。
 - 其余语义一律不动：`command -v md5sum` 预检、`md5_of` 不吞 stderr/退出码、源或目标 md5 取空即败、DEST 必须绝对路径、目标为目录显式 FAILED、md5 幂等不重写不动 mtime、结尾 `/reload` 提示。
 
-### 遗留项（双审第二轮要求登记，2026-10-04）
-1. **`ctxmode` 副本尚未对齐**：仍是旧倒挂顺序 + 旧文案 `(dirname 而非目录本体)`；且它是新仓 `/root/workspace/pi-extensions` 的**联邦级联宿主**——中枢级联会显式传覆盖变量（形如 `env PI_CTXMODE_EXT=... <宿主脚本>`），在 `HOME` 缺失环境下旧顺序会被直接拦死，即「级联显式给了覆盖变量、却被 HOME 校验拒之门外」。该副本由其归属仓的修复轮处理，不阻塞本仓本次提交。
-2. **目标带尾部斜杠且父目录不存在时，报错口径不统一**（既有缺陷，非本次引入）：`PI_EXT_DEST=/tmp/x/` 时 `mkdir -p "$(dirname '/tmp/x/')"` 建的是父级 `/tmp`，随后 `install -m 644 ... '/tmp/x/'` 原样报错，**不是统一的 `FAILED:` 前缀**——实测 `env -u HOME PI_EXT_DEST=/tmp/pi-ext-fix-banana/ bash integrations/pi/install.sh` 在打完 `destination: /tmp/pi-ext-fix-banana/` 的 stdout 块后，stderr 为 `install: 无法创建普通文件 '/tmp/pi-ext-fix-banana/': 不是目录`，exit 1。修前同样形态（`install` 调用一直未被包裹），不属本次修复范围；若后续要把失败语义收敛成统一口径，需同时顾及 `dirname` 对尾部斜杠的剥除行为。
-3. **新仓 `pi-extensions` 的 registry 级联契约**：应把「覆盖变量优先于 `HOME`」写成显式级联契约（含每个宿主脚本的覆盖变量名），并考虑在 `--audit` 增加契约探针——以 `env -u HOME PI_EXT_DEST=<临时目标> <宿主脚本>` 干跑探测顺序倒挂，把「逐字对齐样板」从人肉纪律变成可巡检项。
+### 遗留项（双审第二轮要求登记，2026-10-04；2026-10-16 销账更新）
+1. **[已闭合] `ctxmode` 副本尚未对齐**：当时仍是旧倒挂顺序 + 旧文案 `(dirname 而非目录本体)`；且它是新仓 `/root/workspace/pi-extensions` 的**联邦级联宿主**——中枢级联会显式传覆盖变量（形如 `env PI_CTXMODE_EXT=... <宿主脚本>`），在 `HOME` 缺失环境下旧顺序会被直接拦死，即「级联显式给了覆盖变量、却被 HOME 校验拒之门外」。该副本由其归属仓的修复轮处理，不阻塞本仓当时提交。**闭合记录**：`ctxmode` 仓提交 `d3d79d0` 已将 `/root/workspace/ctxmode/integrations/pi/install.sh` 对齐为优先采纳 `PI_CTXMODE_EXT`、未指定时才校验 `HOME`，且目录报错文案已统一为 `(须指定文件名而非目录本体)`。
+2. **[已闭合] 目标带尾部斜杠且父目录不存在时，报错口径不统一**（既有缺陷，非当时引入）：`PI_EXT_DEST=/tmp/x/` 时 `mkdir -p "$(dirname '/tmp/x/')"` 建的是父级 `/tmp`，随后 `install -m 644 ... '/tmp/x/'` 原样报错，**不是统一的 `FAILED:` 前缀**——实测 `env -u HOME PI_EXT_DEST=/tmp/pi-ext-fix-banana/ bash integrations/pi/install.sh` 在打完 `destination: /tmp/pi-ext-fix-banana/` 的 stdout 块后，stderr 为 `install: 无法创建普通文件 '/tmp/pi-ext-fix-banana/': 不是目录`，exit 1。**闭合记录（2026-10-16，分支 `chore/deploy-and-install-hardening`）**：`integrations/pi/install.sh` 在校验 `DEST` 为绝对路径之后、`-d "$DEST"` 之前显式拦截 `*/` 结尾路径（`fail "PI_EXT_DEST ($DEST) must not end with '/' — expected the extension file path (须指定文件名而非目录路径)"`），并将 `mkdir -p "$DEST_DIR"` 与 `install -m 644 "$SRC" "$DEST"` 用 `|| fail "..."` 包裹，确保任何创建目录或写入失败均统一输出 `FAILED:` 到 stderr 并 `exit 1`。
+3. **[已闭合（契约落地）] 新仓 `pi-extensions` 的 registry 级联契约**：应把「覆盖变量优先于 `HOME`」写成显式级联契约（含每个宿主脚本的覆盖变量名），并考虑在 `--audit` 增加契约探针——以 `env -u HOME PI_EXT_DEST=<临时目标> <宿主脚本>` 干跑探测顺序倒挂，把「逐字对齐样板」从人肉纪律变成可巡检项。**闭合记录**：`/root/workspace/pi-extensions/federated/registry.json` 已显式固化 3 个 `federated` 宿主的 `authority.installScript` 与 `authority.installDestEnv`（`codegraph-go` → `PI_EXT_DEST`、`ctxmode` → `PI_CTXMODE_EXT`、`pi-cache-guardian` → `PI_EXT_DEST`），三处宿主 `install.sh` 均已对齐覆盖变量优先于 `HOME`；`install.sh --audit` 保持严格只读巡检（检查上游脚本存在性与 md5/权限），全机 12 扩展巡检 100% 通过。
+
+## 追加硬化（2026-10-16）：install.sh 尾部斜杠拦截与 deploy.sh 分支/洁净度门禁
+
+- 分支：`chore/deploy-and-install-hardening`（基于 `main` `6e3b98a`）。
+- `integrations/pi/install.sh`：
+  - 在 `DEST` 绝对路径检查之后、`-d "$DEST"` 之前新增 `*/` 尾部斜杠显式拦截，在进入 md5 计算与 stdout 块之前即以 `install.sh FAILED: PI_EXT_DEST ($DEST) must not end with '/' — expected the extension file path (须指定文件名而非目录路径)` 报错退出（`exit 1`）。
+  - 在 `DEST_DIR="$(dirname "$DEST")"` 之后，将 `mkdir -p "$DEST_DIR"` 与 `install -m 644 "$SRC" "$DEST"` 两处包裹 `|| fail "..."` 兜底，消除裸系统命令报错未带 `FAILED:` 前缀的漏口。
+- `deploy.sh`：
+  - 在开头 `cd "$ROOT"` 后、`=== 编译 ===` 前新增 Git 分支与工作区洁净度前置门禁：
+    - 非 `main` 分支：`FAILED: deploy.sh requires branch 'main' (current: $CURRENT_BRANCH); set DEPLOY_ALLOW_DIRTY=1 to override`（stderr，`exit 1`）。
+    - 工作区洁净度：先在 `if` 外独立赋值 `DIRTY_STATUS="$(git status --porcelain)"`（确保 `git status` 命令本身失败时在 `set -e` 下立即停机，不会被 `if` 吞掉返回码）；当 `DIRTY_STATUS` 非空且未设豁免时，输出 `FAILED: working tree is dirty; commit/stash/clean changes before deploying, or set DEPLOY_ALLOW_DIRTY=1 (or DEPLOY_COMMIT=1) to override`（stderr，`exit 1`）。
+    - `DEPLOY_COMMIT=1` 与 `DEPLOY_ALLOW_DIRTY=1` 的协同关系：`DEPLOY_ALLOW_DIRTY=1` 同时豁免分支门禁（允许非 `main` 分支）与脏树门禁；而当用户在 `main` 分支显式设置 `DEPLOY_COMMIT=1`（期望部署完成后顺手自动提交版本/发布改动）时，前置门禁自动豁免脏树检查（无需重复叠加 `DEPLOY_ALLOW_DIRTY=1`），但非 `main` 分支下仅设 `DEPLOY_COMMIT=1` 仍会被分支门禁拦下。
+- 实测验证：
+  - `PI_EXT_DEST=/tmp/cg-test-slash/ bash integrations/pi/install.sh` → stderr 输出 `install.sh FAILED: PI_EXT_DEST (/tmp/cg-test-slash/) must not end with '/' ...`，`exit 1`。
+  - 在未提交的 `chore/deploy-and-install-hardening` 分支直接运行 `bash deploy.sh` → 第一秒即被分支门禁拦截，stderr 输出 `FAILED: deploy.sh requires branch 'main' (current: chore/deploy-and-install-hardening); set DEPLOY_ALLOW_DIRTY=1 to override`，`exit 1`；模拟 `CURRENT_BRANCH=main` 且工作区 dirty 时被第二道门禁拦截，stderr 输出 `FAILED: working tree is dirty; commit/stash/clean changes before deploying, or set DEPLOY_ALLOW_DIRTY=1 (or DEPLOY_COMMIT=1) to override`，`exit 1`。
+  - `bash /root/workspace/pi-extensions/install.sh --audit` → 12 扩展（含 `codegraph-go` federated 项）全部 `MATCH — unchanged`，`exit 0`。
 
 ## 来源
-- 关联：分支 chore/pi-ext-sync（未提交）；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003。
+- 关联：分支 chore/pi-ext-sync（已合入）及硬化分支 chore/deploy-and-install-hardening；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003；硬化任务 MARK-CODEGRAPH-HARDEN-20261015；收尾修正任务 MARK-CODEGRAPH-FIXUP-20261015。
 - 后续项（不阻断本次但不该被忘）：
-  1. 同一扩展目录 `~/.pi/agent/extensions/` 下还有 4+ 个自研扩展（ctxmode.ts / cache-guardian.ts / prism.ts / herdsman-pi.ts / herdr-agent-state.ts）各踩同一颗雷，本仓库管不到，需各自归属仓库补齐同步机制。
-  2. deploy.sh 仍无 dirty-tree / 分支检查——它会把未审查的 ts 直接盖到生产扩展目录；后续应加工作区洁净度或显式确认。
+  1. **[已闭合]** 同一扩展目录 `~/.pi/agent/extensions/` 下还有 4+ 个自研扩展（ctxmode.ts / cache-guardian.ts / prism.ts / herdsman-pi.ts / herdr-agent-state.ts）各踩同一颗雷，本仓库管不到，需各自归属仓库补齐同步机制。**闭合记录**：已由 `/root/workspace/pi-extensions` 联邦式分发中枢统一纳管全机 12 个扩展（8 hosted + 3 federated `codegraph-go`/`ctxmode`/`pi-cache-guardian` + 1 external `herdr-agent-state.ts` 只读巡检），各自宿主 `install.sh` 均已补齐并接入中枢级联。
+  2. **[已闭合]** deploy.sh 仍无 dirty-tree / 分支检查——它会把未审查的 ts 直接盖到生产扩展目录；后续应加工作区洁净度或显式确认。**闭合记录（2026-10-16）**：已在 `deploy.sh` 开头增加 `main` 分支与 `DIRTY_STATUS="$(git status --porcelain)"` 空工作区门禁（`DEPLOY_ALLOW_DIRTY=1` 可显式豁免分支与脏树检查，`main` 分支下 `DEPLOY_COMMIT=1` 自动豁免脏树检查）。
   3. 扩展加载无版本戳：运行中的会话无法自证新旧，`/reload` 只能靠人工确认；可在扩展里暴露版本常量供 status 类 action 输出。
   4. `PI_EXT_DEST` 语义已定稿为文件路径（见上），README 若补充文档需保持同一口径。
+  5. 跨仓契约副本后续跟进观察项：本仓 `integrations/pi/install.sh` 本轮新增的 `*/` 尾部斜杠显式拦截以及 `mkdir -p` / `install -m 644` 两处包裹 `|| fail` 兜底，跨仓同源契约副本（`pi-cache-guardian` 与 `ctxmode` 的 `integrations/pi/install.sh`）后续可在各自归属仓维护轮次中视需要同步对齐。

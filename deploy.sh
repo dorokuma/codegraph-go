@@ -8,8 +8,21 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINARY="${BINARY:-$HOME/.local/bin/codegraph-go}"
 CODEGRAPH_HOME="${CODEGRAPH_HOME:-$HOME/.codegraph}"
 
-echo "=== 编译 ==="
 cd "$ROOT"
+
+# 前置门禁：默认仅允许在干净的 main 分支执行部署，避免把未合入分支或未审改动直接盖进生产二进制与 Pi 扩展目录。
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$CURRENT_BRANCH" != "main" ] && [ "${DEPLOY_ALLOW_DIRTY:-0}" != "1" ]; then
+  echo "FAILED: deploy.sh requires branch 'main' (current: $CURRENT_BRANCH); set DEPLOY_ALLOW_DIRTY=1 to override" >&2
+  exit 1
+fi
+DIRTY_STATUS="$(git status --porcelain)"
+if [ -n "$DIRTY_STATUS" ] && [ "${DEPLOY_ALLOW_DIRTY:-0}" != "1" ] && [ "${DEPLOY_COMMIT:-0}" != "1" ]; then
+  echo "FAILED: working tree is dirty; commit/stash/clean changes before deploying, or set DEPLOY_ALLOW_DIRTY=1 (or DEPLOY_COMMIT=1) to override" >&2
+  exit 1
+fi
+
+echo "=== 编译 ==="
 go build -o ./bin/codegraph-go ./cmd/codegraph-go 2>&1
 echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
 

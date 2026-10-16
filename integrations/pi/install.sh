@@ -46,6 +46,11 @@ case "$DEST" in
   /*) ;;
   *) fail "destination is not an absolute path: $DEST" ;;
 esac
+case "$DEST" in
+  */)
+    fail "PI_EXT_DEST ($DEST) must not end with '/' — expected the extension file path (须指定文件名而非目录路径)"
+    ;;
+esac
 if [ -d "$DEST" ]; then
   fail "destination is a directory: $DEST — expected the extension file path (须指定文件名而非目录本体)"
 fi
@@ -80,8 +85,9 @@ if [ -f "$DEST" ] && [ "$DEST_MD5" = "$SRC_MD5" ]; then
   echo "unchanged: destination already matches source (md5 $SRC_MD5), nothing written"
 else
   # 目标父目录在新机器上可能不存在（~/.pi/agent/extensions），先建好。
-  mkdir -p "$(dirname "$DEST")"
-  install -m 644 "$SRC" "$DEST"
+  DEST_DIR="$(dirname "$DEST")"
+  mkdir -p "$DEST_DIR" || fail "failed to create destination directory: $DEST_DIR"
+  install -m 644 "$SRC" "$DEST" || fail "failed to install $SRC to $DEST"
   echo "changed: installed $DEST (md5 $SRC_MD5)"
 fi
 
