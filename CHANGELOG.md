@@ -17,6 +17,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - 统一 scripts/notes-index.sh 索引脚本，并在 AGENTS.md 补充索引刷新指引。
 - AGENTS.md 补充全局 commit-msg hook 提交规范。
 - `integrations/pi/codegraph-go.ts` 注释中的过时仓库路径回灌修正（`/root/codegraph-go` → `/root/workspace/codegraph-go`，仅注释，无逻辑改动）。
+- `AGENTS.md`（本地忽略文件）「关联仓库」章节移除已归档退役的 `prism` 条目（详见 `.agents/notes/20261016-drop-prism-related-repo.md`）。
 
 ## [0.9.12] - 2026-09-13
 
