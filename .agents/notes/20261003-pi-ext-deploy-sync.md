@@ -13,7 +13,7 @@ supersedes: "/root/workspace/pi-cache-guardian/.agents/notes/20261004-pi-ext-syn
 - 权威源统一覆盖以下 4 项跨仓共性观察项：
   1. **扩展加载无版本戳［状态：未闭环（本轮未修）］**：Pi 仅在会话启动或 `/reload` 时加载扩展，运行中的会话无法自证新旧，`/reload` 只能靠人工确认；后续可在扩展里暴露版本常量供 status 类 action 输出（见下文「来源 → 后续项 #3」）。
   2. **`PI_EXT_DEST` 语义定稿为目标文件完整路径［状态：已定稿（见本仓 main 分支 install.sh 现行为与 6e3b98a/e10ca85 提交）］**：目标覆盖变量（`PI_EXT_DEST` / `PI_CTXMODE_EXT`）语义统一为目标扩展文件的完整绝对路径（而非目录），且优先级高于 `HOME`；指向已存在目录或非绝对路径均显式 `FAILED` 退出，不静默补全文件名、不静默拷进目录（见下文「决策」「追加修复（2026-10-04）」及「来源 → 后续项 #4」）。
-  3. **`install.sh` 尾部斜杠拦截与 `mkdir -p` / `install` 兜底［状态：ctxmode 副本已落地、pi-cache-guardian 副本未见（逐仓状态不同步，须按仓核验）；本样板仓已于 0764b30 落地］**：在校验 `DEST` 为绝对路径后、`-d "$DEST"` 前显式拦截 `*/` 尾部斜杠路径，并将 `mkdir -p "$DEST_DIR"` 与 `install -m 644 "$SRC" "$DEST"` 用 `|| fail "..."` 包裹以确保失败统一带 `FAILED:` 前缀输出到 stderr 并 `exit 1`（见下文「遗留项 #2」「追加硬化（2026-10-16）」及「来源 → 后续项 #5」）。
+  3. **`install.sh` 尾部斜杠拦截与 `mkdir -p` / `install` 兜底［状态：仅本样板仓已于 0764b30 落地；ctxmode（d3d79d0）与 pi-cache-guardian 副本均未见落地（无 */ 尾部斜杠拦截、mkdir -p / install 未用 || fail 包裹）］**：在校验 `DEST` 为绝对路径后、`-d "$DEST"` 前显式拦截 `*/` 尾部斜杠路径，并将 `mkdir -p "$DEST_DIR"` 与 `install -m 644 "$SRC" "$DEST"` 用 `|| fail "..."` 包裹以确保失败统一带 `FAILED:` 前缀输出到 stderr 并 `exit 1`（见下文「遗留项 #2」「追加硬化（2026-10-16）」及「来源 → 后续项 #5」）。
   4. **`changed` 分支未复验目标 md5 的模板级问题［状态：未修（模板级，四仓同修才动）］**：同源 `install.sh` 模板在 `changed` 分支执行 `install -m 644 "$SRC" "$DEST"` 后，直接输出 `changed: installed $DEST (md5 $SRC_MD5)`，未对写入后的目标文件重新计算 `md5_of "$DEST"` 并与 `$SRC_MD5` 复验比对；属三仓同源 `install.sh` 的模板级共性观察项，统一在此登记。
 
 ## 一句话结论
