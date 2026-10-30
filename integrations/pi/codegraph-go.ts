@@ -30,8 +30,38 @@ const DIAG_LOG_FILE = "codegraph-go.log"
 let diagLogPath: string | null = null
 
 /**
+ * Resolve the agent configuration directory the same way every Go extension
+ * does (go/agentdir.go in pi-extensions): PIG_EXT_HOST_INFO.agentDir →
+ * PI_CODING_AGENT_DIR → PIG_CODING_AGENT_DIR → $PIG_HOME/agent →
+ * ~/.pig/agent — never ~/.pi, so a redirected or isolated PiG run cannot
+ * recreate the retired Pi home. Returns "" only when no home resolves.
+ */
+function resolveAgentDir(): string {
+	try {
+		const raw = process.env.PIG_EXT_HOST_INFO
+		if (raw) {
+			const parsed = JSON.parse(raw) as { agentDir?: string }
+			if (typeof parsed.agentDir === "string" && parsed.agentDir.trim() !== "") {
+				return parsed.agentDir
+			}
+		}
+	} catch {
+		// malformed host info falls through to the env chain
+	}
+	const piDir = process.env.PI_CODING_AGENT_DIR?.trim()
+	if (piDir) return piDir
+	const pigDir = process.env.PIG_CODING_AGENT_DIR?.trim()
+	if (pigDir) return pigDir
+	const pigHome = process.env.PIG_HOME?.trim()
+	if (pigHome) return path.join(pigHome, "agent")
+	const home = os.homedir()
+	if (!home) return ""
+	return path.join(home, ".pig", "agent")
+}
+
+/**
  * TUI-safe diagnostics. console.* corrupts Pi's input row — only DEBUG may print.
- * Otherwise append to ~/.pi/agent/logs/codegraph-go.log.
+ * Otherwise append to <agent dir>/logs/codegraph-go.log.
  */
 function diagLog(msg: string): void {
 	const line = `[${DIAG_TAG}] ${msg}`
@@ -41,7 +71,7 @@ function diagLog(msg: string): void {
 	}
 	try {
 		if (!diagLogPath) {
-			const dir = path.join(os.homedir() || "/tmp", ".pi", "agent", "logs")
+			const dir = path.join(resolveAgentDir() || path.join(os.homedir() || "/tmp", ".pig", "agent"), "logs")
 			fs.mkdirSync(dir, { recursive: true })
 			diagLogPath = path.join(dir, DIAG_LOG_FILE)
 		}

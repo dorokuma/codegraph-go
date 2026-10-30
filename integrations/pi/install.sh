@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — 把仓库版 Pi 扩展同步安装到 ~/.pi/agent/extensions/。
+# install.sh — 把仓库版 Pi 扩展同步安装到 ~/.pig/agent/extensions/。
 #
 # 背景：deploy.sh 只部署 Go 二进制，Pi 扩展（integrations/pi/codegraph-go.ts）
 # 的同步此前依赖 integrations/pi/README.md 的手工 install，容易漏——部署副本
@@ -8,7 +8,7 @@
 # 正文。本脚本把该步骤收进 deploy.sh，也可单独执行验证：
 #   integrations/pi/install.sh
 #
-# DEST 语义定稿：目标是一个「文件路径」（~/.pi/agent/extensions/
+# DEST 语义定稿：目标是一个「文件路径」（~/.pig/agent/extensions/
 # codegraph-go.ts），不接受目录——指向已存在目录时显式失败，不静默补全
 # 文件名、不静默拷进目录。PI_EXT_DEST 可覆盖（验证/多机部署场景）。
 #
@@ -39,7 +39,7 @@ else
   # HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
   HOME_DIR="${HOME:-}"
   [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
-  DEST="$HOME_DIR/.pi/agent/extensions/codegraph-go.ts"
+  DEST="$HOME_DIR/.pig/agent/extensions/codegraph-go.ts"
 fi
 [ -n "$DEST" ] || fail "destination is empty"
 case "$DEST" in
@@ -84,7 +84,7 @@ echo "  target md5:  $DEST_MD5"
 if [ -f "$DEST" ] && [ "$DEST_MD5" = "$SRC_MD5" ]; then
   echo "unchanged: destination already matches source (md5 $SRC_MD5), nothing written"
 else
-  # 目标父目录在新机器上可能不存在（~/.pi/agent/extensions），先建好。
+  # 目标父目录在新机器上可能不存在（~/.pig/agent/extensions），先建好。
   DEST_DIR="$(dirname "$DEST")"
   mkdir -p "$DEST_DIR" || fail "failed to create destination directory: $DEST_DIR"
   install -m 644 "$SRC" "$DEST" || fail "failed to install $SRC to $DEST"
