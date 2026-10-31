@@ -35,6 +35,10 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 		"--line-number", "--no-heading", "--color=never",
 		"--max-count=20",
 		"-e", defPattern)
+	rgDef.Args = append(rgDef.Args, rgExcludeArgs(root, false)...)
+	// "/"-anchored exclude globs resolve against the child's cwd — run rg
+	// from the project root so "!/sub" pins to <root>/sub.
+	rgDef.Dir = root
 	rgDef.Args = append(rgDef.Args, rgRoots...)
 	// Streamed + capped: the old rg.Output() loaded the whole match set into
 	// memory before the per-definition loop (audit medium).
@@ -54,6 +58,8 @@ func (s *Server) toolCalleesBodyFallback(ctx context.Context, root string, datab
 			"--line-number", "--no-heading", "--color=never",
 			"--max-count=20",
 			"-e", fallbackPattern)
+		rgDefFallback.Args = append(rgDefFallback.Args, rgExcludeArgs(root, false)...)
+		rgDefFallback.Dir = root
 		rgDefFallback.Args = append(rgDefFallback.Args, rgRoots...)
 		defLines, _, err = rgOutputLines(rgDefFallback, 2000, 1<<20)
 		if err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/dorokuma/codegraph-go/internal/config"
 	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 	"github.com/dorokuma/codegraph-go/internal/safelog"
 	"github.com/dorokuma/codegraph-go/internal/server"
 )
@@ -115,6 +116,21 @@ func checkDirectFallbackSafe(root string) error {
 // hanging forever.
 const fatalFlushTimeout = 2 * time.Second
 
+// canonicalize resolves p to an absolute path with symlinks evaluated,
+// matching the workdir canonicalization in main. Failures keep the
+// absolute (or original) path — narrowing and validation work on the
+// cleaned form.
+func canonicalize(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	if rp, err := filepath.EvalSymlinks(abs); err == nil && rp != "" {
+		return rp
+	}
+	return abs
+}
+
 // fatalf reports a fatal error with the exact log.Fatalf output format and
 // exit code 1, but flushes the non-blocking log buffer first. log.Fatalf
 // cannot be used on these paths: its internal os.Exit skips deferred cleanup
@@ -156,6 +172,12 @@ func main() {
 
 	cfg := config.LoadConfig()
 
+	// Thin call: apply configured nice/GOMAXPROCS to this process. Runs for
+	// every mode — the client (spawned daemon inherits the parent's niceness
+	// anyway, and the daemon re-applies its own copy on startup), the
+	// CODEGRAPH_DAEMON_INTERNAL daemon itself, and direct mode.
+	daemon.ApplyProcessLimits(cfg.Nice, cfg.MaxProcs)
+
 	// Canonicalize all workdirs (abs + EvalSymlinks) and dedup.
 	seen := make(map[string]bool)
 	var unique []string
@@ -181,6 +203,32 @@ func main() {
 	}
 	// Primary workdir for backward compat (cfg.Workdir = workdirs[0]).
 	cfg.Workdir = cfg.Workdirs[0]
+
+	// Startup workdir narrowing (single source: extraction). When the
+	// session target — explicit -workdir (or the daemon's -workdir arg,
+	// which SpawnDetached passes verbatim) or the process cwd — sits in a
+	// subtree a configured workdir refuses to index (.wt worktree
+	// container, exclude_dirs rule, home-mode non-project dir), the parent
+	// root's index is blind to it by construction. Shrink Workdirs to the
+	// target itself BEFORE the authority check below: the target stays a
+	// descendant of a config workdir, so ValidateWorkdirs still passes,
+	// and the parent root is not kept as a blind ExtraDBs secondary.
+	//
+	// LoadConfig has already published the runtime config snapshot
+	// (YAML exclude_dirs + CODEGRAPH_EXCLUDE_DIRS) via applyEnvOverrides
+	// + storeRuntimeConfig, so ShouldSkipDirIn sees the full rule set.
+	{
+		explicitWd := ""
+		if cfg.ExplicitWorkdir != "" {
+			explicitWd = canonicalize(cfg.ExplicitWorkdir)
+		}
+		cwd := ""
+		if wd, err := os.Getwd(); err == nil {
+			cwd = canonicalize(wd)
+		}
+		cfg.Workdirs = extraction.NarrowExcludedWorkdirs(explicitWd, cwd, cfg.Workdirs)
+		cfg.Workdir = cfg.Workdirs[0]
+	}
 
 	// Authority check: the config file's workdirs are the allowlist — any
 	// workdir outside those roots (or not a descendant of one) is refused
@@ -237,10 +285,13 @@ func main() {
 	}
 
 	// Need a place for lock/socket. Prefer first existing .codegraph/ across
-	// all workdirs; otherwise use primary workdir.
+	// all workdirs; otherwise use primary workdir. The bounded variant stops
+	// at a candidate root whose own skip rules exclude the starting path
+	// (e.g. a worktree under .wt): that index cannot contain the path, so
+	// adopting it would serve a blind index for the worktree.
 	root := ""
 	for _, wd := range cfg.Workdirs {
-		root = db.FindNearestCodeGraphRoot(wd)
+		root = db.FindNearestCodeGraphRootBounded(wd, extraction.ShouldSkipDirIn)
 		if root != "" {
 			break
 		}
@@ -257,8 +308,9 @@ func main() {
 	}
 
 	// Probe → spawn → dial shared daemon; on failure fall back to direct.
-	// Pass parent -config / -no-sync so the detached writer matches this session.
-	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync}
+	// Pass parent -config / -no-sync / cpu quota so the detached writer
+	// matches this session.
+	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync, CPUQuotaPercent: cfg.CPUQuotaPercent}
 	conn, br, hello, ok, err := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
 	if ok {
 		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)

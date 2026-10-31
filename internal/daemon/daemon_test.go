@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -239,4 +240,32 @@ func TestHelloVersionMismatch(t *testing.T) {
 	if res.Outcome != "fallback-needed" {
 		t.Fatalf("want fallback on mismatch, got %+v", res)
 	}
+}
+
+// TestApplyProcessLimitsMaxProcs: GOMAXPROCS capping honours the env-var
+// precedence rule — an explicit GOMAXPROCS always wins over max_procs.
+func TestApplyProcessLimitsMaxProcs(t *testing.T) {
+	prev := runtime.GOMAXPROCS(-1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+
+	ApplyProcessLimits(0, 1)
+	if got := runtime.GOMAXPROCS(-1); got != 1 {
+		t.Fatalf("GOMAXPROCS = %d, want 1 after ApplyProcessLimits(0,1)", got)
+	}
+
+	t.Setenv("GOMAXPROCS", "7")
+	ApplyProcessLimits(0, 2)
+	if got := runtime.GOMAXPROCS(-1); got != 1 {
+		t.Fatalf("explicit GOMAXPROCS env must not be overridden, got %d", got)
+	}
+
+	// nice=0 / maxProcs=0 are pure no-ops (also exercises the non-error
+	// path of a setpriority that may fail without CAP_SYS_NICE).
+	// Non-zero nice levels are verified only in limits_linux_test.go's
+	// re-executed child process — calling ApplyProcessLimits(19, 0) here
+	// would renice the go test process itself, and a non-root user
+	// running -count=3 could no longer raise the priority back in later
+	// rounds (nice can only be lowered without CAP_SYS_NICE), making the
+	// isolated child's nice=12 setpriority fail.
+	ApplyProcessLimits(0, 0)
 }

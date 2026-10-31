@@ -6,6 +6,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ## [Unreleased]
 
 ### Added
+- **可配置的冗余目录排除**：`config.yaml` 新增 `exclude_dirs`（亦可用 `CODEGRAPH_EXCLUDE_DIRS` 逗号分隔追加），支持四类规则——裸目录名 / glob（如 `*-backup*`，按 basename 匹配）、相对 workdir 的 slash 路径（如 `experiments/scratch`）、以及 `"./sub"` / `"/sub"` 顶层锚定语法（仅排除 `<workdir>/sub` 及其子树，不误伤深层同名目录如 `proj/internal/ref`），统一作用于索引遍历、文件监听、git-assist 的 `ShouldSkipDirIn` 及 rg 侧搜索排除；内置跳过名单新增 `.wt`（git worktree 容器目录），同时新增 workdir 根保护——当 workdir 本身落在被排除路径（含单个 `.wt/<repo>/<branch>` worktree）时根及其子树绝不误跳过。rg 兜底（`search`/`files`/`callers`/`callees`/`impact`）现在经新增的 `extraction.BuiltinSkipGlobs(root)` 单一真源导出同一套内置排除——`skipDirNames` 单段目录名、`skipPathFragments` 多段缓存树（`.local/lib`、`.cargo/registry`、`code_references`、`gopath/pkg` 等）及 Go 工具链段（`go/pkg`、`go/bin`、`go/src`，经 `isGopathRoot` 判定顶层 `go`），不再只排除 `.wt` 与 `exclude_dirs`；`search`/`files` 在已收窄进跳过祖先目录（如 `node_modules/pkg`、`.local/lib/pkg`、`.wt/repo/feat`）的 workdir 下仍正常命中根内文件，不误清空。`index_workers` 亦可经 YAML 配置（优先级：`CODEGRAPH_INDEX_WORKERS` 环境变量 > `index_workers` > 默认 min(8, NumCPU-1)）。
+- **守护进程资源限制**：`config.yaml` 新增 `nice`（[0,19]，越界截断；`CODEGRAPH_NICE` 覆盖；Linux 下遍历 `/proc/self/task` 覆盖全进程所有线程，不止调用线程）、`max_procs`（[0,64] GOMAXPROCS 上限，仅当 `GOMAXPROCS` 环境变量未设置时生效；`CODEGRAPH_MAX_PROCS` 覆盖）与 `cpu_quota_percent`（[0,6400] 钳制，如 `150` 即 1.5 核；`CODEGRAPH_CPU_QUOTA_PERCENT` 覆盖）。`main` 在 `LoadConfig()` 后对当前进程做一行薄调用 `daemon.ApplyProcessLimits`，客户端/守护进程/direct 模式同时生效；`cpu_quota_percent` 仅在 systemd 主机且 `systemd-run` 可用时经 `systemd-run --quiet --scope -p CPUQuota=<N>%` 包装拉起守护进程，`cmd.Start()` 失败或 150ms 观察窗内非零退出自动无感回退直接执行，更晚的异步失败记 warn 日志并由客户端拨号超时落回 direct 模式。
 - **Agent 协作骨架**：接入 `AGENTS.md` 协作规范、`.agents/notes/` 决策与踩坑笔记机制及 `scripts/notes-index.sh` 索引生成工具。
 
 ### Fixed

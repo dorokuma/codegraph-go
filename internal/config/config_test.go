@@ -1,10 +1,14 @@
 package config
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestValidateWorkdirsEqualRoot: a workdir equal to an allowed root passes.
@@ -338,5 +342,193 @@ func TestWorkdirAllowlistHomeFallbackUnresolvable(t *testing.T) {
 	}
 	if err := ValidateWorkdirs([]string{"/root"}, allow); err == nil {
 		t.Fatal("empty allowlist from unresolvable $HOME must reject every workdir (fail closed)")
+	}
+}
+
+// TestYamlConfigParsesNewFields: the new optional resource/exclusion keys
+// decode into the yamlConfig struct; unknown keys remain ignored.
+func TestYamlConfigParsesNewFields(t *testing.T) {
+	src := `
+workdirs:
+  - /root/workspace
+exclude_dirs:
+  - "*-backup*"
+  - vendor2/
+nice: 10
+max_procs: 4
+index_workers: 3
+cpu_quota_percent: 150
+unknown_future_key: whatever
+`
+	var yc yamlConfig
+	if err := yaml.Unmarshal([]byte(src), &yc); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(yc.ExcludeDirs, []string{"*-backup*", "vendor2/"}) {
+		t.Fatalf("ExcludeDirs = %v", yc.ExcludeDirs)
+	}
+	if yc.Nice != 10 || yc.MaxProcs != 4 || yc.IndexWorkers != 3 || yc.CPUQuotaPercent != 150 {
+		t.Fatalf("numeric fields = %+v", yc)
+	}
+}
+
+// TestApplyEnvOverridesClamp: out-of-range YAML values are clamped and the
+// CODEGRAPH_* env vars override (ExcludeDirs appends).
+func TestApplyEnvOverridesClamp(t *testing.T) {
+	cfg := &Config{Nice: 99, MaxProcs: -5, CPUQuotaPercent: -3, ExcludeDirs: []string{"a"}}
+	t.Setenv(EnvExcludeDirs, " b ,c/ , , ")
+	t.Setenv(EnvNice, "-4")
+	applyEnvOverrides(cfg)
+	if cfg.Nice != 0 { // env override -4 clamped to 0
+		t.Fatalf("Nice = %d, want 0", cfg.Nice)
+	}
+	if cfg.MaxProcs != 0 || cfg.CPUQuotaPercent != 0 {
+		t.Fatalf("negative caps must clamp to 0, got %+v", cfg)
+	}
+	want := []string{"a", "b", "c/"}
+	if !reflect.DeepEqual(cfg.ExcludeDirs, want) {
+		t.Fatalf("ExcludeDirs = %v, want %v", cfg.ExcludeDirs, want)
+	}
+
+	// max_procs env override wins and clamps to 64.
+	t.Setenv(EnvMaxProcs, "999")
+	applyEnvOverrides(cfg)
+	if cfg.MaxProcs != 64 {
+		t.Fatalf("MaxProcs = %d, want 64", cfg.MaxProcs)
+	}
+
+	// cpu_quota_percent clamps to [0,6400]: 6400 = a 64-core host fully
+	// allotted (CPUQuota=<N>% with 100 per core); anything higher is
+	// meaningless to systemd and must not leak through.
+	t.Setenv(EnvCPUQuotaPercent, "99999")
+	applyEnvOverrides(cfg)
+	if cfg.CPUQuotaPercent != 6400 {
+		t.Fatalf("CPUQuotaPercent = %d, want 6400", cfg.CPUQuotaPercent)
+	}
+}
+
+// TestLoadConfigPublishesRuntimeSnapshot: LoadConfig stores exclude_dirs and
+// index_workers in the package-level snapshot read by ExcludeDirs() and
+// IndexWorkers().
+func TestLoadConfigPublishesRuntimeSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "isolated-home"))
+	cfgFile := filepath.Join(dir, "config.yaml")
+	body := "workdirs:\n  - " + dir + "\nexclude_dirs:\n  - junk\nindex_workers: 3\nnice: 5\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEGRAPH_CONFIG", cfgFile)
+	t.Cleanup(func() { SetRuntimeConfigForTesting(nil, 0) })
+
+	// Isolate flag state: LoadConfig parses os.Args.
+	oldArgs := os.Args
+	oldFlagCommandLine := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	os.Args = []string{os.Args[0]}
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldFlagCommandLine
+	}()
+
+	cfg := LoadConfig()
+	if cfg.Nice != 5 {
+		t.Fatalf("cfg.Nice = %d, want 5", cfg.Nice)
+	}
+	if got := ExcludeDirs(); !reflect.DeepEqual(got, []string{"junk"}) {
+		t.Fatalf("ExcludeDirs() = %v, want [junk]", got)
+	}
+	if got := IndexWorkers(); got != 3 {
+		t.Fatalf("IndexWorkers() = %d, want 3 (config wins over default)", got)
+	}
+	// Env override still wins over the config snapshot.
+	t.Setenv(EnvIndexWorkers, "2")
+	if got := IndexWorkers(); got != 2 {
+		t.Fatalf("IndexWorkers() = %d, want 2 (env beats config)", got)
+	}
+}
+
+// TestLoadConfigAbsolutizesConfigFile: a relative config path (the
+// ./codegraph-config.yaml lookup candidate) must be stored back into
+// cfg.ConfigFile as an absolute path so a detached daemon whose cmd.Dir
+// differs still opens the same file (S3).
+func TestLoadConfigAbsolutizesConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "isolated-home"))
+	local := filepath.Join(dir, "codegraph-config.yaml")
+	body := "workdirs:\n  - " + dir + "\n"
+	if err := os.WriteFile(local, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	oldArgs := os.Args
+	oldFlagCommandLine := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	os.Args = []string{os.Args[0]}
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldFlagCommandLine
+	}()
+
+	cfg := LoadConfig()
+	if !filepath.IsAbs(cfg.ConfigFile) {
+		t.Fatalf("ConfigFile = %q, want absolute path", cfg.ConfigFile)
+	}
+	if cfg.ConfigFile != local {
+		t.Fatalf("ConfigFile = %q, want %q", cfg.ConfigFile, local)
+	}
+}
+
+// TestLoadConfigExplicitWorkdir: ExplicitWorkdir records the -workdir flag
+// value (post expandPath) and stays "" when the flag was omitted — even
+// after Workdir is backfilled from Workdirs[0]. Downstream narrowing
+// (extraction.NarrowExcludedWorkdirs) relies on this distinction.
+func TestLoadConfigExplicitWorkdir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "isolated-home"))
+	cfgFile := filepath.Join(dir, "config.yaml")
+	body := "workdirs:\n  - " + dir + "\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEGRAPH_CONFIG", cfgFile)
+
+	oldArgs := os.Args
+	oldFlagCommandLine := flag.CommandLine
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldFlagCommandLine
+	}()
+
+	// No -workdir: ExplicitWorkdir stays empty even though Workdir is
+	// backfilled from the config workdirs.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	os.Args = []string{os.Args[0]}
+	cfg := LoadConfig()
+	if cfg.ExplicitWorkdir != "" {
+		t.Fatalf("ExplicitWorkdir = %q, want \"\" without -workdir", cfg.ExplicitWorkdir)
+	}
+	if cfg.Workdir != dir {
+		t.Fatalf("Workdir = %q, want %q (backfilled from config)", cfg.Workdir, dir)
+	}
+
+	// Explicit -workdir: recorded in ExplicitWorkdir.
+	explicit := filepath.Join(dir, "wt")
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	os.Args = []string{os.Args[0], "-workdir", explicit}
+	cfg = LoadConfig()
+	if cfg.ExplicitWorkdir != explicit {
+		t.Fatalf("ExplicitWorkdir = %q, want %q", cfg.ExplicitWorkdir, explicit)
+	}
+	if cfg.Workdirs[0] != explicit {
+		t.Fatalf("Workdirs[0] = %q, want %q", cfg.Workdirs[0], explicit)
 	}
 }

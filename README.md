@@ -85,6 +85,39 @@ codegraph-go -workdir /path/to/project
 | `-workdir` | current directory | Workspace root |
 | `-no-sync` | false | Disable auto-sync file watcher |
 
+### Config file
+
+Optional YAML config (`-config` > `$CODEGRAPH_CONFIG` > `./codegraph-config.yaml` > `~/.config/codegraph/config.yaml`):
+
+```yaml
+workdirs: [/path/to/project]     # authority roots for workdir validation
+exclude_dirs:                  # extra dirs to skip while indexing/watching
+  - "*-backup*"                 # bare name or glob matched on dir basename
+  - experiments/scratch         # workdir-relative slash path
+  - "./ref"                     # top-level anchor: only <workdir>/ref and its
+                               # subtree — a deep proj/internal/ref is NOT excluded
+nice: 10                       # process nice level, clamped to [0,19] (0 = untouched;
+                               # Linux: applied to every thread via /proc/self/task)
+max_procs: 4                   # GOMAXPROCS cap, clamped to [0,64] (0 = unlimited);
+                               # an explicit $GOMAXPROCS env always wins
+index_workers: 3               # parallel extract workers
+                               # ($CODEGRAPH_INDEX_WORKERS env > this > default min(8, cores-1))
+cpu_quota_percent: 150         # launch the daemon under a systemd-run scope with
+                               # CPUQuota=150%, clamped to [0,6400] (0 = off; falls
+                               # back to a plain spawn on non-systemd hosts or when
+                               # the scope launch fails — never blocks daemon start)
+```
+
+Env overrides: `CODEGRAPH_EXCLUDE_DIRS` (comma-separated, appends),
+`CODEGRAPH_NICE`, `CODEGRAPH_MAX_PROCS`, `CODEGRAPH_CPU_QUOTA_PERCENT`.
+The built-in skip list already covers dependency caches, build outputs and
+the `.wt` git-worktree container; the workdir root itself is never skipped
+even when it sits inside an excluded path (e.g. a single worktree as
+workdir). The same built-in skip dirs and `skipPathFragments` cache trees
+(node_modules, `.local/lib`, `go/pkg`, `.cargo/registry`, …) are also
+excluded from rg-based `search`/`files`/`callers`/`callees`/`impact`, so
+the rg backstop and the indexer never disagree about what is in scope.
+
 ### Shared daemon socket auth
 
 The optional shared daemon serves MCP sessions over a Unix socket that is
