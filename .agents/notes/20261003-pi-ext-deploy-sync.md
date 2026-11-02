@@ -117,6 +117,7 @@ supersedes: "/root/workspace/pi-cache-guardian/.agents/notes/20261004-pi-ext-syn
   - 显式 `PI_EXT_DEST` 或默认目录无 `go.mod` 时，原安装与 md5 幂等行为 100% 不变。
 - **回归测试**：`scripts/test_deploy_immutable_lock.sh` 新增场景 5（断言 25–29，总计 29/29）：bash -n 语法检查；(a) 临时 HOME 下放原生扩展软链 + 预置脏 `.ts`，不传 `PI_EXT_DEST` → exit 0、输出 `skipped: native Go extension active`、脏 `.ts` 自愈清除、`go.mod` 完好；(b) 同夹具显式 `PI_EXT_DEST` → `changed: installed`、`.ts` 正常落盘；(c) 无原生扩展的新鲜 HOME 连跑两次 → `changed: installed` → `unchanged`。全部使用临时 HOME，不触碰真实 `/root/.pig`。
 - **实测**：手跑三场景与脚本断言一致；真实 `/root/.pig/agent/extensions/codegraph-go.ts` 确认不存在。
+- **oracle-cg-r7 `consider` 观察项**：跨仓联邦中枢 `/root/workspace/pi-extensions/install.sh` 级联同步时会显式注入 `PI_EXT_DEST`，按契约走 `EXPLICIT_DEST=1` 分支（显式覆盖变量保留给测试与定向导出使用）；在 `zero-node` 主机上退役已迁为原生 Go 扩展条目的 TS 级联同步归属外部 `/root/workspace/pi-extensions` 仓后续演进处理（`out-of-scope`）。
 
 ## 来源
 - 关联：分支 chore/pi-ext-sync（已合入）及硬化分支 chore/deploy-and-install-hardening；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003；硬化任务 MARK-CODEGRAPH-HARDEN-20261015；收尾修正任务 MARK-CODEGRAPH-FIXUP-20261015；zero-node 共存保护修复任务 MARK-WORKER-CG-R6B-20261103-0332。
