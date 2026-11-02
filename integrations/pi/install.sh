@@ -35,11 +35,13 @@ SRC="$ROOT/integrations/pi/codegraph-go.ts"
 # PI_EXT_DEST=/tmp/x.ts bash install.sh 修复前 FAILED、exit 1）。
 if [ -n "${PI_EXT_DEST:-}" ]; then
   DEST="$PI_EXT_DEST"
+  EXPLICIT_DEST=1
 else
   # HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
   HOME_DIR="${HOME:-}"
   [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
   DEST="$HOME_DIR/.pig/agent/extensions/codegraph-go.ts"
+  EXPLICIT_DEST=0
 fi
 [ -n "$DEST" ] || fail "destination is empty"
 case "$DEST" in
@@ -56,6 +58,28 @@ if [ -d "$DEST" ]; then
 fi
 
 [ -f "$SRC" ] || fail "source not found: $SRC"
+
+# 原生 Go 扩展共存保护（zero-node 宿主机）：默认目标路径下若已存在同名原生
+# Go 扩展目录（含 go.mod，如 ~/.pig/agent/extensions/codegraph-go 指向
+# pi-extensions/go/codegraph-go 的软链），说明本机走原生扩展路线——把 .ts
+# 拷进去会让 pig 启动时调起已不存在的 node 重打包，所有会话直接起不来
+# （spawn:runtime_unavailable: TypeScript extensions need Node.js 22.13）。
+# 此时先自愈清理残留的 .ts 副本/坏软链，再显式 exit 0，绝不写入 TypeScript
+# 扩展。仅作用于默认路径（EXPLICIT_DEST=0）；显式 PI_EXT_DEST 时 100% 保留
+# 原有安装与 md5 幂等行为。
+if [ "$EXPLICIT_DEST" -eq 0 ]; then
+  NATIVE_EXT="${DEST%.ts}"
+  if [ -d "$NATIVE_EXT" ] && [ -f "$NATIVE_EXT/go.mod" ]; then
+    # 残留文件或非目录软链自愈：.ts 已存在说明上次同步曾写入过，先清掉。
+    if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+      rm -f -- "$DEST" || fail "failed to remove stale TypeScript extension: $DEST"
+    fi
+    echo "pi extension sync"
+    echo "  native Go ext: $NATIVE_EXT"
+    echo "skipped: native Go extension active at $NATIVE_EXT (TypeScript $DEST not installed)"
+    exit 0
+  fi
+fi
 
 md5_of() {
   local line

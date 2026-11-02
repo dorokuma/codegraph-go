@@ -88,6 +88,12 @@ func (s *Server) detectedProjectDirs() []string {
 					continue
 				}
 				projectDir := filepath.Join(wd, e.Name())
+				// Honour the same skip rules the indexer uses: a top-level dir
+				// excluded by exclude_dirs (or the built-in list) must not be
+				// offered as a home-mode project selector — its index is empty.
+				if extraction.ShouldSkipDirIn(wd, projectDir, e.Name()) {
+					continue
+				}
 				if extraction.HasProjectMarker(projectDir) {
 					s.DetectDirs = append(s.DetectDirs, projectDir)
 				}
@@ -170,7 +176,7 @@ func (s *Server) resolveProject(projectPath string) (root string, database *db.D
 	if err != nil {
 		return "", nil, fmt.Errorf("bad projectPath %q: %w", projectPath, err)
 	}
-	resolved := db.FindNearestCodeGraphRoot(abs)
+	resolved := db.FindNearestCodeGraphRootBounded(abs, extraction.ShouldSkipDirIn)
 	if resolved == "" {
 		// Cache may be stale — allow detectProject to rescan on next call.
 		s.resetDetect()

@@ -412,6 +412,12 @@ func (s *Server) toolSearch(ctx context.Context, _ *mcp.CallToolRequest, args se
 		if args.NoIgnore {
 			rg.Args = append(rg.Args, "--no-ignore")
 		}
+		// Mirror the indexer's dir exclusions (.wt, exclude_dirs) so rg does
+		// not surface matches from trees the index refuses to walk. The "/"
+		//-anchored globs pin to the project root's top level — they only
+		// work because rg runs with cwd = projRoot.
+		rg.Args = append(rg.Args, rgExcludeArgs(projRoot, args.NoIgnore)...)
+		rg.Dir = projRoot
 		rg.Args = append(rg.Args, "--", args.Pattern, searchRoot)
 		return rg
 	})
@@ -453,11 +459,11 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	// (audit critical #2); an unbounded max would load the whole rg output.
 	args.Max = clampLimit(args.Max, defaultFilesMax, maxFilesResults)
 	s.adoptDetectedProject(&args.ProjectPath, []*string{&args.Path})
-	root, _, err := s.resolveProject(args.ProjectPath)
+	projRoot, _, err := s.resolveProject(args.ProjectPath)
 	if err != nil {
 		return recoverableProjectErr(err)
 	}
-	defer s.releaseProject(root)
+	defer s.releaseProject(projRoot)
 
 	// Home/broad mode: rg would search the entire home directory (go/pkg/mod,
 	// other projects, etc.). Use the DB file list instead — it only contains
@@ -484,15 +490,21 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 		}, nil, nil
 	}
 
-	// Narrow search root if a path subdirectory is specified.
+	// Narrow the search root if a path subdirectory is specified. projRoot
+	// stays the project root: the rg child runs with Dir=projRoot so
+	// "/"-anchored exclude globs keep pinning to the project top level, and
+	// the exclusion list is evaluated against projRoot — a top-level-only
+	// rule like "./ref" must not suddenly match subproj/ref just because
+	// the search was narrowed.
+	searchRoot := projRoot
 	if args.Path != "" {
-		root, err = s.resolvePathIn(root, args.Path)
+		searchRoot, err = s.resolvePathIn(projRoot, args.Path)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	fullPath := filepath.Join(root, pattern)
+	fullPath := filepath.Join(searchRoot, pattern)
 	if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
 		if strings.HasSuffix(pattern, "/") {
 			pattern = pattern + "**/*"
@@ -500,7 +512,10 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 			pattern = pattern + "/**/*"
 		}
 	}
-	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern, root)
+	rg := exec.CommandContext(ctx, "rg", "--files", "-g", pattern)
+	rg.Args = append(rg.Args, rgExcludeArgs(projRoot, false)...)
+	rg.Dir = projRoot
+	rg.Args = append(rg.Args, searchRoot)
 	lines, _, err := rgOutputLines(rg, args.Max, rgMaxOutputBytes)
 	if err != nil {
 		if len(lines) == 0 {
@@ -515,7 +530,7 @@ func (s *Server) toolFiles(ctx context.Context, _ *mcp.CallToolRequest, args fil
 	}
 	var b strings.Builder
 	for _, l := range lines {
-		rel, err := filepath.Rel(root, l)
+		rel, err := filepath.Rel(searchRoot, l)
 		if err == nil {
 			fmt.Fprintln(&b, rel)
 		}
@@ -690,6 +705,8 @@ func (s *Server) toolCallers(ctx context.Context, _ *mcp.CallToolRequest, args n
 		if args.Glob != "" {
 			rg.Args = append(rg.Args, "--glob", args.Glob)
 		}
+		rg.Args = append(rg.Args, rgExcludeArgs(root, false)...)
+		rg.Dir = root
 		// "--" ends flag parsing so a Name starting with "-" is matched
 		// literally instead of parsed as an rg flag (flag injection).
 		rg.Args = append(rg.Args, "--", args.Name, searchRoot)
@@ -770,12 +787,16 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 		}, nil, nil
 	}
 	outLines, err := rgEachRoot(searchRoots, args.MaxResults, rgMaxOutputBytes, func(searchRoot string) *exec.Cmd {
-		return exec.CommandContext(ctx, "rg",
+		rg := exec.CommandContext(ctx, "rg",
 			"--line-number", "--no-heading", "--color=never",
-			"--fixed-strings", "-c", "-w",
+			"--fixed-strings", "-c", "-w")
+		rg.Args = append(rg.Args, rgExcludeArgs(projRoot, false)...)
+		rg.Dir = projRoot
+		rg.Args = append(rg.Args,
 			// "--" ends flag parsing so a Name starting with "-" is matched
 			// literally instead of parsed as an rg flag (flag injection).
 			"--", args.Name, searchRoot)
+		return rg
 	})
 	if err != nil {
 		if len(outLines) == 0 {

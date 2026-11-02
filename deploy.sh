@@ -32,28 +32,143 @@ echo "BUILD OK ($(du -h ./bin/codegraph-go | cut -f1))"
 echo "=== 替换二进制 ==="
 # M6: install 目标父目录（~/.local/bin）在新机器上可能不存在，先建好。
 mkdir -p "$(dirname "$BINARY")"
-if [ -f "$BINARY" ]; then
-  if install -m 755 ./bin/codegraph-go "$BINARY.new" && \
-     mv "$BINARY" "$BINARY.old" && \
-     mv "$BINARY.new" "$BINARY"; then
-    rm -f "$BINARY.old"
+# 不可变锁（对齐 dispatch-agent / sbx 的部署规范）：正式安装的二进制是 0555
+# 只读可执行 + chattr +i 不可变位，运行期任何一条 `cat > ~/.local/bin/...`
+# 之类的误写都会在写入那一刻就被 EPERM 拒掉，而不是悄悄污染生产二进制。
+#   - staged 新二进制一律 install -m 0555；
+#   - CODEGRAPH_SKIP_IMMUTABLE_LOCK=1：测试环境（二进制在 /tmp 下）跳过 chattr，
+#     否则只读目录里的清理会 EPERM；
+#   - chattr +i 只在 root 且有 chattr 时执行（非 root 或无 e2fsprogs 时只保留
+#     0555）；文件系统不支持不可变位（非 ext*，如 btrfs/overlayfs/tmpfs）时
+#     chattr 会失败，这里同样只降级为 0555 并记一行，不算部署失败。
+# 替换过程本身要求「先备、后解锁、再单次原子换、立刻上锁」：旧版实现先
+# `mv $BINARY $BINARY.old` 再 `mv $BINARY.new $BINARY`——两次 rename 之间存在
+# 正式路径完全缺失的空窗（此时任何 client 拉起的 daemon 都会 ENOENT），且中途
+# 异常退出会留下一份无锁甚至不存在的二进制。现在旧文件经 `cp -pf` 备份到
+# $BINARY.old、新文件经 `install -m 0555` 预置到 $BINARY.new，解锁 $BINARY 后只
+# 需一次 `mv -f`（POSIX rename(2) 单步覆盖目录项，正式路径零毫秒空窗）；中途
+# 异常退出由 EXIT trap 恢复「存在 + 0555 + 不可变」。
+binary_locked=0
+protect_binary=0
+# relock_binary — EXIT trap 处理：部署中途异常退出（set -e / pipefail 触发的
+# 非零退出同样走 EXIT）时兜底：清掉未换入的 staged 文件；若正式路径缺失而
+# .old 备份尚在则先恢复，再对任何在位的 $BINARY 强制「0555 + 不可变」，
+# 不允许留下一个可写、无锁或干脆缺失的生产二进制。
+relock_binary() {
+  rm -f "$BINARY.new" 2>/dev/null || true
+  [ "$protect_binary" = "1" ] || return 0
+  if [ ! -e "$BINARY" ] && [ -f "$BINARY.old" ]; then
+    mv -f "$BINARY.old" "$BINARY" 2>/dev/null || true
+  fi
+  # $BINARY 仍在原位而 .old 备份尚未清理（例如 cp -pf + unlock_binary 之后、
+  # mv -f "$BINARY.new" "$BINARY" 之前异常退出）：先解锁再删除，绝不遗留
+  # 一个可能带不可变位的 .old 文件。
+  if [ -e "$BINARY.old" ]; then
+    unlock_binary "$BINARY.old" 2>/dev/null || true
+    rm -f "$BINARY.old" 2>/dev/null || true
+  fi
+  [ -e "$BINARY" ] || return 0
+  chmod 0555 "$BINARY" 2>/dev/null || true
+  if [ "${CODEGRAPH_SKIP_IMMUTABLE_LOCK:-0}" != "1" ] && [ "$(id -u)" = "0" ] && command -v chattr >/dev/null 2>&1; then
+    chattr +i "$BINARY" 2>/dev/null || true
+  fi
+}
+trap relock_binary EXIT
+# unlock_binary — mv 只能替换目录项，不可变位不阻碍换名；但目标已存在时显式
+# 解锁一次是更安全的做法，也顺带满足「原子 mv 前先 chattr -i」的规范。
+unlock_binary() {
+  [ "${CODEGRAPH_SKIP_IMMUTABLE_LOCK:-0}" = "1" ] && return 0
+  [ "$(id -u)" = "0" ] || return 0
+  command -v chattr >/dev/null 2>&1 || return 0
+  [ -e "$1" ] || return 0
+  chattr -i "$1" 2>/dev/null || true
+  return 0
+}
+# lock_binary — 上不可变位；非 root / 无 chattr / 文件系统不支持（btrfs、
+# overlayfs、tmpfs 等）时降级为纯 0555 并记一行，不算部署失败。
+lock_binary() {
+  if [ "${CODEGRAPH_SKIP_IMMUTABLE_LOCK:-0}" = "1" ]; then
+    echo "immutable lock: skipped (CODEGRAPH_SKIP_IMMUTABLE_LOCK=1)"
+    return 0
+  fi
+  if [ "$(id -u)" != "0" ]; then
+    echo "immutable lock: skipped (not root; 0555 only)"
+    return 0
+  fi
+  if ! command -v chattr >/dev/null 2>&1; then
+    echo "immutable lock: skipped (chattr not installed; 0555 only)"
+    return 0
+  fi
+  if chattr +i "$1" 2>/dev/null; then
+    binary_locked=1
+    echo "immutable lock: chattr +i applied"
   else
-    # 失败回滚：只在确实已经把旧二进制挪走、且新二进制没装上时恢复 .old；
-    # 上次崩溃残留的旧 .old 绝不能被当成回滚源覆盖新二进制。
-    if [ -f "$BINARY.old" ] && [ ! -f "$BINARY" ]; then
-      mv "$BINARY.old" "$BINARY" 2>/dev/null || true
+    echo "immutable lock: chattr +i unsupported on this filesystem (0555 only)"
+  fi
+  return 0
+}
+if [ -f "$BINARY" ]; then
+  # 替换分支：先备份旧文件、预置新文件（此时 $BINARY 尚未解锁、全程在位且
+  # 不可变），再解锁 → 单次原子 mv → 立即上锁。任何一步失败都不会让正式
+  # 路径空出来：$BINARY 直到 mv 那一刻都还是旧二进制。
+  # protect_binary 在本分支最顶部就置位——连下面的预清理（解锁残留 .old）
+  # 与后续 cp/install 中途收到 SIGINT/SIGTERM 时，relock_binary 同样能兜
+  # 底：清掉半截 .old/.new 并确保 $BINARY 维持「0555 + 不可变」。
+  # then/else 内部不再重复置位。
+  protect_binary=1
+  # 上一次崩溃可能留下带不可变位的 $BINARY.old——不可变文件不能 unlink，
+  # 不先解锁会让下面的 rm 失败，把一次正常部署带进 set -e。
+  unlock_binary "$BINARY.old"
+  rm -f "$BINARY.old" 2>/dev/null || true
+  if cp -pf "$BINARY" "$BINARY.old" && \
+     install -m 0555 ./bin/codegraph-go "$BINARY.new"; then
+    # 解锁 $BINARY：从这一刻起 $BINARY 处于「已解锁、将被换入」窗口，窗口只
+    # 跨下面这一条 mv。
+    unlock_binary "$BINARY"
+    if mv -f "$BINARY.new" "$BINARY"; then
+      lock_binary "$BINARY"
+      unlock_binary "$BINARY.old"
+      rm -f "$BINARY.old"
+    else
+      # mv 失败：$BINARY 仍在位但已解锁。新 staged 文件由 EXIT trap 清理，
+      # 这里立即重上锁并删除本次备份后退出。
+      lock_binary "$BINARY"
+      rm -f "$BINARY.new" "$BINARY.old" 2>/dev/null || true
+      echo "DEPLOY FAILED: atomic replace failed" >&2
+      exit 1
     fi
-    rm -f "$BINARY.new" 2>/dev/null || true
-    echo "DEPLOY FAILED: rolled back" >&2
+  else
+    # 备份或 staged install 就失败（如目标分区满）：$BINARY 从未解锁、一直
+    # 在位。protect_binary 已在外层置位让 trap 重锁兜底；清理本次产生的
+    # .new/.old 再退出。
+    rm -f "$BINARY.new" "$BINARY.old" 2>/dev/null || true
+    lock_binary "$BINARY"
+    echo "DEPLOY FAILED: could not stage new binary" >&2
     exit 1
   fi
 else
-  if ! install -m 755 ./bin/codegraph-go "$BINARY"; then
-    echo "DEPLOY FAILED: could not install $BINARY" >&2
+  # 新装分支：正式路径不存在，先把新文件以 0555 预置到 $BINARY.new，置位
+  # protect_binary 后单次 mv 到位再上锁——与替换分支同一节奏，trap 语义一致。
+  if install -m 0555 ./bin/codegraph-go "$BINARY.new"; then
+    protect_binary=1
+    if mv -f "$BINARY.new" "$BINARY"; then
+      lock_binary "$BINARY"
+    else
+      rm -f "$BINARY.new" 2>/dev/null || true
+      echo "DEPLOY FAILED: could not install $BINARY" >&2
+      exit 1
+    fi
+  else
+    rm -f "$BINARY.new" 2>/dev/null || true
+    echo "DEPLOY FAILED: could not stage new binary" >&2
     exit 1
   fi
 fi
-echo "DEPLOYED → $BINARY"
+if [ "$binary_locked" = "1" ]; then
+  echo "DEPLOYED → $BINARY (0555, immutable)"
+else
+  echo "DEPLOYED → $BINARY (0555)"
+fi
 # rm -rf 保护：只允许删除本次构建产物目录。仓库若被检到 / 下，`rm -rf ./bin`
 # 会变成 `rm -rf /bin`；符号链接的 bin 也绝不能跟随删除。
 if [ "$ROOT" = "/" ] || [ -L "$ROOT/bin" ] || [ ! -d "$ROOT/bin" ]; then
@@ -337,14 +452,13 @@ if [ -d "$REG_DIR" ]; then
     python3 "$ROOT/scripts/cleanup_daemon_registry.py" "$REG_DIR" "${KILLED_PID:-}" ""
   fi
 fi
-# Pre-warm: spawn the new daemon detached — the shell equivalent of Go-side
-# SpawnDetached (internal/daemon/spawn.go): setsid puts the daemon in its own
-# session (SysProcAttr{Setsid:true}), stdin is /dev/null, stdout/stderr go to
-# .codegraph/daemon.log, and CODEGRAPH_DAEMON_INTERNAL=1 is the daemon-mode
-# entry SpawnDetached uses. nohup is deliberately NOT used: it only ignores
-# SIGHUP without leaving the session (no setsid), which is a remedial
-# workaround, not proper daemonization. This way the next client connects
-# immediately instead of paying spawn + index time.
+# Pre-warm: bring the new daemon up so the next client connects immediately
+# instead of paying spawn + index time. The spawn itself is NOT done here any
+# more — deploy.sh used to be the shell twin of Go-side SpawnDetached (setsid
+# + CODEGRAPH_DAEMON_INTERNAL=1 + daemon.log), and that second entry point
+# quietly bypassed everything the Go spawn path layers on top (the systemd-run
+# CPUQuota scope first of all). The warm-up now asks the binary itself to do
+# it through the ordinary client path, see the -warm-daemon call below.
 mkdir -p "$WORKDIR/.codegraph"
 # M5: 预热参数与 Go 侧 SpawnDetached（internal/daemon/spawn.go）对齐：
 # -workdir <root> + 可选 -config。config 文件按与 Go ConfigPath 相同的优先级
@@ -364,40 +478,52 @@ elif [ -f "$ROOT/codegraph-config.yaml" ]; then
 elif [ -f "$HOME/.config/codegraph/config.yaml" ]; then
   DEPLOY_CFG="$HOME/.config/codegraph/config.yaml"
 fi
+# M5 后续收敛：预热不再自己 `CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY"`。
+# 那是与 Go 端 SpawnDetached 平行的第二套 daemon 启动入口，绕过了
+# systemd-run --scope -p CPUQuota=<N>% 第四层硬配额（以及它的两级回退）、
+# 配置解析后的 workdir 收窄与权限校验；结果是「经客户端拉起的 daemon 有
+# CPUQuota，部属时预热出来的 daemon 没有」，上限形同虚设。
+# 现在走 `"$BINARY" -workdir <wd> [-config <cfg>] -warm-daemon`：客户端跑完整
+# 启动链（LoadConfig → NarrowExcludedWorkdirs → ValidateWorkdirs）后调
+# EnsureAndDial，由 SpawnDetached 带配额地拉起 daemon，连上后挂断连接退 0。
+# 失败（非零退出）不阻断部属：下面仍然做就绪探测，下一个客户端也会自己重拉。
+WARM_ARGS=(-workdir "$WORKDIR")
 if [ -n "$DEPLOY_CFG" ]; then
-  CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" -config "$DEPLOY_CFG" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
-else
-  CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY" -workdir "$WORKDIR" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1 &
+  WARM_ARGS+=(-config "$DEPLOY_CFG")
 fi
-SPAWN_PID=$!
-# Verify the warm-up actually took the lock AND bound the socket AND is
-# alive: the pidfile is written before the socket bind, so a pidfile alone
-# does not mean the daemon is listening yet. Four conditions together mean
-# ready — pidfile + socket + DB flock held by the new daemon (flock -n
-# probe fails = held) + the spawned process alive. A half-dead old daemon
-# still holding the DB would make the new daemon exit immediately; the
-# missing flock would then be caught here instead of falsely reporting
-# ready. Not ready is idempotent: the next client spawns automatically.
+WARM_ARGS+=(-warm-daemon)
+if "$BINARY" "${WARM_ARGS[@]}" </dev/null >>"$WORKDIR/.codegraph/daemon.log" 2>&1; then
+  echo "warm-daemon: daemon reachable for $WORKDIR"
+else
+  echo "WARN: warm-daemon exited non-zero — daemon not reachable yet, falling through to the readiness probe"
+fi
+# Verify the warm-up actually took the lock AND bound the socket AND that the
+# daemon process is alive: the pidfile is written before the socket bind, so a
+# pidfile alone does not mean the daemon is listening yet. All conditions
+# together mean ready — pidfile + socket + DB flock held by the new daemon
+# (flock -n probe fails = held) + the recorded daemon pid alive and matching
+# the FULL daemon predicate (daemon_matches: our binary + -workdir $WORKDIR +
+# CODEGRAPH_DAEMON_INTERNAL=1). A half-dead old daemon still holding the DB
+# would make the new daemon exit immediately; the missing flock would then be
+# caught here instead of falsely reporting ready. Not ready is idempotent: the
+# next client spawns automatically.
+# 注意：预热现在由客户端间接拉起 daemon，PID 属于那个 daemon 而不是任何子
+# shell 的 $!；经 systemd-run --scope 包装时更是如此。就绪与否一律以 pidfile
+# 里记录的真实 daemon PID 为准，不再与客户端命令自身的 PID 比对。
 ready=0
 for i in $(seq 1 15); do
-  if ! kill -0 "$SPAWN_PID" 2>/dev/null; then
-    break
-  fi
-  # All conditions must describe THE spawned process, not another daemon
-  # that won the lock race (e.g. a client respawn during the deploy).
-  # setsid execs in place, so the daemon keeps $SPAWN_PID — require the
-  # pidfile pid to match before calling this ready.
   NEWPID=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$WORKDIR/.codegraph/daemon.pid" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
   if [ -f "$WORKDIR/.codegraph/daemon.pid" ] && [ -S "$WORKDIR/.codegraph/daemon.sock" ] \
      && ! flock -n "$WORKDIR/.codegraph/codegraph.lock" true 2>/dev/null \
-     && [ "$NEWPID" = "$SPAWN_PID" ]; then
+     && [ -n "$NEWPID" ] && kill -0 "$NEWPID" 2>/dev/null \
+     && daemon_matches "$NEWPID" "$WORKDIR"; then
     ready=1
     break
   fi
   sleep 0.2
 done
 if [ "$ready" = "1" ]; then
-  echo "new daemon warmed up for $WORKDIR (pid $SPAWN_PID)"
+  echo "new daemon warmed up for $WORKDIR (pid $NEWPID)"
 else
   # Distinguish "another live daemon is already serving" (fine — keep it,
   # its discovery record was preserved above) from a genuinely failed

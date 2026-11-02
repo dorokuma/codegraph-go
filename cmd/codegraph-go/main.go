@@ -16,6 +16,7 @@ import (
 	"github.com/dorokuma/codegraph-go/internal/config"
 	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
+	"github.com/dorokuma/codegraph-go/internal/extraction"
 	"github.com/dorokuma/codegraph-go/internal/safelog"
 	"github.com/dorokuma/codegraph-go/internal/server"
 )
@@ -40,8 +41,13 @@ func runInit(root string) error {
 	}
 	// Authority check (same policy as main, no side door): init <root> must
 	// stay inside the allowlist roots — config workdirs, or $HOME when there
-	// is no usable config (fail closed when neither resolves).
-	if err := config.ValidateWorkdirs([]string{root}, config.WorkdirAllowlist("")); err != nil {
+	// is no usable config (fail closed when neither resolves). The path is
+	// canonicalized exactly like main canonicalizes every workdir (Abs +
+	// EvalSymlinks): ValidateWorkdirs canonicalizes internally, but db.Open
+	// does not — handing it the raw path would create a second .codegraph at
+	// the symlink location while the session works on the canonical one.
+	abs = canonicalize(abs)
+	if err := config.ValidateWorkdirs([]string{abs}, config.WorkdirAllowlist("")); err != nil {
 		return fmt.Errorf("%v. Fix: use a root inside an allowed root, or add it to the workdirs list in the config file", err)
 	}
 	database, err := db.Open(abs)
@@ -115,6 +121,21 @@ func checkDirectFallbackSafe(root string) error {
 // hanging forever.
 const fatalFlushTimeout = 2 * time.Second
 
+// canonicalize resolves p to an absolute path with symlinks evaluated,
+// matching the workdir canonicalization in main. Failures keep the
+// absolute (or original) path — narrowing and validation work on the
+// cleaned form.
+func canonicalize(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	if rp, err := filepath.EvalSymlinks(abs); err == nil && rp != "" {
+		return rp
+	}
+	return abs
+}
+
 // fatalf reports a fatal error with the exact log.Fatalf output format and
 // exit code 1, but flushes the non-blocking log buffer first. log.Fatalf
 // cannot be used on these paths: its internal os.Exit skips deferred cleanup
@@ -138,6 +159,73 @@ func flushAndExit(code int) {
 	os.Exit(code)
 }
 
+// daemonDialWait / daemonDialPoll bound the client-side wait for a daemon to
+// come up: the same pair the normal client path and -warm-daemon use, so the
+// deploy pre-warm cannot drift from what a real client tolerates.
+const (
+	daemonDialWait = 6 * time.Second
+	daemonDialPoll = 25 * time.Millisecond
+)
+
+// resolveSessionRoot picks the project root the session attaches to: the
+// nearest .codegraph across the configured workdirs (bounded — a candidate
+// root whose own skip rules exclude the starting path is a blind index and
+// must not be adopted), otherwise the primary workdir, created so a daemon
+// can be spawned into it. Canonicalized with EvalSymlinks.
+//
+// Split out of main so the -warm-daemon pre-warm path resolves the root with
+// the exact same rule as the interactive client path.
+func resolveSessionRoot(cfg config.Config) string {
+	root := ""
+	for _, wd := range cfg.Workdirs {
+		root = db.FindNearestCodeGraphRootBounded(wd, extraction.ShouldSkipDirIn)
+		if root != "" {
+			break
+		}
+	}
+	if root == "" {
+		root = cfg.Workdirs[0]
+		// Ensure .codegraph exists so a daemon can be spawned.
+		if database, err := db.Open(root); err == nil {
+			_ = database.Close()
+		}
+	}
+	if rp, err := filepath.EvalSymlinks(root); err == nil && rp != "" {
+		root = rp
+	}
+	return root
+}
+
+// runWarmDaemon implements -warm-daemon: spawn (or attach to) the shared
+// daemon through the SAME client path an interactive session takes —
+// EnsureAndDial → SpawnDetached, including the systemd-run CPUQuota wrapper
+// and its fallbacks — then drop the connection and exit.
+//
+// It exists because deploy.sh used to start the daemon itself with
+// `CODEGRAPH_DAEMON_INTERNAL=1 setsid "$BINARY"`, a second, divergent daemon
+// entry point that silently bypassed every layer the Go spawn path adds (CPU
+// quota first among them). Pre-warming through the binary keeps exactly one
+// daemon-startup implementation.
+//
+// Returns nil only when a daemon is actually reachable; a non-nil error makes
+// the caller exit non-zero so the deploy log shows the warm-up failed (the
+// deploy script's own readiness probe stays as the second witness).
+func runWarmDaemon(cfg config.Config, spawnOpts *daemon.SpawnOpts) error {
+	root := resolveSessionRoot(cfg)
+	conn, _, hello, ok, err := daemon.EnsureAndDial(root, daemonDialWait, daemonDialPoll, spawnOpts)
+	if err != nil {
+		return fmt.Errorf("warm daemon for %s: %w", root, err)
+	}
+	if !ok {
+		return fmt.Errorf("warm daemon for %s: no daemon answered after %s", root, daemonDialWait)
+	}
+	if err := conn.Close(); err != nil {
+		slog.Warn("warm daemon connection close failed", "error", err)
+	}
+	slog.Info("daemon warmed up", "workdir", root, "pid", hello.PID, "socket", hello.SocketPath)
+	return nil
+}
+
 func main() {
 	_, safelogCleanup := safelog.SetupLogger(config.LogLevel())
 	defer safelogCleanup()
@@ -155,6 +243,12 @@ func main() {
 	}
 
 	cfg := config.LoadConfig()
+
+	// Thin call: apply configured nice/GOMAXPROCS to this process. Runs for
+	// every mode — the client (spawned daemon inherits the parent's niceness
+	// anyway, and the daemon re-applies its own copy on startup), the
+	// CODEGRAPH_DAEMON_INTERNAL daemon itself, and direct mode.
+	daemon.ApplyProcessLimits(cfg.Nice, cfg.MaxProcs)
 
 	// Canonicalize all workdirs (abs + EvalSymlinks) and dedup.
 	seen := make(map[string]bool)
@@ -182,6 +276,32 @@ func main() {
 	// Primary workdir for backward compat (cfg.Workdir = workdirs[0]).
 	cfg.Workdir = cfg.Workdirs[0]
 
+	// Startup workdir narrowing (single source: extraction). When the
+	// session target — explicit -workdir (or the daemon's -workdir arg,
+	// which SpawnDetached passes verbatim) or the process cwd — sits in a
+	// subtree a configured workdir refuses to index (.wt worktree
+	// container, exclude_dirs rule, home-mode non-project dir), the parent
+	// root's index is blind to it by construction. Shrink Workdirs to the
+	// target itself BEFORE the authority check below: the target stays a
+	// descendant of a config workdir, so ValidateWorkdirs still passes,
+	// and the parent root is not kept as a blind ExtraDBs secondary.
+	//
+	// LoadConfig has already published the runtime config snapshot
+	// (YAML exclude_dirs + CODEGRAPH_EXCLUDE_DIRS) via applyEnvOverrides
+	// + storeRuntimeConfig, so ShouldSkipDirIn sees the full rule set.
+	{
+		explicitWd := ""
+		if cfg.ExplicitWorkdir != "" {
+			explicitWd = canonicalize(cfg.ExplicitWorkdir)
+		}
+		cwd := ""
+		if wd, err := os.Getwd(); err == nil {
+			cwd = canonicalize(wd)
+		}
+		cfg.Workdirs = extraction.NarrowExcludedWorkdirs(explicitWd, cwd, cfg.Workdirs)
+		cfg.Workdir = cfg.Workdirs[0]
+	}
+
 	// Authority check: the config file's workdirs are the allowlist — any
 	// workdir outside those roots (or not a descendant of one) is refused
 	// before any mode is entered. This single call point covers client,
@@ -203,15 +323,35 @@ func main() {
 	}
 	slog.Info("starting", "workdir", cfg.Workdir, "workdirs", cfg.Workdirs)
 
-	// Decision order (official #411):
+	// Parent flags the detached daemon inherits. One instance for every path
+	// below (the -warm-daemon pre-warm and the interactive client), so a
+	// deploy warm-up can never spawn with different options than a real
+	// client would.
+	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync, CPUQuotaPercent: cfg.CPUQuotaPercent}
+
+	// Decision order (official #411, extended with the deploy pre-warm step):
 	//  1. CODEGRAPH_DAEMON_INTERNAL=1 → we ARE the detached daemon
-	//  2. CODEGRAPH_NO_DAEMON=1 → direct embedded mode
-	//  3. else try proxy to shared daemon (spawn if needed); fallback direct
+	//  2. -warm-daemon → bring the shared daemon up through this same client
+	//     path, hang up and exit
+	//  3. CODEGRAPH_NO_DAEMON=1 → direct embedded mode
+	//  4. else try proxy to shared daemon (spawn if needed); fallback direct
 	if daemon.Internal() {
 		if err := server.RunDaemonProcess(cfg); err != nil {
 			slog.Error("daemon process failed", "error", err)
 			flushAndExit(1)
 		}
+		return
+	}
+	// -warm-daemon: pre-warm and exit. Handled BEFORE the CODEGRAPH_NO_DAEMON
+	// branch on purpose — direct mode would start a whole embedded MCP session
+	// here instead of just bringing the daemon up and hanging up.
+	if cfg.WarmDaemon {
+		if err := runWarmDaemon(cfg, spawnOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "codegraph-go: %v\n", err)
+			slog.Error("warm daemon failed", "error", err)
+			flushAndExit(1)
+		}
+		flushAndExit(0)
 		return
 	}
 	if daemon.OptOut() {
@@ -237,29 +377,16 @@ func main() {
 	}
 
 	// Need a place for lock/socket. Prefer first existing .codegraph/ across
-	// all workdirs; otherwise use primary workdir.
-	root := ""
-	for _, wd := range cfg.Workdirs {
-		root = db.FindNearestCodeGraphRoot(wd)
-		if root != "" {
-			break
-		}
-	}
-	if root == "" {
-		root = cfg.Workdirs[0]
-		// Ensure .codegraph exists so a daemon can be spawned.
-		if database, err := db.Open(root); err == nil {
-			_ = database.Close()
-		}
-	}
-	if rp, err := filepath.EvalSymlinks(root); err == nil && rp != "" {
-		root = rp
-	}
+	// all workdirs; otherwise use primary workdir. The bounded variant stops
+	// at a candidate root whose own skip rules exclude the starting path
+	// (e.g. a worktree under .wt): that index cannot contain the path, so
+	// adopting it would serve a blind index for the worktree.
+	root := resolveSessionRoot(cfg)
 
 	// Probe → spawn → dial shared daemon; on failure fall back to direct.
-	// Pass parent -config / -no-sync so the detached writer matches this session.
-	spawnOpts := &daemon.SpawnOpts{ConfigFile: cfg.ConfigFile, NoSync: cfg.NoSync}
-	conn, br, hello, ok, err := daemon.EnsureAndDial(root, 6*time.Second, 25*time.Millisecond, spawnOpts)
+	// Pass parent -config / -no-sync / cpu quota so the detached writer
+	// matches this session.
+	conn, br, hello, ok, err := daemon.EnsureAndDial(root, daemonDialWait, daemonDialPoll, spawnOpts)
 	if ok {
 		slog.Info("proxy → daemon", "pid", hello.PID, "socket", hello.SocketPath)
 		if _, err := daemon.RunProxy(conn, br, hello); err != nil {
