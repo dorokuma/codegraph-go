@@ -166,6 +166,12 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 			// (permissions, cgroup v1-only host, transient unit policy) must
 			// not prevent the daemon from starting — respawn directly.
 			slog.Warn("systemd-run spawn failed, falling back to direct spawn", "error", err)
+			// The wrapper is gone: clear it BEFORE the reaper below, or the
+			// direct child would still be treated as a scoped spawn and run
+			// into the 150ms async probe window — where a normal lock-race
+			// loser exiting 0 looks like a scope-start failure and spawns the
+			// daemon a second time.
+			quotaArgs = nil
 			cmd = exec.Command(self, args...)
 			cmd.Env = filtered
 			cmd.Dir = root
@@ -253,7 +259,21 @@ func daemonAliveAt(root string) bool {
 		return false
 	}
 	info := DecodeLock(raw)
-	return info != nil && info.PID > 0 && IsProcessAlive(info.PID)
+	if info == nil || info.PID <= 0 || !IsProcessAlive(info.PID) {
+		return false
+	}
+	// PID-reuse guard, reusing the same procStartTime mechanism as
+	// verifyDaemonIdentity: a live pid whose current /proc start time differs
+	// from the recorded one is a different incarnation, so the pidfile holder
+	// is gone and the lock is free to take. got == 0 (non-/proc platforms or
+	// an unreadable stat) keeps the plain alive-probe verdict, and pidfiles
+	// written before ProcStart existed (info.ProcStart == 0) stay compatible.
+	if info.ProcStart > 0 {
+		if got := procStartTime(info.PID); got > 0 && got != info.ProcStart {
+			return false
+		}
+	}
+	return true
 }
 
 // systemdRunArgs returns the argv for launching the daemon through a

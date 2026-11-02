@@ -104,8 +104,22 @@ supersedes: "/root/workspace/pi-cache-guardian/.agents/notes/20261004-pi-ext-syn
   - 在未提交的 `chore/deploy-and-install-hardening` 分支直接运行 `bash deploy.sh` → 第一秒即被分支门禁拦截，stderr 输出 `FAILED: deploy.sh requires branch 'main' (current: chore/deploy-and-install-hardening); set DEPLOY_ALLOW_DIRTY=1 to override`，`exit 1`；模拟 `CURRENT_BRANCH=main` 且工作区 dirty 时被第二道门禁拦截，stderr 输出 `FAILED: working tree is dirty; commit/stash/clean changes before deploying, or set DEPLOY_ALLOW_DIRTY=1 (or DEPLOY_COMMIT=1) to override`，`exit 1`。
   - `bash /root/workspace/pi-extensions/install.sh --audit` → 12 扩展（含 `codegraph-go` federated 项）全部 `MATCH — unchanged`，`exit 0`。
 
+## 追加修复（2026-11-03）：zero-node 宿主机原生 Go 扩展共存保护
+
+- 分支：`feat/exclude-dirs-and-cpu-limit`（worktree `.wt/codegraph-go/feat-exclude-dirs-and-cpu-limit`）。
+- **事故背景**：本机于 2026-10-30 移除 Node.js（zero-node），`~/.pig/agent/extensions/*` 全量迁移为指向 `/root/workspace/pi-extensions/go/*` 的原生 Go 扩展目录软链（如 `codegraph-go -> /root/workspace/pi-extensions/go/codegraph-go`，内含 `go.mod`）。但 `install.sh` 在未设 `PI_EXT_DEST` 时无条件向 `$HOME/.pig/agent/extensions/codegraph-go.ts` 写入 TypeScript 副本——同名 `.ts` 一落进扩展目录，pig 启动时即调起 `node`（>=22.13）重打包，直接报 `Failed to load extension ... spawn:runtime_unavailable: TypeScript extensions need Node.js 22.13 or newer`，**全机所有 pig 会话无法启动**（真实部署中实抓的致命回归）。
+- **修复口径**（`integrations/pi/install.sh`）：
+  - 目标解析时记录 `EXPLICIT_DEST`（`PI_EXT_DEST` 非空 → 1；走默认路径 → 0）。
+  - 原有前置校验（`md5sum`、`HOME`、绝对路径、尾部 `/`、`-d "$DEST"`、`[ -f "$SRC" ]`）全部不变。
+  - 全部校验通过后、md5 计算与拷贝之前新增共存保护：仅当 `EXPLICIT_DEST=0` 时取 `NATIVE_EXT="${DEST%.ts}"`，若 `[ -d "$NATIVE_EXT" ] && [ -f "$NATIVE_EXT/go.mod" ]`（`-d` 自动穿透指向目录的软链）判定为原生扩展已激活：
+    - 先自愈：`[ -e "$DEST" ] || [ -L "$DEST" ]` 时 `rm -f -- "$DEST"`（清掉残留文件或非目录软链，失败则 `FAILED:` 非零退出）；
+    - 输出 `pi extension sync` / `  native Go ext: $NATIVE_EXT` / `skipped: native Go extension active at $NATIVE_EXT (TypeScript $DEST not installed)` 并 `exit 0`，绝不写入 .ts。
+  - 显式 `PI_EXT_DEST` 或默认目录无 `go.mod` 时，原安装与 md5 幂等行为 100% 不变。
+- **回归测试**：`scripts/test_deploy_immutable_lock.sh` 新增场景 5（断言 25–29，总计 29/29）：bash -n 语法检查；(a) 临时 HOME 下放原生扩展软链 + 预置脏 `.ts`，不传 `PI_EXT_DEST` → exit 0、输出 `skipped: native Go extension active`、脏 `.ts` 自愈清除、`go.mod` 完好；(b) 同夹具显式 `PI_EXT_DEST` → `changed: installed`、`.ts` 正常落盘；(c) 无原生扩展的新鲜 HOME 连跑两次 → `changed: installed` → `unchanged`。全部使用临时 HOME，不触碰真实 `/root/.pig`。
+- **实测**：手跑三场景与脚本断言一致；真实 `/root/.pig/agent/extensions/codegraph-go.ts` 确认不存在。
+
 ## 来源
-- 关联：分支 chore/pi-ext-sync（已合入）及硬化分支 chore/deploy-and-install-hardening；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003；硬化任务 MARK-CODEGRAPH-HARDEN-20261015；收尾修正任务 MARK-CODEGRAPH-FIXUP-20261015。
+- 关联：分支 chore/pi-ext-sync（已合入）及硬化分支 chore/deploy-and-install-hardening；CHANGELOG.md [Unreleased]；R2 修复任务 FIX-CODEGRAPH-PI-EXT-SYNC-R2-20261003；硬化任务 MARK-CODEGRAPH-HARDEN-20261015；收尾修正任务 MARK-CODEGRAPH-FIXUP-20261015；zero-node 共存保护修复任务 MARK-WORKER-CG-R6B-20261103-0332。
 - 后续项（不阻断本次但不该被忘）：
   1. **[已闭合]** 同一扩展目录 `~/.pi/agent/extensions/` 下还有 4+ 个自研扩展（ctxmode.ts / cache-guardian.ts / prism.ts / herdsman-pi.ts / herdr-agent-state.ts）各踩同一颗雷，本仓库管不到，需各自归属仓库补齐同步机制。**闭合记录**：已由 `/root/workspace/pi-extensions` 联邦式分发中枢统一纳管全机 12 个扩展（8 hosted + 3 federated `codegraph-go`/`ctxmode`/`pi-cache-guardian` + 1 external `herdr-agent-state.ts` 只读巡检），各自宿主 `install.sh` 均已补齐并接入中枢级联。
   2. **[已闭合]** deploy.sh 仍无 dirty-tree / 分支检查——它会把未审查的 ts 直接盖到生产扩展目录；后续应加工作区洁净度或显式确认。**闭合记录（2026-10-16）**：已在 `deploy.sh` 开头增加 `main` 分支与 `DIRTY_STATUS="$(git status --porcelain)"` 空工作区门禁（`DEPLOY_ALLOW_DIRTY=1` 可显式豁免分支与脏树检查，`main` 分支下 `DEPLOY_COMMIT=1` 自动豁免脏树检查）。

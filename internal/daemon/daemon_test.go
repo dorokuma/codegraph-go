@@ -242,6 +242,246 @@ func TestHelloVersionMismatch(t *testing.T) {
 	}
 }
 
+// TestDaemonExitsWhenWorkdirRemoved is the regression for the stale narrow
+// daemon: a session narrowed into a .wt/<repo>/<branch> worktree keeps
+// serving that path, and when the dispatched agent deletes the worktree the
+// daemon used to sit there holding the DB flock, the pidfile and the socket
+// until the (five-minute) idle timeout — wasting the lock and blocking a
+// fresh spawn under a recreated path. The workdir liveness watch must end it
+// at the next tick, but never in the middle of a live session.
+func TestDaemonExitsWhenWorkdirRemoved(t *testing.T) {
+	oldInterval := rootLivenessInterval
+	rootLivenessInterval = 20 * time.Millisecond
+	t.Cleanup(func() { rootLivenessInterval = oldInterval })
+
+	start := func(root string) *Daemon {
+		t.Helper()
+		if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Idle exit must not be what ends this daemon — long timeout, so only
+		// the workdir watch can fire.
+		t.Setenv(EnvIdleTimeoutMS, "3600000")
+		handler := func(ctx context.Context, rwc io.ReadWriteCloser) error {
+			<-ctx.Done()
+			return nil
+		}
+		d := New(root, handler)
+		d.idleAfter = IdleTimeout()
+		if err := d.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	exitedWithin := func(d *Daemon, within time.Duration) bool {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { d.Wait(); close(done) }()
+		select {
+		case <-done:
+			return true
+		case <-time.After(within):
+			return false
+		}
+	}
+
+	// (a) workdir removed, no session → the daemon stops by itself.
+	root := t.TempDir()
+	d := start(root)
+	select {
+	case <-d.ctx.Done():
+		d.Stop("test cleanup")
+		t.Fatal("daemon exited while its workdir still existed")
+	case <-time.After(200 * time.Millisecond): // several ticks, still alive
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if !exitedWithin(d, 5*time.Second) {
+		d.Stop("test cleanup")
+		t.Fatal("daemon did not exit after its workdir was removed")
+	}
+	if !d.stopping.Load() {
+		t.Fatal("daemon must be marked stopping once the workdir is gone")
+	}
+
+	// (b) the same, but with a live session at the moment the workdir goes:
+	// the session is never cut, the daemon leaves when the session does.
+	root2 := t.TempDir()
+	d2 := start(root2)
+	client, served := net.Pipe()
+	defer client.Close()
+	d2.addClient(served)
+	if err := os.RemoveAll(root2); err != nil {
+		t.Fatal(err)
+	}
+	if exitedWithin(d2, 300*time.Millisecond) {
+		served.Close()
+		t.Fatal("daemon cut an in-flight session when its workdir vanished")
+	}
+	// The session ends the normal way (serveConn's defer): only then is the
+	// daemon allowed to leave.
+	d2.dropClient(served)
+	served.Close()
+	if !exitedWithin(d2, 5*time.Second) {
+		d2.Stop("test cleanup")
+		t.Fatal("daemon did not exit after the last session ended and the workdir was gone")
+	}
+}
+
+// TestDaemonStopIfIdleDoesNotCutInFlightOrHandshakingSession is the
+// concurrency regression for the accept→register race: a connection that
+// has been Accept()ed but has not completed ClientHello (the handshake
+// window before addClient) used to be invisible to ClientCount, so a
+// "clients==0" idle/workdir stop could cut the listener out from under
+// it. With the in-flight counter, stopIfIdle must refuse while the
+// handshake is parked, must refuse while a session is live, and must
+// succeed cleanly once everything has drained.
+func TestDaemonStopIfIdleDoesNotCutInFlightOrHandshakingSession(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Idle exit must not be what ends this daemon — long timeout, so only
+	// explicit stopIfIdle calls decide.
+	t.Setenv(EnvIdleTimeoutMS, "3600000")
+
+	var sessions atomic.Int32
+	sessionStarted := make(chan struct{}, 8)
+	sessionRelease := make(chan struct{})
+	handler := func(ctx context.Context, rwc io.ReadWriteCloser) error {
+		sessions.Add(1)
+		sessionStarted <- struct{}{}
+		select {
+		case <-sessionRelease:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+
+	d := New(root, handler)
+	d.idleAfter = IdleTimeout()
+	res, err := TryAcquireLock(root)
+	if err != nil || res.Kind != "acquired" {
+		t.Fatalf("lock: %+v err=%v", res, err)
+	}
+	defer os.Remove(res.PidPath)
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- Phase 1: a connection parked INSIDE the handshake window ---
+	// (accepted by the kernel backlog / serveConn between Accept and
+	// addClient). It never sends ClientHello, so it stays in-flight
+	// without ever registering as a client. To make the window
+	// deterministic we check the internal counter rather than racing
+	// Accept scheduling.
+	raw, err := net.Dial("unix", d.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	// Read the server hello so we know serveConn is running and the conn
+	// has been counted in-flight.
+	br := bufio.NewReader(raw)
+	if _, err := br.ReadBytes('\n'); err != nil {
+		t.Fatalf("server hello: %v", err)
+	}
+	// Spin briefly until the accept loop's counter lands (the hello was
+	// written AFTER inFlight++, but give the scheduler a beat anyway).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		d.mu.Lock()
+		n := d.inFlight
+		d.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("accepted connection never entered the in-flight window")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The connection is in-flight but NOT a client: stopIfIdle must
+	// refuse instead of cutting it.
+	if d.stopIfIdle("test: should refuse") {
+		t.Fatal("stopIfIdle cut a connection still in the handshake window")
+	}
+	if d.stopping.Load() {
+		t.Fatal("daemon must not be marked stopping while a conn is in-flight")
+	}
+	// The handshake completes now: the parked conn sends ClientHello and
+	// becomes a real session.
+	if err := WriteClientHello(raw); err != nil {
+		t.Fatal(err)
+	}
+	<-sessionStarted
+	// Now registered: stopIfIdle still refuses (a live session).
+	if d.stopIfIdle("test: should refuse") {
+		t.Fatal("stopIfIdle cut a live session")
+	}
+	// --- Phase 2: a second concurrent connection also survives ---
+	raw2, err := net.Dial("unix", d.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw2.Close()
+	br2 := bufio.NewReader(raw2)
+	if _, err := br2.ReadBytes('\n'); err != nil {
+		t.Fatalf("server hello (conn2): %v", err)
+	}
+	if err := WriteClientHello(raw2); err != nil {
+		t.Fatal(err)
+	}
+	<-sessionStarted
+	if d.stopIfIdle("test: should refuse") {
+		t.Fatal("stopIfIdle cut concurrent live sessions")
+	}
+	if sessions.Load() != 2 {
+		t.Fatalf("sessions=%d want 2", sessions.Load())
+	}
+
+	// --- Phase 3: sessions end; the NEXT stopIfIdle wins cleanly ---
+	close(sessionRelease)
+	raw.Close()
+	raw2.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		d.mu.Lock()
+		idle := d.clients == 0 && d.inFlight == 0
+		d.mu.Unlock()
+		if idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sessions never drained")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !d.stopIfIdle("test: drained") {
+		t.Fatal("stopIfIdle refused after all sessions drained")
+	}
+	if !d.stopping.Load() {
+		t.Fatal("daemon must be marked stopping after a successful stopIfIdle")
+	}
+	// Wait completes (stopIfIdle ran the full shutdown: listener closed,
+	// conns drained, artifacts removed).
+	done := make(chan struct{})
+	go func() { d.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not finish shutdown after stopIfIdle")
+	}
+	// A fresh dial must fail — the listener is gone, not half-stopped.
+	if c, err := net.Dial("unix", d.SocketPath()); err == nil {
+		c.Close()
+		t.Fatal("listener still accepting after stopIfIdle")
+	}
+	// And a duplicate Stop is a no-op, not a double-close panic.
+	d.Stop("test cleanup")
+}
+
 // TestApplyProcessLimitsMaxProcs: GOMAXPROCS capping honours the env-var
 // precedence rule — an explicit GOMAXPROCS always wins over max_procs.
 func TestApplyProcessLimitsMaxProcs(t *testing.T) {

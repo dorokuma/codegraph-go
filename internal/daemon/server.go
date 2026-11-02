@@ -30,8 +30,14 @@ type Daemon struct {
 	handler   SessionHandler
 	idleAfter time.Duration
 
-	mu         sync.Mutex
-	clients    int
+	mu      sync.Mutex
+	clients int
+	// inFlight counts accepted connections that have not completed
+	// registration yet (serveConn between Accept and addClient). It is
+	// what makes stopIfIdle atomic: a connection parked in the handshake
+	// window is still "someone being served", so the daemon must not
+	// exit underneath it. Guarded by mu like clients.
+	inFlight   int
 	conns      map[net.Conn]struct{}
 	idleTimer  *time.Timer
 	stopping   atomic.Bool
@@ -166,7 +172,66 @@ func (d *Daemon) Start() error {
 
 	d.wg.Add(1)
 	go d.acceptLoop()
+	// Workdir liveness: a workdir can disappear underneath a running daemon
+	// (dispatched agents delete their .wt/<repo>/<branch> worktree while a
+	// narrowed daemon still serves it). Without this the daemon keeps the DB
+	// lock, the pidfile and the socket until the idle timeout fires — five
+	// minutes of dead weight that also blocks a fresh spawn under the same
+	// path. Poll cheaply and stop as soon as nobody is served any more.
+	//
+	// Deliberately NOT tracked by d.wg: this goroutine calls Stop, and Stop
+	// waits for d.wg — joining the watchdog into its own wait group would
+	// deadlock the shutdown it is trying to start.
+	go d.watchRootLiveness()
 	return nil
+}
+
+// rootLivenessInterval is how often a running daemon checks that its workdir
+// still exists. A var so tests shrink it; 0 disables the watchdog.
+var rootLivenessInterval = 15 * time.Second
+
+// watchRootLiveness stops the daemon when its workdir has been removed while
+// no session is active, so a daemon narrowed into a deleted git worktree
+// releases the DB lock, the pidfile and the socket immediately instead of
+// idling out minutes later.
+//
+// Active sessions are never interrupted: a client is mid-request, the worst
+// outcome would be an error in the middle of a tool call. The next idle
+// window (or the next tick with no clients) ends the process. Stop runs
+// synchronously here and the goroutine returns right after it — which is why
+// Start must not join this goroutine into d.wg (Stop waits for d.wg).
+func (d *Daemon) watchRootLiveness() {
+	interval := rootLivenessInterval
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+			if d.root == "" || d.stopping.Load() {
+				continue
+			}
+			if _, err := os.Stat(d.root); err == nil {
+				continue
+			} else if !os.IsNotExist(err) {
+				// EACCES / EIO / ELOOP and friends do not prove the workdir is
+				// gone — never tear a serving daemon down over a stat error we
+				// cannot attribute to a deleted directory.
+				continue
+			}
+			// Atomic idle stop: a connection accepted-but-not-registered
+			// still counts (inFlight), so the check-and-stop cannot race a
+			// handshake the way a ClientCount-then-Stop pair could.
+			if d.stopIfIdle("workdir removed") {
+				log.Printf("daemon workdir %s no longer exists; shut down to release the lock and sockets", d.root)
+				return
+			}
+		}
+	}
 }
 
 // Wait blocks until Stop has finished (idle/signal/explicit) and sessions drain.
@@ -189,18 +254,74 @@ func (d *Daemon) Stop(reason string) {
 	if !d.stopping.CompareAndSwap(false, true) {
 		return
 	}
-	defer close(d.stopped)
+	// Same beginShutdown + listener close + finishShutdown sequence as
+	// stopIfIdle; the listener is closed outside the mutex so a pending
+	// Accept error path never waits on d.mu while holding it.
+	ln := d.beginShutdown()
 	log.Printf("daemon shutting down (%s; clients=%d)", reason, d.ClientCount())
+	if ln != nil {
+		_ = ln.Close()
+	}
+	d.finishShutdown()
+}
+
+// stopIfIdle is the atomic counterpart of Stop used by the autonomous
+// shutdown paths (idle timer, workdir watchdog): under a single d.mu hold
+// it checks that no session is registered AND no accepted connection is
+// still in the handshake window, flips d.stopping, then closes the
+// listener and runs the shared shutdown — so no Accept can slip between
+// the count check and the stop. Returns false (nothing stopped) when the
+// daemon is busy or already stopping.
+func (d *Daemon) stopIfIdle(reason string) bool {
 	d.mu.Lock()
+	if d.clients > 0 || d.inFlight > 0 {
+		d.mu.Unlock()
+		return false
+	}
+	// Flip stopping while still holding mu: a connection that completes
+	// its handshake right now sees the flag in addClient and is refused
+	// instead of registering into a daemon that is already draining.
+	if !d.stopping.CompareAndSwap(false, true) {
+		d.mu.Unlock()
+		return false
+	}
+	ln := d.beginShutdownLocked()
+	d.mu.Unlock()
+	log.Printf("daemon shutting down (%s; clients=0)", reason)
+	if ln != nil {
+		_ = ln.Close()
+	}
+	d.finishShutdown()
+	return true
+}
+
+// beginShutdown detaches the listener + idle timer under d.mu (the
+// caller owns the stopping flag via CompareAndSwap). It returns the
+// listener so the caller can close it AFTER releasing the mutex —
+// closing wakes a blocked Accept, so keeping it outside the critical
+// section keeps the lock hold minimal.
+func (d *Daemon) beginShutdown() net.Listener {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.beginShutdownLocked()
+}
+
+// beginShutdownLocked is beginShutdown with d.mu already held.
+func (d *Daemon) beginShutdownLocked() net.Listener {
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
 		d.idleTimer = nil
 	}
-	d.mu.Unlock()
+	return d.listener
+}
+
+// finishShutdown is the shared tail of Stop and stopIfIdle: cancel the
+// context, force-close live sessions, wait for accept loop + sessions to
+// drain, then remove lock/socket artifacts. d.stopped is closed exactly
+// once — both entry points funnel through stopping.CompareAndSwap.
+func (d *Daemon) finishShutdown() {
+	defer close(d.stopped)
 	d.cancel()
-	if d.listener != nil {
-		_ = d.listener.Close()
-	}
 	// Force-close live clients so session handlers unblock.
 	d.mu.Lock()
 	for c := range d.conns {
@@ -264,6 +385,22 @@ func (d *Daemon) acceptLoop() {
 			continue
 		}
 		permErrs = 0
+		// Register the accepted connection under the same lock that
+		// stopIfIdle inspects: either the daemon is already stopping (drop
+		// the conn) or the conn is counted in-flight BEFORE serveConn
+		// starts, so the idle/stop check can never miss it.
+		d.mu.Lock()
+		if d.stopping.Load() {
+			d.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		d.inFlight++
+		if d.idleTimer != nil {
+			d.idleTimer.Stop()
+			d.idleTimer = nil
+		}
+		d.mu.Unlock()
 		d.wg.Add(1)
 		go d.serveConn(conn)
 	}
@@ -272,6 +409,9 @@ func (d *Daemon) acceptLoop() {
 func (d *Daemon) serveConn(conn net.Conn) {
 	defer d.wg.Done()
 	defer conn.Close()
+	// The accept loop counted this connection in-flight before spawning
+	// us; decrement on the way out, whatever the handshake did.
+	defer d.finishConn()
 	// Audit critical: an unrecovered panic in a session goroutine exits the
 	// whole process — every other session's MCP connection dies with it and
 	// the index writer disappears. Recover here so a panicking session (or
@@ -318,7 +458,11 @@ func (d *Daemon) serveConn(conn net.Conn) {
 	}
 	rwc := &sessionRWC{r: r, conn: conn, idle: sessionIdleTimeout}
 
-	d.addClient(conn)
+	if !d.addClient(conn) {
+		// The daemon began stopping between Accept and registration —
+		// never start a handler for a session the shutdown already owns.
+		return
+	}
 	defer d.dropClient(conn)
 
 	ctx := d.ctx
@@ -327,15 +471,39 @@ func (d *Daemon) serveConn(conn net.Conn) {
 	}
 }
 
-func (d *Daemon) addClient(conn net.Conn) {
+// addClient registers a live session. It returns false when the daemon
+// is already stopping: registration and the stopping flag are checked
+// under the same mutex, so a session can never slip past beginShutdown
+// and get stranded uncounted.
+func (d *Daemon) addClient(conn net.Conn) bool {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping.Load() {
+		return false
+	}
 	d.clients++
 	d.conns[conn] = struct{}{}
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
 		d.idleTimer = nil
 	}
+	return true
+}
+
+// finishConn is the accept-loop counterpart of addClient/dropClient: it
+// decrements the in-flight count serveConn was spawned with, and
+// rearms the idle timer when the last connection — registered or
+// in-flight — is gone.
+func (d *Daemon) finishConn() {
+	d.mu.Lock()
+	if d.inFlight > 0 {
+		d.inFlight--
+	}
+	idle := d.clients == 0 && d.inFlight == 0
 	d.mu.Unlock()
+	if idle {
+		d.armIdleTimer()
+	}
 }
 
 func (d *Daemon) dropClient(conn net.Conn) {
@@ -357,19 +525,15 @@ func (d *Daemon) armIdleTimer() {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.clients > 0 || d.idleTimer != nil {
+	if d.clients > 0 || d.inFlight > 0 || d.idleTimer != nil {
 		return
 	}
 	d.idleTimer = time.AfterFunc(d.idleAfter, func() {
-		d.mu.Lock()
-		n := d.clients
-		d.idleTimer = nil
-		d.mu.Unlock()
-		if n > 0 {
+		// Atomic idle stop: a busy daemon (session live or handshake in
+		// flight) refuses and simply rearms for the next window.
+		if !d.stopIfIdle("idle timeout") {
 			d.armIdleTimer()
-			return
 		}
-		d.Stop("idle timeout")
 	})
 }
 

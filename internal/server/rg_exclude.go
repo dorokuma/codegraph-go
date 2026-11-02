@@ -1,9 +1,6 @@
 package server
 
 import (
-	"path/filepath"
-	"strings"
-
 	"github.com/dorokuma/codegraph-go/internal/config"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
 )
@@ -39,6 +36,13 @@ import (
 //     only when <root>/go is a real GOPATH workspace (isGopathRoot), so
 //     an ordinary project dir named "go" at top level is not nuked.
 //
+// User-configured rules are NOT pasted into rg verbatim: every one of them
+// goes through extraction.RgExcludeGlob first, which applies the same shape
+// mapping as above and escapes what the two glob engines disagree on, so a
+// rule the walker reads as a literal directory name ("{foo,bar}", "data[")
+// cannot be expanded into other trees — or into an "error parsing glob"
+// that kills the whole rg call — on the rg side.
+//
 // noIgnore=true returns nil: the caller explicitly asked to search inside
 // ignored/excluded trees, so no exclusion globs are added.
 //
@@ -62,22 +66,17 @@ func rgExcludeArgs(root string, noIgnore bool) []string {
 		emit(g)
 	}
 	// User-configured rules (config.yaml exclude_dirs / CODEGRAPH_EXCLUDE_DIRS).
+	// The shape mapping (anchor / bare) and the walker-vs-rg glob escaping
+	// both live in extraction.RgExcludeGlob, next to the walker itself, so
+	// the two sides cannot drift and no rule can break rg's glob parser.
 	for _, pat := range config.ExcludeDirs() {
-		pat = strings.TrimSuffix(strings.TrimSpace(filepath.ToSlash(pat)), "/")
-		if pat == "" {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(pat, "./") || strings.HasPrefix(pat, "/"):
-			sub := strings.TrimPrefix(strings.TrimPrefix(pat, "./"), "/")
-			if sub == "" {
-				continue
-			}
-			emit("/" + sub)
-		case strings.Contains(pat, "/"):
-			emit("/" + pat)
-		default:
-			emit(pat)
+		// One rule can need TWO globs: the wildcard translation AND a
+		// literal translation — see extraction.RgExcludeGlobs (a valid
+		// Go pattern like `\{foo` or `[ab]` whose own literal name the
+		// pattern does not match is still excluded by the walker's
+		// exact-name comparison, so rg needs both forms).
+		for _, g := range extraction.RgExcludeGlobs(pat) {
+			emit(g)
 		}
 	}
 	return globs

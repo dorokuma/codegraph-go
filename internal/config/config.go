@@ -44,7 +44,13 @@ type Config struct {
 	ExplicitWorkdir string
 	ConfigFile      string
 	NoSync          bool
-	LogLevel        string
+	// WarmDaemon records the -warm-daemon flag: the process only pre-warms
+	// the shared daemon (probe → SpawnDetached → dial, exactly the path a
+	// normal client takes, CPUQuota wrapper included) and exits. deploy.sh
+	// uses it so the daemon is never started through a second, divergent
+	// shell-side entry point.
+	WarmDaemon bool
+	LogLevel   string
 
 	// Optional pruning / resource-limit knobs. Every field is backward
 	// compatible: zero values reproduce the previous behaviour.
@@ -67,6 +73,22 @@ type yamlConfig struct {
 	CPUQuotaPercent int      `yaml:"cpu_quota_percent"`
 }
 
+// workdirsOnlyConfig is the MINIMAL read view WorkdirAllowlist uses: the
+// single "workdirs" key and nothing else.
+//
+// Why a second struct: the authority roots are a security boundary, so
+// decoding them must not depend on any other key in the file. Unmarshalling
+// the full yamlConfig made a typo in an unrelated, non-privileged knob
+// ("nice: soon", "index_workers: many") fail the whole document decode, and
+// WorkdirAllowlist then fell back to $HOME — silently WIDENING the allowlist
+// from the operator's narrow "workdirs: [/root/workspace]" to the entire
+// home directory. Decoding only workdirs keeps the boundary intact: such a
+// typo costs the resource knobs (LoadConfig already logs and ignores the
+// file), never the authority roots.
+type workdirsOnlyConfig struct {
+	Workdirs []string `yaml:"workdirs"`
+}
+
 // LoadConfig parses CLI flags, reads the environment and the optional
 // standalone YAML config, and returns a Config with defaults applied.
 // Config file priority: -config flag > $CODEGRAPH_CONFIG >
@@ -80,6 +102,7 @@ func LoadConfig() Config {
 	flag.StringVar(&cfg.Workdir, "workdir", "", "workspace root (default: cwd; prepended to config workdirs)")
 	flag.StringVar(&cfg.ConfigFile, "config", "", "path to YAML config file")
 	flag.BoolVar(&cfg.NoSync, "no-sync", false, "disable auto-sync file watcher")
+	flag.BoolVar(&cfg.WarmDaemon, "warm-daemon", false, "pre-warm the shared daemon through the normal client spawn path, then exit")
 	flag.Parse()
 
 	// Determine config file path: -config flag > ConfigPath() lookup order.
@@ -302,14 +325,17 @@ func ConfigPath() string {
 }
 
 // WorkdirAllowlist returns the authority roots for workdir validation. The
-// config file is authoritative: when it exists and parses to a non-empty
-// workdirs list, those roots are returned (expanded for ~ and $VAR, then
-// canonicalized by ValidateWorkdirs). Otherwise — no config file, unreadable
-// or unparsable file, or an empty workdirs list — the allowlist falls back to
-// $HOME (canonicalized), so workdirs outside $HOME are refused even without a
-// config file. When $HOME itself cannot be resolved the result is an empty
-// allowlist, whose semantics are "reject everything" (fail closed — see
-// ValidateWorkdirs).
+// config file is authoritative: when it exists and its "workdirs" key
+// decodes to a non-empty list, those roots are returned (expanded for ~ and
+// $VAR, then canonicalized by ValidateWorkdirs). Decoding uses the minimal
+// workdirsOnlyConfig view, so a bad value under a non-privileged key
+// (nice / max_procs / index_workers / cpu_quota_percent) can never widen the
+// allowlist. Otherwise — no config file, unreadable file, a document whose
+// YAML syntax itself is broken, or an empty workdirs list — the allowlist
+// falls back to $HOME (canonicalized), so workdirs outside $HOME are refused
+// even without a config file. When $HOME itself cannot be resolved the result
+// is an empty allowlist, whose semantics are "reject everything" (fail closed
+// — see ValidateWorkdirs).
 // configFile may be empty to use the standard lookup order (ConfigPath).
 func WorkdirAllowlist(configFile string) []string {
 	path := configFile
@@ -319,12 +345,18 @@ func WorkdirAllowlist(configFile string) []string {
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err == nil {
-			var yc yamlConfig
-			if err := yaml.Unmarshal(data, &yc); err == nil && len(yc.Workdirs) > 0 {
+			// Minimal decode on purpose (see workdirsOnlyConfig): an invalid
+			// value under any other key must not degrade the authority roots
+			// down to $HOME. A document whose YAML SYNTAX is broken still
+			// fails to decode here — same contract as before: fall back to
+			// $HOME (see TestWorkdirAllowlist's "workdirs: [unterminated"
+			// case), never silently trust a partially parsed file.
+			var wc workdirsOnlyConfig
+			if err := yaml.Unmarshal(data, &wc); err == nil && len(wc.Workdirs) > 0 {
 				// L2: expand ~ and $VAR exactly like LoadConfig does, so the
 				// allowlist matches the expanded workdirs.
-				roots := make([]string, 0, len(yc.Workdirs))
-				for _, wd := range yc.Workdirs {
+				roots := make([]string, 0, len(wc.Workdirs))
+				for _, wd := range wc.Workdirs {
 					if wd = expandPath(wd); wd != "" {
 						roots = append(roots, wd)
 					}

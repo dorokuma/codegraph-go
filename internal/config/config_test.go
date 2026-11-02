@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -286,6 +287,80 @@ func TestWorkdirAllowlist(t *testing.T) {
 	}
 	if got := WorkdirAllowlist(empty); len(got) != 1 || got[0] != homeC {
 		t.Fatalf("empty workdirs must fall back to $HOME, got %v", got)
+	}
+}
+
+// TestWorkdirAllowlist_InvalidResourceFieldPreservesWorkdirs is the
+// must-fix regression: the authority roots are a security boundary, so they
+// must never depend on a non-privileged key. With the full yamlConfig decode
+// a typo such as `nice: invalid` failed the whole document parse, the config
+// workdirs were dropped and WorkdirAllowlist fell back to $HOME — widening
+// the allowlist from the operator's own `workdirs: [<root>]` to the entire
+// home directory. Every invalid resource value below must keep the strict
+// workdirs whitelist (outside workdirs still rejected), while a document
+// whose YAML SYNTAX itself is broken keeps the pre-existing contract of
+// falling back to $HOME (same as TestWorkdirAllowlist asserts).
+func TestWorkdirAllowlist_InvalidResourceFieldPreservesWorkdirs(t *testing.T) {
+	dir := t.TempDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeC := canonical(home)
+
+	// The configured authority root, deliberately NOT inside $HOME's parent
+	// chain ambiguity: a sibling of it is the "must stay refused" probe.
+	roots := filepath.Join(dir, "workspace")
+	if err := os.MkdirAll(roots, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := canonical(roots)
+
+	cases := []struct {
+		name      string
+		body      string
+		syntaxErr bool // YAML itself unparsable → $HOME fallback contract
+	}{
+		{"invalid nice", "workdirs:\n  - " + roots + "\nnice: invalid\n", false},
+		{"invalid cpu_quota_percent", "workdirs:\n  - " + roots + "\ncpu_quota_percent: 150%%\n", false},
+		{"invalid max_procs", "workdirs:\n  - " + roots + "\nmax_procs: four\n", false},
+		{"invalid index_workers", "workdirs:\n  - " + roots + "\nindex_workers: many\n", false},
+		{"wrong type nice", "workdirs:\n  - " + roots + "\nnice: [1, 2]\n", false},
+		{"all four invalid at once", "workdirs:\n  - " + roots + "\n" +
+			"nice: soon\nmax_procs: four\nindex_workers: many\ncpu_quota_percent: lots\n", false},
+		{"invalid resource field plus exclude_dirs", "workdirs:\n  - " + roots + "\nexclude_dirs: [junk]\nnice: -1x\n", false},
+		{"broken yaml syntax", "workdirs: [unterminated\nnice: 5\n", true},
+	}
+
+	for i, tc := range cases {
+		cfgFile := filepath.Join(dir, fmt.Sprintf("cfg-%d.yaml", i))
+		if err := os.WriteFile(cfgFile, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := WorkdirAllowlist(cfgFile)
+		if tc.syntaxErr {
+			if len(got) != 1 || got[0] != homeC {
+				t.Fatalf("%s: broken YAML syntax must keep the $HOME fallback contract, got %v (want [%s])", tc.name, got, homeC)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("%s: allowlist = %v, want [%s] — a bad resource key must not widen the authority roots (degrading to $HOME=%s would)", tc.name, got, want, homeC)
+		}
+		// The whitelist is still strict: the config root and its descendants
+		// pass, everything else — including the $HOME the buggy version fell
+		// back to — is refused.
+		if err := ValidateWorkdirs([]string{roots, filepath.Join(roots, "repo", "feat")}, got); err != nil {
+			t.Fatalf("%s: workdirs inside the configured root must pass: %v", tc.name, err)
+		}
+		if err := ValidateWorkdirs([]string{dir}, got); err == nil {
+			t.Fatalf("%s: %s (parent of the configured root) must stay refused, got allowlist %v", tc.name, dir, got)
+		}
+		if !insideRoot(homeC, want) {
+			if err := ValidateWorkdirs([]string{homeC}, got); err == nil {
+				t.Fatalf("%s: $HOME (%s) must not be an authority root any more", tc.name, homeC)
+			}
+		}
 	}
 }
 

@@ -30,7 +30,7 @@ Alignment: steps **1–9** done incl. 7.5 (logic **19**). Not full feature-parit
 - **Framework route detection:** Gin, chi, gorilla/mux, GoFrame, Express, NestJS, React Router, Flask, FastAPI, Django, Laravel, Rails, Spring, ASP.NET, Axum, actix, Rocket, Vapor, Play
 - **Cross-language bridging:** CGo (Go↔C), Python ctypes/cffi/Cython, React Native/Expo, Swift↔ObjC
 - **Home-mode indexing:** workdir=`$HOME` only enters project-like top-level dirs
-- **Shared daemon (optional):** one process per project root owns SQLite + watcher; MCP hosts attach via Unix socket proxy. `CODEGRAPH_NO_DAEMON=1` keeps the old embedded mode. Idle exit default 300s (`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`).
+- **Shared daemon (optional):** one process per project root owns SQLite + watcher; MCP hosts attach via Unix socket proxy. `CODEGRAPH_NO_DAEMON=1` keeps the old embedded mode. Idle exit default 300s (`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`); a daemon whose workdir disappeared (a deleted `.wt` worktree) exits on its own at the next liveness tick once no session is active, instead of holding the lock until the idle timeout.
 - **content_hash incremental:** SHA-256 of file bytes; unchanged content skips re-extract even if mtime moved
 - **Git-assist sync:** after cold index, `git status` picks up edits missed while nothing was watching (no hooks installed)
 - **Portable index paths:** files/nodes stored relative to workdir (schema 17+); safe to move/copy the tree after reindex
@@ -62,7 +62,11 @@ cd codegraph-go
 go build -o codegraph-go ./cmd/codegraph-go
 
 # Install
-# Recommended: run ./deploy.sh — it installs to $HOME/.local/bin/codegraph-go.
+# Recommended: run ./deploy.sh — it installs to $HOME/.local/bin/codegraph-go
+# as 0555 (read-only executable) plus an immutable bit (chattr +i) when running
+# as root on a filesystem that supports it, so a stray `cat > binary` cannot
+# quietly corrupt the deployed build. Set CODEGRAPH_SKIP_IMMUTABLE_LOCK=1 to
+# install without the immutable bit (used by the script's own tests).
 cp codegraph-go ~/.local/bin/codegraph-go
 ```
 
@@ -83,7 +87,9 @@ codegraph-go -workdir /path/to/project
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-workdir` | current directory | Workspace root |
+| `-config` | auto-discovered | Path to the YAML config file (see below) |
 | `-no-sync` | false | Disable auto-sync file watcher |
+| `-warm-daemon` | false | Bring the shared daemon up through the ordinary client path (`EnsureAndDial` → `SpawnDetached`, CPU-quota wrapper included), hang up and exit. Used by `deploy.sh`, which no longer starts a daemon of its own — that private entry point used to bypass `CPUQuota` and every other layer of the Go spawn path. |
 
 ### Config file
 
@@ -97,7 +103,8 @@ exclude_dirs:                  # extra dirs to skip while indexing/watching
   - "./ref"                     # top-level anchor: only <workdir>/ref and its
                                # subtree — a deep proj/internal/ref is NOT excluded
 nice: 10                       # process nice level, clamped to [0,19] (0 = untouched;
-                               # Linux: applied to every thread via /proc/self/task)
+                               # Linux: bounded multi-pass sweep over /proc/self/task,
+                               # best-effort — see the resource-limits note)
 max_procs: 4                   # GOMAXPROCS cap, clamped to [0,64] (0 = unlimited);
                                # an explicit $GOMAXPROCS env always wins
 index_workers: 3               # parallel extract workers
@@ -117,6 +124,47 @@ workdir). The same built-in skip dirs and `skipPathFragments` cache trees
 (node_modules, `.local/lib`, `go/pkg`, `.cargo/registry`, …) are also
 excluded from rg-based `search`/`files`/`callers`/`callees`/`impact`, so
 the rg backstop and the indexer never disagree about what is in scope.
+
+`exclude_dirs` rules are read with `filepath.Match` semantics plus an
+exact-name comparison (the indexer's engine). Before they reach ripgrep
+they go through `extraction.RgExcludeGlobs`, which emits up to two globs
+per rule — a wildcard translation and a literal one — mirroring the
+walker's "exact-name OR filepath.Match" dual semantics: a valid Go
+pattern whose own literal name it does not match (`\{foo`, `[ab]`) is
+still excluded by name on both sides. The translation keeps the shape
+(`./sub` stays anchored to the workdir root) and rewrites what the two
+glob engines disagree on: `\`, `{` and `}` become the classes `[\\]`,
+`[{]` and `[}]` (rg's brace expansion runs before escape resolution and
+in-class `\` is literal), and `[...]` classes are re-emitted through
+POSIX class normalisation — reversed ranges (`[z-a]`, silently empty for
+Go but exit 2 for rg) are suppressed, `[^z-a]` collapses to `?`, and
+in-class `]`/`!`/`^`/`-` are placed where rg reads them literally.
+Bare-name rules (no `/` in the rule) get one more fix: the walker only
+ever sees a basename, which can never be `/`, but rg's `[!x]` and any
+range spanning `/` would otherwise match the separator and kill a
+two-level dir like `cmd/codegraph-go` — so `/` is injected into
+negated classes (`[!x]` → `[!x/]`, emitted `**/`-prefixed because the
+glob now carries `/`) and positive ranges are split at the separator
+(`[\--0]` → `[.0-]`). Path rules (`a/b`, `./sub`) keep `/` as a legal
+class member — `filepath.Match("a[/]b","a/b")` is true and rg 14.1.1
+honours it identically. A rule `filepath.Match` rejects (`data[`, a
+trailing dangling escape like `a\`, or a `*`-suffixed malformed tail
+like `foo*\`) is passed to rg fully escaped — `a\` becomes `a[\\]`,
+`foo*\` becomes `foo\*[\\]` — which rg parses and which excludes
+exactly the literal directory. Validity is checked by `isValidGoPattern`,
+which validates every `*`-separated chunk instead of relying on
+`filepath.Match(pat, "")` (it short-circuits at the first failing `*`
+chunk and never sees a malformed tail). No rule can ever abort a
+search (no exit 2) and no rule can panic the translator.
+
+The glob conversion layer (character classes, brace expansion,
+backslash escaping) is aligned against **ripgrep 14.1.1** (`globset`)
+measured behaviour. After upgrading the local `ripgrep`, re-verify
+compatibility with:
+
+```
+go test -p 2 ./internal/extraction ./internal/server -run TestRgExcludeArgsWeirdRulesAgreeWithWalker
+```
 
 ### Shared daemon socket auth
 

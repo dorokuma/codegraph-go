@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,117 @@ func TestIsGoRunTempPath(t *testing.T) {
 		if got := isGoRunTempPath(c.path); got != c.want {
 			t.Errorf("isGoRunTempPath(%q) = %v, want %v", c.path, got, c.want)
 		}
+	}
+}
+
+// TestSpawnDetachedSystemdRunSyncFallbackClearsQuota is the regression for
+// the sync-rollback leak: when the systemd-run wrapper fails at cmd.Start()
+// (ENOENT — the binary vanished from PATH mid-spawn, the classic case),
+// SpawnDetached respawns the daemon directly. It must also clear quotaArgs,
+// because the shared code path below decides whether to sit in the 150ms
+// async scope-failure probe purely from quotaArgs != nil. Without the clear,
+// the DIRECT child runs through that probe, and — the probe's second
+// condition is "no live daemon holds the pidfile yet" — a direct daemon that
+// fails to come up non-zero inside the window is spawned a SECOND time. The
+// fake daemon appends one marker line per exec with its parent pid, so the
+// test can count actual spawns: exactly one, and it must be a child of this
+// test process (a direct exec, never the wrapper).
+func TestSpawnDetachedSystemdRunSyncFallbackClearsQuota(t *testing.T) {
+	root := t.TempDir()
+	execLog := filepath.Join(root, "execs.log")
+
+	// The "daemon": records every exec (pid of its spawner) and exits
+	// non-zero — like a real spawn that fails to come up, which is exactly the
+	// condition the async probe mistakes for a scope-start failure.
+	self := filepath.Join(root, "fake-daemon.sh")
+	body := "#!/bin/sh\nprintf 'exec %s %s\\n' \"$0\" \"$PPID\" >> '" + execLog + "'\nexit 3\n"
+	if err := os.WriteFile(self, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wrapper that cannot be executed at all → cmd.Start() fails
+	// synchronously → the direct-respawn branch runs.
+	oldArgs := systemdRunArgsFn
+	systemdRunArgsFn = func(string, []string, *SpawnOpts) []string {
+		return []string{filepath.Join(root, "no-such-systemd-run")}
+	}
+	defer func() { systemdRunArgsFn = oldArgs }()
+
+	oldResolve := resolveDaemonBinaryFn
+	resolveDaemonBinaryFn = func() (string, error) { return self, nil }
+	defer func() { resolveDaemonBinaryFn = oldResolve }()
+
+	var logBuf strings.Builder
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(oldLogger)
+
+	if err := SpawnDetached(root, &SpawnOpts{CPUQuotaPercent: 150}); err != nil {
+		t.Fatalf("SpawnDetached must fall back to a direct spawn and succeed: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), "systemd-run spawn failed, falling back to direct spawn") {
+		t.Fatalf("expected the synchronous fallback warn line, got: %q", logBuf.String())
+	}
+
+	// Give the async probe window (150ms) plus the respawn it would trigger
+	// time to happen, then count the execs: one direct spawn, never the
+	// wrapper, every child parented by this test process.
+	time.Sleep(500 * time.Millisecond)
+	raw, err := os.ReadFile(execLog)
+	if err != nil {
+		t.Fatalf("daemon was never spawned: %v", err)
+	}
+	lines := strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' })
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 direct daemon exec, got %d: %q — the cleared quotaArgs regressed (the direct child ran through the scope probe and respawned itself)", len(lines), string(raw))
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) != 3 || fields[0] != "exec" || filepath.Base(fields[1]) != "fake-daemon.sh" {
+		t.Fatalf("unexpected exec record %q", lines[0])
+	}
+	if fields[2] != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("daemon must be a direct child of this process (direct spawn), got ppid %s want %d", fields[2], os.Getpid())
+	}
+}
+
+// TestDaemonAliveAtRejectsReusedPID: the pidfile liveness probe behind the
+// systemd-run fallback window must not accept a live pid whose /proc start
+// time differs from the recorded ProcStart — such a pid is a different
+// incarnation (PID reuse) and treating it as a live daemon would wrongly
+// suppress the direct-spawn fallback. daemonAliveAt reuses the same
+// procStartTime mechanism as verifyDaemonIdentity.
+func TestDaemonAliveAtRejectsReusedPID(t *testing.T) {
+	start := procStartTime(os.Getpid())
+	if start <= 0 {
+		t.Skip("no /proc start time on this platform; the ProcStart guard is a no-op")
+	}
+	root := t.TempDir()
+	pidPath := PidPath(root)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(procStart int64) {
+		if err := os.WriteFile(pidPath, EncodeLock(LockInfo{
+			PID:        os.Getpid(),
+			Version:    PackageVersion,
+			SocketPath: PreferredSocket(root),
+			StartedAt:  1,
+			ProcStart:  procStart,
+		}), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(start)
+	if !daemonAliveAt(root) {
+		t.Fatal("a live pid recorded with its real ProcStart must report alive")
+	}
+
+	// Same live pid, forged start time: incarnation mismatch → the recorded
+	// daemon is gone, the pid is someone else's recycled slot.
+	write(1)
+	if daemonAliveAt(root) {
+		t.Fatal("a live pid with ProcStart=1 (mismatched incarnation) must report dead")
 	}
 }
 
