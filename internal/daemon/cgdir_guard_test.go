@@ -2,11 +2,15 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // Daemon-side .codegraph symlink jail regression: before the guard, the three
@@ -103,4 +107,70 @@ func TestTryAcquireLockCreatesMissingCodeGraphDir(t *testing.T) {
 		t.Fatalf(".codegraph must be a real directory after TryAcquireLock, got %v", fi.Mode())
 	}
 	defer func() { _ = os.Remove(res.PidPath) }()
+}
+
+// TestSpawnDetachedDaemonLogOpenFailureFailsClosed is the RED regression for
+// the swallowed daemon.log open failure (diagnostic-fix rounds 1-2): the
+// baseline sets logFile=nil and spawns anyway when daemon.log cannot be
+// opened — the child runs with stdout/stderr discarded and the parent only
+// sees a dial timeout (CG_B5_EISDIR_BLIND_SPAWN). A directory planted at the
+// daemon.log path is a root-proof EISDIR trigger (chmod would be skipped
+// under euid 0); the same merge absorbs the duplicate EISDIR sub-case that
+// used to live in spawn_test.go, keeping the independent non-root EACCES
+// leg there. SpawnDetached must fail closed BEFORE spawning anything: the
+// error must carry the EISDIR errno, the target root and the log path; the
+// systemdRunArgsFn counter proves startup preparation was never reached and
+// the marker proves no child ever ran.
+//
+// Baseline-injection note: this test deliberately uses only symbols that
+// exist at ae3dd51 (SpawnDetached, CodeGraphDir, resolveDaemonBinaryFn,
+// systemdRunArgsFn), so copying this file onto a bare ae3dd51 clone
+// compiles and FAILS substantively (err == nil, child spawned) — not with
+// undefined symbols.
+func TestSpawnDetachedDaemonLogOpenFailureFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(CodeGraphDir(root), "daemon.log")
+	if err := os.MkdirAll(logPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(root, "spawned.marker")
+	self := filepath.Join(root, "fake-daemon.sh")
+	body := "#!/bin/sh\nprintf ran > '" + marker + "'\n"
+	if err := os.WriteFile(self, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldResolve := resolveDaemonBinaryFn
+	resolveDaemonBinaryFn = func() (string, error) { return self, nil }
+	defer func() { resolveDaemonBinaryFn = oldResolve }()
+	// Startup-preparation probe: systemdRunArgsFn is only evaluated once the
+	// log was opened successfully, so a nonzero count means the spawn path
+	// continued past the refused open.
+	var prepCalls atomic.Int64
+	oldArgs := systemdRunArgsFn
+	systemdRunArgsFn = func(string, []string, *SpawnOpts) []string {
+		prepCalls.Add(1)
+		return nil
+	}
+	defer func() { systemdRunArgsFn = oldArgs }()
+
+	err := SpawnDetached(root, nil)
+	if err == nil {
+		t.Fatal("CG_B5_EISDIR_BLIND_SPAWN an unopenable daemon.log must fail SpawnDetached closed, not spawn a child whose output is discarded")
+	}
+	if !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("the error must carry the open failure errno EISDIR, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), logPath) || !strings.Contains(err.Error(), root) {
+		t.Fatalf("the error must name the daemon log path and the target root, got: %v", err)
+	}
+	if got := prepCalls.Load(); got != 0 {
+		t.Fatalf("CG_B5_EISDIR_BLIND_SPAWN reached startup preparation %d time(s) after the open failure", got)
+	}
+	// Bound the wait so a baseline build (which DID spawn the fake) cannot
+	// race the marker write, then assert the fix never spawned at all.
+	time.Sleep(300 * time.Millisecond)
+	if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
+		t.Fatalf("CG_B5_EISDIR_BLIND_SPAWN a child was spawned despite the log open failure (marker present: %v)", serr)
+	}
 }

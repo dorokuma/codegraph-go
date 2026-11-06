@@ -1,17 +1,21 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/dorokuma/codegraph-go/internal/cgdir"
+	"golang.org/x/sys/unix"
 )
 
 // SpawnOpts carries parent CLI flags the detached daemon should inherit.
@@ -41,7 +45,9 @@ var (
 
 // SpawnDetached launches this binary as the shared daemon for root.
 // Stdio goes to .codegraph/daemon.log; the child is in its own session.
-// opts may be nil.
+// Fails with a phase/root/path/errno error when the log cannot be opened
+// instead of spawning a child whose output would be discarded. opts may be
+// nil.
 // resolveDaemonBinary returns the path of this binary to spawn as the
 // detached daemon. It prefers os.Executable() — the real, resolved path of
 // the running client — so the daemon is always the same binary (same
@@ -100,6 +106,16 @@ func isGoRunTempPath(p string) bool {
 		strings.Contains(dir, string(filepath.Separator)+"go-build")
 }
 
+// spawnEarlyExitWindow bounds how long SpawnDetached watches a systemd-run
+// scope launch for an immediate non-zero exit before treating it as a
+// healthy startup.
+const spawnEarlyExitWindow = 150 * time.Millisecond
+
+// daemonLogTailBytes bounds the daemon.log tail embedded in early-exit
+// diagnostics — enough for the daemon's final fatal lines, small enough to
+// stay a single warn record.
+const daemonLogTailBytes = 4 * 1024
+
 func SpawnDetached(root string, opts *SpawnOpts) error {
 	// The .codegraph guard runs before anything under the project is
 	// touched: daemon.log below — and everything the daemon writes later —
@@ -114,13 +130,34 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 	}
 	logPath := filepath.Join(CodeGraphDir(root), "daemon.log")
 	// Rotate if the log has grown past 10 MB — keep one previous copy.
+	// Lstat (never Stat): a symlinked or otherwise non-regular leaf must not
+	// enter rotation — following a link would stat and rename the TARGET,
+	// and a rotated symlink leaf would still redirect the open below to a
+	// file outside the project. Non-regular leafs are left in place and
+	// rejected at open time instead.
 	const maxLogSize = 10 * 1024 * 1024
-	if fi, statErr := os.Stat(logPath); statErr == nil && fi.Size() > maxLogSize {
+	if fi, statErr := os.Lstat(logPath); statErr == nil && fi.Mode().IsRegular() && fi.Size() > maxLogSize {
 		_ = os.Rename(logPath, logPath+".1")
 	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	// Fail instead of spawning blind: when daemon.log cannot be opened the
+	// child would run with stdout/stderr discarded, and the parent would
+	// learn nothing about why the daemon died (a read-only .codegraph was
+	// the original incident — EACCES here left zero evidence). Returning
+	// the phase + target root + path + errno lets EnsureAndDial surface a
+	// real error while still falling back to direct mode safely.
+	// O_RDWR (not O_WRONLY): the same open file description is handed to the
+	// exit watcher for the bounded diagnostic tail — the tail is read through
+	// THIS fd, never by re-opening logPath, so a rotation, a rename, or a
+	// swapped symlink at that path cannot redirect the read to a different
+	// file. The open itself must not follow a leaf symlink either: a planted
+	// link used to redirect the child's stdout/stderr — and this fd's tail —
+	// to an arbitrary file outside the project, so openDaemonLog pins the
+	// leaf to a regular file at the syscall boundary (see below). Ownership
+	// of logFile transfers to whichever goroutine owns the child wait below;
+	// every error path closes it explicitly.
+	logFile, err := openDaemonLog(logPath)
 	if err != nil {
-		logFile = nil
+		return fmt.Errorf("spawn daemon for %s: open daemon log %s: %w", root, logPath, err)
 	}
 
 	args := []string{"-workdir", root}
@@ -132,11 +169,6 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 			args = append(args, "-no-sync")
 		}
 	}
-	cmd := exec.Command(self, args...)
-	quotaArgs := systemdRunArgsFn(self, args, opts)
-	if quotaArgs != nil {
-		cmd = exec.Command(quotaArgs[0], quotaArgs[1:]...)
-	}
 	env := os.Environ()
 	// Mark as daemon; scrub any stale host-ppid markers.
 	filtered := make([]string, 0, len(env)+1)
@@ -147,18 +179,23 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 		filtered = append(filtered, e)
 	}
 	filtered = append(filtered, EnvDaemonInternal+"=1")
-	cmd.Env = filtered
-	cmd.Dir = root
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-		defer logFile.Close()
-	} else {
-		cmd.Stdout = nil
-		cmd.Stderr = nil
+	// daemonCmd builds a detached child with identical env/dir/session/stdio
+	// for the primary spawn and every systemd-run fallback respawn below.
+	daemonCmd := func(name string, cargs ...string) *exec.Cmd {
+		c := exec.Command(name, cargs...)
+		c.Env = filtered
+		c.Dir = root
+		c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		c.Stdout = logFile
+		c.Stderr = logFile
+		c.Stdin = nil
+		return c
 	}
-	cmd.Stdin = nil
+	cmd := daemonCmd(self, args...)
+	quotaArgs := systemdRunArgsFn(self, args, opts)
+	if quotaArgs != nil {
+		cmd = daemonCmd(quotaArgs[0], quotaArgs[1:]...)
+	}
 
 	if err := cmd.Start(); err != nil {
 		if quotaArgs != nil {
@@ -168,45 +205,34 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 			slog.Warn("systemd-run spawn failed, falling back to direct spawn", "error", err)
 			// The wrapper is gone: clear it BEFORE the reaper below, or the
 			// direct child would still be treated as a scoped spawn and run
-			// into the 150ms async probe window — where a normal lock-race
-			// loser exiting 0 looks like a scope-start failure and spawns the
+			// into the async probe window — where a normal lock-race loser
+			// exiting 0 looks like a scope-start failure and spawns the
 			// daemon a second time.
 			quotaArgs = nil
-			cmd = exec.Command(self, args...)
-			cmd.Env = filtered
-			cmd.Dir = root
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-			if logFile != nil {
-				cmd.Stdout = logFile
-				cmd.Stderr = logFile
-			}
-			cmd.Stdin = nil
+			cmd = daemonCmd(self, args...)
 			if err = cmd.Start(); err != nil {
-				return err
+				_ = logFile.Close()
+				return fmt.Errorf("spawn daemon for %s: %w", root, err)
 			}
 		} else {
-			return err
+			_ = logFile.Close()
+			return fmt.Errorf("spawn daemon for %s: %w", root, err)
 		}
 	}
-	// Reap the child in a goroutine instead of Process.Release: a candidate
-	// daemon that loses the lock race exits within ~50ms, and without a Wait
-	// the parent would carry a zombie until the CLI itself exits. cmd.Wait()
-	// reaps it immediately; a daemon that survives long-term just blocks the
-	// goroutine on Wait — acceptable for the CLI's short lifetime. The child
-	// is a Setsid session leader and is adopted by init if this process dies,
-	// so reaping does not affect daemon independence (cmd.Wait() and Setsid
-	// do not conflict — Wait is a plain waitpid on the child).
-	//
-	// The buffered channel also doubles as the async-failure probe for the
-	// systemd-run path below: when the wrapper was used, we watch a short
-	// window for an immediate non-zero exit (scope creation failed —
-	// Start() succeeds because systemd-run itself launched fine) and fall
-	// back to a direct spawn, same zero-fault contract as the sync path.
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
+	// The child is a Setsid session leader and is adopted by init if this
+	// process dies, so reaping does not affect daemon independence
+	// (cmd.Wait() and Setsid do not conflict — Wait is a plain waitpid on
+	// the child).
 	if quotaArgs != nil {
+		// The buffered channel also doubles as the async-failure probe for
+		// the systemd-run path: when the wrapper was used, we watch a short
+		// window for an immediate non-zero exit (scope creation failed —
+		// Start() succeeds because systemd-run itself launched fine) and fall
+		// back to a direct spawn, same zero-fault contract as the sync path.
+		waitCh := make(chan error, 1)
+		go func() {
+			waitCh <- cmd.Wait()
+		}()
 		select {
 		case waitErr := <-waitCh:
 			if waitErr != nil && !daemonAliveAt(root) {
@@ -216,23 +242,18 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 				// A normal lock-race loser exits 0, and a winner keeps the pid
 				// file owned — neither must trigger the fallback.
 				slog.Warn("systemd-run scope start failed, falling back to direct spawn", "error", waitErr)
-				cmd = exec.Command(self, args...)
-				cmd.Env = filtered
-				cmd.Dir = root
-				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-				if logFile != nil {
-					cmd.Stdout = logFile
-					cmd.Stderr = logFile
-				}
-				cmd.Stdin = nil
+				cmd = daemonCmd(self, args...)
 				if err := cmd.Start(); err != nil {
-					return err
+					_ = logFile.Close()
+					return fmt.Errorf("spawn daemon for %s: %w", root, err)
 				}
-				go func() {
-					_ = cmd.Wait()
-				}()
+				go watchDaemonExit(cmd, root, logFile, logPath)
+			} else {
+				// Wrapper exited cleanly, or a live daemon already holds the
+				// lock: no fallback, nobody else needs the fd.
+				_ = logFile.Close()
 			}
-		case <-time.After(150 * time.Millisecond):
+		case <-time.After(spawnEarlyExitWindow):
 			// Still running after the window: normal startup (the daemon or
 			// the systemd-run wrapper supervising it). Keep watching the
 			// reaper channel so a scope that fails asynchronously — e.g.
@@ -241,20 +262,229 @@ func SpawnDetached(root string, opts *SpawnOpts) error {
 			// client still falls back to direct mode via the dial timeout;
 			// this is observability only.
 			go func() {
+				defer logFile.Close()
 				if waitErr := <-waitCh; waitErr != nil {
 					slog.Warn("systemd-run scope exited with error after startup window", "error", waitErr)
 				}
 			}()
 		}
+	} else {
+		// Plain spawn: same reaping duty, plus the diagnostic trail the
+		// client otherwise never gets — a daemon that dies non-zero while no
+		// live daemon holds the lock used to leave its Wait result dropped
+		// in the channel, and the parent only saw the dial time out.
+		go watchDaemonExit(cmd, root, logFile, logPath)
 	}
 	return nil
+}
+
+// openDaemonLog opens daemon.log for the child's stdout/stderr under a leaf
+// safety contract the plain os.OpenFile(path, O_RDWR|O_CREAT) call could
+// not give: the kernel must refuse the open when the leaf itself is a
+// symlink — a planted link is never resolved into its target.
+//
+//   - The open is a single unix.Open(logPath, O_RDWR|O_APPEND|O_CREAT|
+//     O_NOFOLLOW|O_CLOEXEC, 0600): O_NOFOLLOW makes the kernel refuse a
+//     symlinked FINAL component at open() time with ELOOP, before
+//     O_CREAT/O_APPEND ever touch a target — a leaf link planted at
+//     daemon.log cannot redirect the child's output (and the parent's
+//     diagnostic tail) to an arbitrary file, and a dangling link does not
+//     get its target created. O_NOFOLLOW deliberately constrains only the
+//     leaf: intermediate components keep following symlinks because a
+//     symlinked workdir ancestor is a supported alias (cgdir.Ensure
+//     verifies only that .codegraph itself resolves to a real directory),
+//     so openat2 RESOLVE_NO_SYMLINKS / RESOLVE_BENEATH-style re-rooting
+//     would reject supported layouts and is out of scope here. The
+//     residual boundary: an ancestor or .codegraph swap racing between
+//     Ensure and this open is not bound by an fd — the leaf guarantee
+//     does not extend to parent re-rooting (unchanged task boundary).
+//   - After open, f.Stat must report a regular file on the bound fd:
+//     FIFOs, devices and anything else the kernel let past O_NOFOLLOW are
+//     refused there. A leaf swapped or unlinked after open is fine — the
+//     fd is already bound to the inode the kernel opened, same standing
+//     as a later rotation, so no post-open Lstat/SameFile re-check is
+//     needed (and a gone leaf is NOT treated as suspicious).
+//
+// Refusals keep errno identity: a leaf directory surfaces EISDIR through
+// the open, leaf links surface ELOOP as the kernel's own errno (no
+// normalization re-check needed), and every failure closes its own fd
+// before returning so the caller never spawns a blind child.
+func openDaemonLog(logPath string) (*os.File, error) {
+	fd, err := unix.Open(logPath,
+		unix.O_RDWR|unix.O_APPEND|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0o600)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), logPath)
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("daemon log leaf is not a regular file: %s", logPath)
+	}
+	return f, nil
+}
+
+// watchDaemonExit reaps a spawned daemon child and, when it exits with an
+// error while no live daemon is recorded in root's pidfile, leaves the
+// diagnostic trail the client otherwise never sees. It reports only what it
+// actually observed: the wait error (exit status or signal), the target
+// root, the log path, and — when the log behind logFile is a regular file —
+// a bounded scrubbed tail. A lock-race loser exits 0 and a surviving winner
+// keeps the pidfile owned; both take the silent return. daemonAliveAt reads
+// the pidfile only — a live daemon holding the flock WITHOUT a pidfile (the
+// invisible-holder case handled in proxy.go) is invisible to this probe, so
+// the warn message claims nothing about flock holders. Callers run it in a
+// goroutine; Wait blocks until the child exits, which for a healthy daemon
+// is the daemon's whole lifetime (same lifetime bound the bare reaper
+// goroutine had before), and logFile stays open for that span so the tail
+// reads the same object the child wrote.
+func watchDaemonExit(cmd *exec.Cmd, root string, logFile *os.File, logPath string) {
+	defer logFile.Close()
+	waitErr := cmd.Wait()
+	if waitErr == nil || daemonAliveAt(root) {
+		return
+	}
+	attrs := []any{"error", waitErr, "root", root, "log", logPath}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) && exitErr.ProcessState.Exited() {
+		attrs = append(attrs, "exit_code", exitErr.ExitCode())
+	}
+	if tail := daemonLogTail(logFile); tail != "" {
+		attrs = append(attrs, "log_tail", tail)
+	}
+	slog.Warn("spawned daemon exited; no live daemon recorded in pidfile", attrs...)
+}
+
+// daemonLogTail returns a bounded, scrubbed tail of the daemon log behind f
+// — the same open file description the spawned child wrote to, never a
+// re-open of the log path, so rotation, renames, or symlink swaps at that
+// path cannot redirect the read elsewhere. Only regular files are read: a
+// pre-planted FIFO or device yields no tail at all instead of a blocking
+// read. f's O_APPEND position is irrelevant; ReadAt does not move it.
+//
+// Redaction boundary: the raw window is the file's last daemonLogTailBytes.
+// Truncating mid-line can split a secret across the window edge (the
+// "token=" prefix just before the cut, the value inside) — no pattern can
+// re-identify such a fragment — so the leading partial line is dropped
+// wholesale and only complete lines are emitted. Scrubbing runs on that
+// complete-line body, then the SAME complete-line rule clamps the result
+// back to daemonLogTailBytes: a byte-level cut could land inside a record
+// and strip the identifying prefix safelog's own patterns still need (a
+// "Basic dXNlcjpwYXNz" reduced to raw base64 is unmaskable downstream), so
+// over-limit output drops whole leading records and a single oversized
+// record is omitted entirely. The emitted tail is always <=
+// daemonLogTailBytes and always a whole number of lines.
+func daemonLogTail(f *os.File) string {
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
+		return ""
+	}
+	size := fi.Size()
+	off := int64(0)
+	truncated := false
+	if size > daemonLogTailBytes {
+		off = size - daemonLogTailBytes
+		truncated = true
+	}
+	buf := make([]byte, size-off)
+	nr, _ := f.ReadAt(buf, off)
+	raw := string(buf[:nr])
+	if truncated {
+		// Drop the leading partial line entirely (see the redaction
+		// boundary note above).
+		i := strings.IndexByte(raw, '\n')
+		if i < 0 {
+			return ""
+		}
+		raw = raw[i+1:]
+	}
+	out := scrubDiagText(raw)
+	// Second trim, same rule as the first: only complete lines are emitted.
+	// Scrubbing expands secrets into longer markers ("pwd=x" grows 10 bytes),
+	// so the post-scrub body can exceed the bound; a raw byte cut there would
+	// drop the identifying prefix of the first surviving record (e.g. leave
+	// the tail of "Basic dXNlcjpwYXNz" without the "Basic" the production
+	// safelog needs to mask it), handing the sink an unmaskable fragment.
+	// Whole records are dropped from the front — the oldest evidence first —
+	// until the emission fits; a single record larger than the bound is
+	// dropped entirely rather than emitted mid-secret. Cutting at '\n'
+	// boundaries also can never split a multi-byte UTF-8 rune.
+	for len(out) > daemonLogTailBytes {
+		i := strings.IndexByte(out, '\n')
+		if i < 0 {
+			// No complete record fits the bound: safe omission.
+			return ""
+		}
+		out = out[i+1:]
+	}
+	return out
+}
+
+// diagScrubPatterns is a compact subset of internal/safelog's secret
+// shapes, kept local because the daemon package must not depend on the
+// logging setup: SetupLogger already scrubs the sinks in production, this
+// is the defense-in-depth pass for consumers that render slog records or
+// SpawnDetached errors around an unconfigured handler (tests, embedders).
+var diagScrubPatterns = []*regexp.Regexp{
+	// key=value / key: value pairs with sensitive names.
+	regexp.MustCompile(`(?i)((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|authorization|credential|session[_-]?id)\s*[=:]\s*)[^,;\n]+`),
+	// Bearer tokens and JWTs.
+	regexp.MustCompile(`(?i)(\bbearer\s+)[-a-z0-9._~+/=:_]{8,}`),
+	regexp.MustCompile(`\beyJ[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\b`),
+	// GitHub tokens (classic + fine-grained).
+	regexp.MustCompile(`\b(gh[pousr]_|github_pat_)[a-z0-9_]{20,}`),
+}
+
+// scrubDiagText masks known secret shapes before diagnostic text (child
+// stderr / log tails) is embedded in warnings returned or logged by the
+// spawn path.
+func scrubDiagText(s string) string {
+	for _, re := range diagScrubPatterns {
+		s = re.ReplaceAllString(s, "${1}[REDACTED]")
+	}
+	return s
 }
 
 // daemonAliveAt reports whether a live daemon already holds root's lock —
 // used to distinguish a systemd-run scope-start failure (nobody holds the
 // pidfile yet) from a normal daemon that just won the race.
+//
+// The pidfile is a diagnostic READ surface only, but it is still read under
+// the same leaf-safety contract as openDaemonLog: a single
+// unix.Open(pidPath, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC) pins the leaf
+// at the syscall boundary — O_NOFOLLOW makes the kernel refuse a symlinked
+// final component (ELOOP) so a planted link can never redirect this read to
+// an arbitrary file outside the project (a forged LockInfo there could
+// otherwise suppress the exit warn by naming a live pid), and O_NONBLOCK
+// makes the open itself return immediately on a FIFO or device leaf instead
+// of parking the watcher forever in open(2) — a writerless FIFO pidfile
+// used to wedge watchDaemonExit after the child was already reaped,
+// starving the deferred logFile close forever. Type and content checks run
+// on the SAME fd (f.Stat must report a regular file, then io.ReadAll on
+// that bound fd), so no Lstat→ReadFile window can swap the leaf between
+// check and read; a leaf unlinked after open is fine — the fd is already
+// bound to the inode. Every failure path (open errno, non-regular leaf,
+// read error) degrades to "no live daemon recorded": this is a
+// best-effort observability probe, never a panic source.
 func daemonAliveAt(root string) bool {
-	raw, err := os.ReadFile(PidPath(root))
+	fd, err := unix.Open(PidPath(root),
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	f := os.NewFile(uintptr(fd), PidPath(root))
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return false
+	}
+	raw, err := io.ReadAll(f)
+	_ = f.Close()
 	if err != nil {
 		return false
 	}
