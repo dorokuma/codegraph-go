@@ -1,0 +1,361 @@
+//go:build unix
+
+// O1 [pattern:pidfile-read-leaf-trust] isolation probe — external payload
+// (evidence id cg-o1-probe-20261106-01, mark CG-O1-PROBE-W67-PX-20261106-01).
+//
+// This file is NOT part of the production test tree. A verifier copies it
+// verbatim to internal/daemon/o1_pidfile_read_probe_test.go inside two
+// disposable clones — one at BASE ae3dd51ac03461f8f4506c0ebcaf6cb81cee1af5
+// and one carrying the candidate diff — and runs it there under isolation.
+// Both clones receive this exact same byte payload.
+//
+// Selected variant (chosen by the main agent): the plain no-quota spawn
+// path. Candidate SpawnDetached ends that path with
+//
+//	go watchDaemonExit(cmd, root, logFile, logPath)
+//
+// and watchDaemonExit calls daemonAliveAt -> os.ReadFile(PidPath(root))
+// after a non-zero child exit. That read has no leaf-type guard, so a
+// daemon.pid that is a FIFO with no writer parks the watcher goroutine
+// inside open(2) indefinitely. BASE's plain path only runs
+//
+//	waitCh <- cmd.Wait()
+//
+// in a goroutine and never touches the pidfile there (daemonAliveAt is
+// reachable on BASE only through the systemd-run quota branch, which this
+// probe forces off), so the very same fixture must not show the blocked
+// chain on BASE. Nothing in this test branches on BASE-vs-candidate flags,
+// versions, or code hashes — it fails only where the real code path
+// actually blocks, and it honestly PASSes if the candidate does not block.
+//
+// Per-subtest fixture (each gets a private t.TempDir root + real
+// .codegraph; daemon.log stays a plain file):
+//
+//	regular_control: daemon.pid is an empty regular file (positive control:
+//	                 the read must return immediately on every snapshot)
+//	fifo:            daemon.pid is a FIFO with no writer (candidate blocks)
+//
+// Evidence lines (grep-able; only matching frames are emitted, never full
+// goroutine dumps or environment strings):
+//
+//	O1_CHILD_REAPED      sub=<sub> pid=<n> seen_alive=<b>
+//	O1_BLOCKED_CHAIN     sub=<sub> value=<b>
+//	O1_STACK_FRAME       sub=<sub> <matching frame line>   (capped)
+//	O1_FIFO_RELEASED     sub=<sub> value=<ok|no-reader|na|error:*|timeout:*>
+//	O1_CLEANUP_COMPLETE  sub=<sub> child_alive=<0|1> watcher_gone=<b>
+//
+// Verdict markers:
+//
+//	O1_PIDFILE_FIFO_WATCHER_BLOCKED — fifo subtest only; emitted AFTER the
+//	                                  FIFO reader has been released and the
+//	                                  watcher awaited, never before cleanup.
+//	O1_PROBE_CLEANUP_FAILED         — infrastructure failure (child left
+//	                                  alive, watcher not releasable, FIFO
+//	                                  release error/timeout); kept separate
+//	                                  from the expected defect signal.
+package daemon
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+const (
+	o1HandshakeTimeout   = 3 * time.Second
+	o1ReapTimeout        = 3 * time.Second
+	o1ObserveTimeout     = 3 * time.Second
+	o1ReleaseTimeout     = 2 * time.Second
+	o1WatcherGoneTimeout = 2 * time.Second
+	o1PollInterval       = 50 * time.Millisecond
+
+	o1BlockedMarker = "O1_PIDFILE_FIFO_WATCHER_BLOCKED"
+	o1CleanupMarker = "O1_PROBE_CLEANUP_FAILED"
+)
+
+// TestO1PidfileReadProbe runs the two serial subtests. No t.Parallel, no
+// other test involvement: -run '^TestO1PidfileReadProbe$' selects exactly
+// this test (parent + regular_control + fifo = 3 RUN lines under -v).
+func TestO1PidfileReadProbe(t *testing.T) {
+	t.Run("regular_control", func(t *testing.T) {
+		runO1PidfileReadProbe(t, false)
+	})
+	t.Run("fifo", func(t *testing.T) {
+		runO1PidfileReadProbe(t, true)
+	})
+}
+
+// runO1PidfileReadProbe is the serial probe body for one pidfile shape. It
+// never short-circuits on an unexpected finding: evidence lines are
+// collected first, then the FIFO reader is released and the watcher is
+// awaited under bounded timeouts, and only then are the verdict Errorf
+// calls emitted. It writes only inside its own t.TempDir root — never the
+// source worktree and never a shared/global .codegraph.
+func runO1PidfileReadProbe(t *testing.T, fifo bool) {
+	t.Helper()
+	sub := "regular_control"
+	if fifo {
+		sub = "fifo"
+	}
+
+	root := t.TempDir()
+	cg := CodeGraphDir(root)
+	if err := os.MkdirAll(cg, 0o700); err != nil {
+		t.Fatalf("O1 setup: mkdir %s: %v", cg, err)
+	}
+	pidPath := PidPath(root)
+	if fifo {
+		if err := syscall.Mkfifo(pidPath, 0o600); err != nil {
+			t.Fatalf("O1 setup: mkfifo %s: %v", pidPath, err)
+		}
+	} else if err := os.WriteFile(pidPath, nil, 0o600); err != nil {
+		t.Fatalf("O1 setup: create regular pidfile %s: %v", pidPath, err)
+	}
+	// daemon.log stays a plain file; SpawnDetached creates/appends it.
+
+	// Fake daemon binary inside THIS root: records its real PID under the
+	// probe root, then exits non-zero. It does not run codegraph, create
+	// shared daemon/systemd state, or carry any credentials. The spawned
+	// argv is "-workdir <root>", so $2 is the root.
+	script := filepath.Join(root, "fake-daemon.sh")
+	scriptBody := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$$\" > \"$2/.codegraph/o1-child.pid\"\n" +
+		"exit 23\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatalf("O1 setup: write fake daemon %s: %v", script, err)
+	}
+
+	// Force the plain path: real SpawnDetached(root, nil), but with the
+	// binary resolved to our script and the systemd-run wrapper disabled.
+	// Both hooks exist on BASE and on the candidate; the override is read
+	// once inside SpawnDetached and restored immediately after.
+	prevResolve := resolveDaemonBinaryFn
+	prevSystemd := systemdRunArgsFn
+	resolveDaemonBinaryFn = func() (string, error) { return script, nil }
+	systemdRunArgsFn = func(string, []string, *SpawnOpts) []string { return nil }
+	defer func() {
+		resolveDaemonBinaryFn = prevResolve
+		systemdRunArgsFn = prevSystemd
+	}()
+	spawnErr := SpawnDetached(root, nil)
+	resolveDaemonBinaryFn = prevResolve
+	systemdRunArgsFn = prevSystemd
+	if spawnErr != nil {
+		t.Fatalf("O1 spawn: SpawnDetached(%q, nil): %v", root, spawnErr)
+	}
+
+	// Stage 1 — real child observed, then confirmed dead/reaped within 3s
+	// (kill(pid,0) reports a zombie as alive, so IsProcessAlive=false here
+	// means Wait actually reaped it; a mere marker file would not prove
+	// reaping).
+	pid, handshakeErr := o1WaitChildPID(filepath.Join(cg, "o1-child.pid"))
+	reaped := false
+	if handshakeErr == nil {
+		reaped = o1WaitReaped(t, pid, sub)
+	}
+
+	// Stage 2 — observe up to 3s for the blocked chain: one goroutine whose
+	// stack simultaneously contains watchDaemonExit -> daemonAliveAt ->
+	// os.ReadFile. Goroutine counts, sleeps, marker files or fd counts are
+	// NOT accepted as leak/block evidence.
+	blocked, frames := o1ObserveBlockedChain(o1ObserveTimeout)
+	t.Logf("O1_BLOCKED_CHAIN sub=%s value=%v", sub, blocked)
+	for _, f := range frames {
+		t.Logf("O1_STACK_FRAME sub=%s %s", sub, f)
+	}
+
+	// Stage 3 — bounded cleanup BEFORE any verdict: release a blocked FIFO
+	// reader (O_WRONLY|O_NONBLOCK — never a bare blocking open), wait for
+	// the watcher goroutine to exit, re-confirm the child stays dead.
+	released := o1ReleaseFIFOReader(pidPath, fifo)
+	t.Logf("O1_FIFO_RELEASED sub=%s value=%s", sub, released)
+	watcherGone := o1WaitWatcherGone(o1WatcherGoneTimeout)
+	childAlive := pid > 0 && IsProcessAlive(pid)
+	t.Logf("O1_CLEANUP_COMPLETE sub=%s child_alive=%d watcher_gone=%v",
+		sub, o1BoolInt(childAlive), watcherGone)
+
+	releaseBad := strings.HasPrefix(released, "error:") ||
+		strings.HasPrefix(released, "timeout:")
+	if childAlive || !watcherGone || releaseBad {
+		t.Errorf("%s sub=%s child_alive=%v watcher_gone=%v released=%q",
+			o1CleanupMarker, sub, childAlive, watcherGone, released)
+	}
+	if handshakeErr != nil {
+		t.Errorf("O1 handshake failed sub=%s: %v", sub, handshakeErr)
+	} else if !reaped {
+		t.Errorf("O1 reap failed sub=%s pid=%d: child not confirmed dead within %s",
+			sub, pid, o1ReapTimeout)
+	}
+	if fifo && blocked {
+		t.Errorf("%s sub=%s: watcher blocked in "+
+			"watchDaemonExit->daemonAliveAt->os.ReadFile on FIFO pidfile "+
+			"after child reap", o1BlockedMarker, sub)
+	}
+	if !fifo && blocked {
+		t.Errorf("O1 unexpected blocked chain in regular_control: " +
+			"watchDaemonExit->daemonAliveAt->os.ReadFile present for a " +
+			"regular pidfile (positive control violated)")
+	}
+}
+
+// o1WaitChildPID polls for the fake child's recorded PID file (bounded).
+func o1WaitChildPID(path string) (int, error) {
+	deadline := time.Now().Add(o1HandshakeTimeout)
+	var last error
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var pid int
+			pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err == nil && pid > 0 {
+				return pid, nil
+			}
+			if err == nil {
+				err = fmt.Errorf("non-positive pid %q", strings.TrimSpace(string(raw)))
+			}
+		}
+		last = err
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("no valid child pid at %s within %s: %v",
+				path, o1HandshakeTimeout, last)
+		}
+		time.Sleep(o1PollInterval)
+	}
+}
+
+// o1WaitReaped confirms the observed child PID is gone (reaped) within 3s.
+func o1WaitReaped(t *testing.T, pid int, sub string) bool {
+	t.Helper()
+	seenAlive := IsProcessAlive(pid)
+	deadline := time.Now().Add(o1ReapTimeout)
+	for {
+		if !IsProcessAlive(pid) {
+			t.Logf("O1_CHILD_REAPED sub=%s pid=%d seen_alive=%v", sub, pid, seenAlive)
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(o1PollInterval)
+	}
+}
+
+// o1ObserveBlockedChain polls this process's goroutine stacks (bounded).
+func o1ObserveBlockedChain(timeout time.Duration) (bool, []string) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if blocked, frames := o1BlockedChainSnapshot(); blocked {
+			return true, frames
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		time.Sleep(o1PollInterval)
+	}
+}
+
+// o1BlockedChainSnapshot reports whether one goroutine's stack contains
+// the whole watchDaemonExit -> daemonAliveAt -> os.ReadFile chain, and
+// returns only the matching frame lines (bounded to 12).
+func o1BlockedChainSnapshot() (bool, []string) {
+	for _, b := range o1GoroutineBlocks() {
+		if strings.Contains(b, "daemon.watchDaemonExit(") &&
+			strings.Contains(b, "daemon.daemonAliveAt(") &&
+			strings.Contains(b, "os.ReadFile(") {
+			frames := make([]string, 0, 12)
+			for _, line := range strings.Split(b, "\n") {
+				if strings.HasPrefix(line, "goroutine ") ||
+					strings.Contains(line, "watchDaemonExit") ||
+					strings.Contains(line, "daemonAliveAt") ||
+					strings.Contains(line, "os.ReadFile") ||
+					strings.Contains(line, "os.OpenFile") {
+					frames = append(frames, strings.TrimSpace(line))
+					if len(frames) == cap(frames) {
+						break
+					}
+				}
+			}
+			return true, frames
+		}
+	}
+	return false, nil
+}
+
+// o1GoroutineBlocks returns each goroutine's stack block (test process
+// only — no host-wide process scanning).
+func o1GoroutineBlocks() []string {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Split(string(buf[:n]), "\ngoroutine ")
+}
+
+// o1WatcherPresent reports whether any goroutine still sits inside the
+// watcher/probe chain symbols.
+func o1WatcherPresent() bool {
+	for _, b := range o1GoroutineBlocks() {
+		if strings.Contains(b, "daemon.watchDaemonExit(") ||
+			strings.Contains(b, "daemon.daemonAliveAt(") {
+			return true
+		}
+	}
+	return false
+}
+
+// o1WaitWatcherGone waits (bounded) for the watcher goroutine to exit.
+func o1WaitWatcherGone(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !o1WatcherPresent() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(o1PollInterval)
+	}
+}
+
+// o1ReleaseFIFOReader opens the FIFO for writing with O_WRONLY|O_NONBLOCK —
+// it pairs instantly with a blocked O_RDONLY reader and fails ENXIO when no
+// reader exists, so the release side itself can never park — then closes
+// it, giving the blocked reader EOF so its ReadFile returns. Returns "na"
+// for non-fifo subtests, "ok" when a writer was paired and closed,
+// "no-reader" when no reader was present and no watcher was running,
+// "error:<e>"/"timeout:<d>" otherwise (bounded).
+func o1ReleaseFIFOReader(pidPath string, fifo bool) string {
+	if !fifo {
+		return "na"
+	}
+	deadline := time.Now().Add(o1ReleaseTimeout)
+	for {
+		fd, err := syscall.Open(pidPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_ = syscall.Close(fd)
+			return "ok"
+		}
+		if err != syscall.ENXIO {
+			return "error:" + err.Error()
+		}
+		// ENXIO: no reader attached right now.
+		if !o1WatcherPresent() {
+			return "no-reader"
+		}
+		if time.Now().After(deadline) {
+			return "timeout:reader-still-present"
+		}
+		time.Sleep(o1PollInterval)
+	}
+}
+
+func o1BoolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
