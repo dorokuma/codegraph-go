@@ -27,3 +27,7 @@ coverage.out
 
 # notes index
 .agents/notes/INDEX.md
+
+# override global ~/.config/git/ignore which ignores AGENTS.md;
+# AGENTS.md is a required L2 deliverable and must be tracked
+!AGENTS.md
