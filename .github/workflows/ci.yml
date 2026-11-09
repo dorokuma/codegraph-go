@@ -16,19 +16,7 @@ jobs:
           cache: true
       - name: Install runtime dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: go test ./...
-      - run: go vet ./...
-      - run: go build ./cmd/codegraph-go
-      - run: CGO_ENABLED=1 go test -race ./...
-      - name: gofmt check
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "Files not gofmt-formatted:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@2026.1
-          "$(go env GOPATH)/bin/staticcheck" ./...
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+      - name: Run checks
+        run: make check
