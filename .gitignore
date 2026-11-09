@@ -30,4 +30,5 @@ coverage.out
 
 # override global ~/.config/git/ignore which ignores AGENTS.md;
 # AGENTS.md is a required L2 deliverable and must be tracked
-!AGENTS.md
+# (root-anchored: only unignore repo-root AGENTS.md)
+!/AGENTS.md
