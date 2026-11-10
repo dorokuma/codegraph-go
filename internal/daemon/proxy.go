@@ -204,8 +204,12 @@ const halfDeadStartupGrace = 3 * time.Second
 //     SIGTERM a healthy daemon, while a missed kill only costs one extra
 //     spawn attempt, which the normal lock-taken path resolves).
 func halfDeadDaemonHoldsLock(projectRoot string) bool {
-	raw, err := os.ReadFile(PidPath(projectRoot))
-	if err != nil {
+	// Leaf-safe read: readRegularPidfile refuses a symlinked pidfile
+	// (ELOOP — a forged out-of-project LockInfo must never justify a kill)
+	// and returns immediately on a writerless FIFO leaf instead of
+	// blocking in open(2); every failure degrades to "no pidfile".
+	raw, ok := readRegularPidfile(PidPath(projectRoot))
+	if !ok {
 		return false // no pidfile → nothing holds the lock
 	}
 	info := DecodeLock(raw)

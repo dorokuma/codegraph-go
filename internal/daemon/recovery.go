@@ -133,8 +133,11 @@ func killInvisibleHolders(root string) (int, error) {
 // startedAt cannot be age-gated: no grace (same conservative choice as
 // halfDeadDaemonHoldsLock, which refuses to classify them as half-dead).
 func newbornDaemonInStartupGrace(root string) bool {
-	raw, err := os.ReadFile(PidPath(root))
-	if err != nil {
+	// Leaf-safe read: readRegularPidfile refuses a symlinked pidfile
+	// (ELOOP) and returns immediately on a writerless FIFO leaf instead
+	// of blocking in open(2); every failure degrades to "no grace".
+	raw, ok := readRegularPidfile(PidPath(root))
+	if !ok {
 		return false
 	}
 	info := DecodeLock(raw)

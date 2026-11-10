@@ -3,7 +3,6 @@ package daemon
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -455,37 +454,21 @@ func scrubDiagText(s string) string {
 // pidfile yet) from a normal daemon that just won the race.
 //
 // The pidfile is a diagnostic READ surface only, but it is still read under
-// the same leaf-safety contract as openDaemonLog: a single
-// unix.Open(pidPath, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC) pins the leaf
-// at the syscall boundary — O_NOFOLLOW makes the kernel refuse a symlinked
-// final component (ELOOP) so a planted link can never redirect this read to
-// an arbitrary file outside the project (a forged LockInfo there could
+// the leaf-safety contract of readRegularPidfile (shared by every
+// diagnostic pidfile probe in this package): O_NOFOLLOW refuses a symlinked
+// leaf (ELOOP) so a planted link can never redirect the read to an
+// arbitrary file outside the project (a forged LockInfo there could
 // otherwise suppress the exit warn by naming a live pid), and O_NONBLOCK
 // makes the open itself return immediately on a FIFO or device leaf instead
 // of parking the watcher forever in open(2) — a writerless FIFO pidfile
 // used to wedge watchDaemonExit after the child was already reaped,
-// starving the deferred logFile close forever. Type and content checks run
-// on the SAME fd (f.Stat must report a regular file, then io.ReadAll on
-// that bound fd), so no Lstat→ReadFile window can swap the leaf between
-// check and read; a leaf unlinked after open is fine — the fd is already
-// bound to the inode. Every failure path (open errno, non-regular leaf,
-// read error) degrades to "no live daemon recorded": this is a
-// best-effort observability probe, never a panic source.
+// starving the deferred logFile close forever. Every failure path (open
+// errno, non-regular leaf, read error) degrades to "no live daemon
+// recorded": this is a best-effort observability probe, never a panic
+// source.
 func daemonAliveAt(root string) bool {
-	fd, err := unix.Open(PidPath(root),
-		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return false
-	}
-	f := os.NewFile(uintptr(fd), PidPath(root))
-	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
-		_ = f.Close()
-		return false
-	}
-	raw, err := io.ReadAll(f)
-	_ = f.Close()
-	if err != nil {
+	raw, ok := readRegularPidfile(PidPath(root))
+	if !ok {
 		return false
 	}
 	info := DecodeLock(raw)

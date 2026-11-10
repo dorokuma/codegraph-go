@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // PackageVersion is the wire-facing version. Proxy and daemon must match exactly.
@@ -95,6 +98,42 @@ func PreferredSocket(projectRoot string) string {
 func EncodeLock(info LockInfo) []byte {
 	b, _ := json.MarshalIndent(info, "", "  ")
 	return append(b, '\n')
+}
+
+// readRegularPidfile is the shared leaf-safe pidfile READ for the daemon
+// package's diagnostic probes (daemonAliveAt, halfDeadDaemonHoldsLock,
+// newbornDaemonInStartupGrace): a single
+// unix.Open(path, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC) pins the leaf
+// at the syscall boundary — O_NOFOLLOW makes the kernel refuse a symlinked
+// final component (ELOOP) so a planted link can never redirect the read to
+// an arbitrary file outside the project (a forged LockInfo there could
+// otherwise name a live pid and suppress a kill/warn), and O_NONBLOCK
+// makes the open itself return immediately on a FIFO or device leaf
+// instead of parking the caller forever in open(2). Type and content
+// checks run on the SAME fd (f.Stat must report a regular file, then
+// io.ReadAll on that bound fd), so no Lstat→ReadFile window can swap the
+// leaf between check and read; a leaf unlinked after open is fine — the fd
+// is already bound to the inode. Every failure path (open errno,
+// non-regular leaf, read error) returns ok=false — callers degrade to
+// their "no pidfile" verdict, never a panic source.
+func readRegularPidfile(path string) (raw []byte, ok bool) {
+	fd, err := unix.Open(path,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, false
+	}
+	f := os.NewFile(uintptr(fd), path)
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, false
+	}
+	raw, err = io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 // DecodeLock parses a pidfile body. Tolerates legacy plain-decimal pid.
