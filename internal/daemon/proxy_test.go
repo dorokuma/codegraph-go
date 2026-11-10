@@ -326,6 +326,129 @@ func TestHalfDeadDaemonHoldsLockStartupGrace(t *testing.T) {
 	<-waited
 }
 
+// probeWithinDeadline runs fn on a helper goroutine and fails the test when
+// it does not return within the deadline — the signal that a pidfile
+// diagnostic probe parked inside open(2) (a writerless FIFO leaf).
+func probeWithinDeadline(t *testing.T, fn func() bool) bool {
+	t.Helper()
+	done := make(chan bool, 1)
+	go func() { done <- fn() }()
+	select {
+	case got := <-done:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("pidfile probe did not return within 2s — a writerless FIFO leaf must never block in open(2)")
+		return false
+	}
+}
+
+// TestPidfileProbesRejectSymlinkLeaf is the [pattern:pidfile-read-leaf-trust]
+// regression for halfDeadDaemonHoldsLock and newbornDaemonInStartupGrace:
+// before readRegularPidfile both probed the pidfile with a bare
+// os.ReadFile(PidPath(...)), which FOLLOWED a symlinked leaf — an attacker
+// (or a stale deploy artifact) could plant daemon.pid as a link to an
+// out-of-project file carrying a forged LockInfo naming a live process,
+// making halfDeadDaemonHoldsLock misclassify a healthy daemon as half-dead
+// (entering the kill flow) and newbornDaemonInStartupGrace grant a phantom
+// startup grace. Each probe is exercised in an independent t.Run subtest so
+// a failing first probe never masks the second: under the pre-fix
+// os.ReadFile implementation each forged target is shaped to make its own
+// probe return true. Both must refuse the leaf at open(2) time (O_NOFOLLOW →
+// ELOOP) and return false.
+func TestPidfileProbesRejectSymlinkLeaf(t *testing.T) {
+	// plantSymlinkedPidfile writes an out-of-project regular file carrying
+	// the forged LockInfo and links <root>/.codegraph/daemon.pid at it.
+	plantSymlinkedPidfile := func(t *testing.T, startedAt int64) string {
+		t.Helper()
+		root := t.TempDir()
+		pidPath := PidPath(root)
+		if err := os.MkdirAll(filepath.Dir(pidPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Out-of-project target: a regular file whose LockInfo decodes as a
+		// LIVE process (this test process itself) — the strongest forgery
+		// shape.
+		target := filepath.Join(t.TempDir(), "daemon.pid")
+		if err := os.WriteFile(target, EncodeLock(LockInfo{
+			PID:        os.Getpid(),
+			Version:    PackageVersion,
+			SocketPath: PreferredSocket(root),
+			StartedAt:  startedAt,
+			ProcStart:  procStartTime(os.Getpid()),
+		}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, pidPath); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+		return root
+	}
+
+	// A forged record PAST the startup grace: a leaf-following read feeds
+	// halfDeadDaemonHoldsLock a live pid older than halfDeadStartupGrace,
+	// misclassifying a healthy daemon as half-dead and entering the kill
+	// flow (KillStaleDaemon's own identity verification is unchanged — the
+	// probe's wrong verdict is what steers EnsureAndDial into that flow).
+	t.Run("halfDeadDaemonHoldsLock", func(t *testing.T) {
+		root := plantSymlinkedPidfile(t, time.Now().Add(-2*halfDeadStartupGrace).UnixMilli())
+		if probeWithinDeadline(t, func() bool { return halfDeadDaemonHoldsLock(root) }) {
+			t.Fatal("a symlinked pidfile must never make halfDeadDaemonHoldsLock true (forged live record past the grace would enter the kill flow)")
+		}
+	})
+
+	// A forged record INSIDE the startup grace: a leaf-following read feeds
+	// newbornDaemonInStartupGrace a fresh live pid, granting a phantom
+	// newborn grace that suppresses the invisible-holder kill pass.
+	t.Run("newbornDaemonInStartupGrace", func(t *testing.T) {
+		root := plantSymlinkedPidfile(t, time.Now().UnixMilli())
+		if probeWithinDeadline(t, func() bool { return newbornDaemonInStartupGrace(root) }) {
+			t.Fatal("a symlinked pidfile must never grant newbornDaemonInStartupGrace")
+		}
+	})
+}
+
+// TestPidfileProbesFifoLeafDoesNotBlock is the second half of the same
+// regression: a writerless FIFO at the pidfile path parked the bare
+// os.ReadFile inside open(2) forever, wedging both
+// halfDeadDaemonHoldsLock (blocking spawns / direct-mode fallback
+// decisions) and newbornDaemonInStartupGrace (blocking the
+// invisible-holder sweep). readRegularPidfile opens with O_NONBLOCK —
+// the open returns immediately, the non-regular leaf is refused, both
+// probes return false in well under the deadline. Each probe runs in its
+// own t.Run subtest on an independent root/FIFO: under the blocking
+// pre-fix implementation the first subtest's t.Fatal must not skip the
+// second subtest.
+func TestPidfileProbesFifoLeafDoesNotBlock(t *testing.T) {
+	// fifoPidfileRoot builds an isolated root whose
+	// <root>/.codegraph/daemon.pid is a writerless FIFO.
+	fifoPidfileRoot := func(t *testing.T) string {
+		t.Helper()
+		root := t.TempDir()
+		pidPath := PidPath(root)
+		if err := os.MkdirAll(filepath.Dir(pidPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("mkfifo", pidPath).CombinedOutput(); err != nil {
+			t.Skipf("mkfifo unsupported: %v (%s)", err, out)
+		}
+		return root
+	}
+
+	t.Run("halfDeadDaemonHoldsLock", func(t *testing.T) {
+		root := fifoPidfileRoot(t)
+		if probeWithinDeadline(t, func() bool { return halfDeadDaemonHoldsLock(root) }) {
+			t.Fatal("a writerless FIFO pidfile must degrade to 'no pidfile', got half-dead")
+		}
+	})
+
+	t.Run("newbornDaemonInStartupGrace", func(t *testing.T) {
+		root := fifoPidfileRoot(t)
+		if probeWithinDeadline(t, func() bool { return newbornDaemonInStartupGrace(root) }) {
+			t.Fatal("a writerless FIFO pidfile must degrade to 'no pidfile', got startup grace")
+		}
+	})
+}
+
 // withPipedStdio replaces the process-level os.Stdin/os.Stdout that RunProxy
 // pipes through with os.Pipes (RunProxy reads the package-level vars), so a
 // test can feed host stdin and capture host stdout. The original streams and
