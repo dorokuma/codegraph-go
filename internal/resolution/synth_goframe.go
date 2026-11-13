@@ -30,6 +30,9 @@ func goframeRouteEdges(ctx *synthCtx) ([]synthEdge, error) {
 	byKey := map[string][]db.Node{}
 	wanted := map[string]bool{}
 	for _, r := range routes {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		if r.Language != "" && r.Language != "go" {
 			continue
 		}
@@ -59,6 +62,9 @@ func goframeRouteEdges(ctx *synthCtx) ([]synthEdge, error) {
 	// type key → handler methods
 	handlersByKey := map[string][]db.Node{}
 	for _, m := range methods {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		if m.Language != "" && m.Language != "go" {
 			continue
 		}
@@ -77,6 +83,9 @@ func goframeRouteEdges(ctx *synthCtx) ([]synthEdge, error) {
 	seen := map[string]bool{}
 	added := 0
 	for joinKey, routeList := range byKey {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		bare := joinKey
 		if dot := strings.LastIndex(joinKey, "."); dot >= 0 {
 			bare = joinKey[dot+1:]
@@ -89,6 +98,9 @@ func goframeRouteEdges(ctx *synthCtx) ([]synthEdge, error) {
 			continue
 		}
 		for _, route := range routeList {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			handler := selectGoFrameHandler(cands, route.File)
 			if handler == nil || handler.ID == route.ID {
 				continue
@@ -113,7 +125,7 @@ func goframeRouteEdges(ctx *synthCtx) ([]synthEdge, error) {
 			added++
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
 func pointerParamTypes(sig string) []string {

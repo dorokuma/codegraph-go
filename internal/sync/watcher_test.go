@@ -2,6 +2,8 @@ package sync
 
 import (
 	"bytes"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +19,107 @@ import (
 
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
+	"modernc.org/sqlite"
 )
+
+var watcherDeletionID atomic.Uint64
+
+// Park a real deletion inside its transaction, then close the orchestrator's
+// shutdown channel and stop the watcher. WaitIdle must drain that one unit,
+// not all remaining files in the deleted directory.
+func TestWaitIdleAfterInterruptedTreeDeletion(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var deletes atomic.Int32
+	function := fmt.Sprintf("watcher_delete_pause_%d", watcherDeletionID.Add(1))
+	if err := sqlite.RegisterScalarFunction(function, 0, func(_ *sqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+		if deletes.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return int64(0), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	for i := 0; i < 6; i++ {
+		if err := database.UpsertFile(fmt.Sprintf("gone/f%d.go", i), 1, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := sql.Open("sqlite", database.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`CREATE TRIGGER pause_file_delete AFTER DELETE ON files BEGIN SELECT ` + function + `(); END`); err != nil {
+		t.Fatal(err)
+	}
+	orch := extraction.NewOrchestrator(database, root)
+	bgDone := make(chan struct{})
+	orch.SetDone(bgDone)
+	w, err := NewWatcher(orch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.debounce = 0
+	w.pending[filepath.Join(root, "gone")] = &pendingEntry{since: time.Now()}
+	w.procWG.Add(1)
+	passDone := make(chan struct{})
+	go func() {
+		defer close(passDone)
+		defer w.procWG.Done()
+		w.processPending()
+	}()
+	defer func() {
+		unblock()
+		w.Stop()
+		<-passDone
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not enter the first deletion transaction")
+	}
+	close(bgDone)
+	stopDone := make(chan struct{})
+	go func() { w.Stop(); close(stopDone) }()
+	// Wait for Stop's signal without reading a concurrently modified state.
+	<-w.done
+	idle := make(chan struct{})
+	go func() { w.WaitIdle(); close(idle) }()
+	select {
+	case <-idle:
+		t.Fatal("WaitIdle returned while a deletion transaction was in flight")
+	default:
+	}
+	unblock()
+	select {
+	case <-idle:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitIdle did not drain the single in-flight deletion unit")
+	}
+	<-stopDone
+	files, err := database.ListFiles()
+	if err != nil || len(files) != 5 || deletes.Load() != 1 {
+		t.Fatalf("deletions after shutdown: remaining=%d deletes=%d err=%v", len(files), deletes.Load(), err)
+	}
+	control := extraction.NewOrchestrator(database, root)
+	if err := control.DeleteTree(root); err != nil {
+		t.Fatal(err)
+	}
+	files, err = database.ListFiles()
+	if err != nil || len(files) != 0 || deletes.Load() != 6 {
+		t.Fatalf("normal deletion: remaining=%d deletes=%d err=%v", len(files), deletes.Load(), err)
+	}
+}
 
 func TestIsSupported(t *testing.T) {
 	ok := []string{"a.go", "b.ts", "c.tsx", "d.js", "e.py", "f.rs", "g.java", "h.swift"}

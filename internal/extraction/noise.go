@@ -1,6 +1,7 @@
 package extraction
 
 import (
+	"context"
 	"strings"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
@@ -78,17 +79,28 @@ func ShouldParkRef(database *db.DB, refName string) bool {
 }
 
 func hasProjectSymbol(database *db.DB, refName string) bool {
+	found, _ := hasProjectSymbolContext(context.Background(), database, refName)
+	return found
+}
+
+func hasProjectSymbolContext(ctx context.Context, database *db.DB, refName string) (bool, error) {
 	names := []string{refName}
 	if tail := NameTail(refName); tail != "" && tail != refName {
 		names = append(names, tail)
 	}
 	for _, n := range names {
-		nodes, err := database.GetNodeByName(n)
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		nodes, err := database.GetNodeByNameContext(ctx, n)
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
 		if err == nil && len(nodes) > 0 {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // ScrubNoisyFailedRefs deletes failed unresolved rows that are pure noise and
@@ -137,42 +149,62 @@ func ScrubNoisyFailedRefs(database *db.DB) (removed int, err error) {
 // refs belonging to the given files. When files is nil, processes all files.
 // hasProjectSymbol results are cached per-call to avoid repeated DB lookups.
 func ScrubNoisyFailedRefsForFiles(database *db.DB, files []string) (removed int, err error) {
+	return scrubNoisyFailedRefsForFilesContext(context.Background(), database, files)
+}
+
+func scrubNoisyFailedRefsForFilesContext(ctx context.Context, database *db.DB, files []string) (removed int, err error) {
 	if database == nil {
 		return 0, nil
 	}
 
 	// Cache hasProjectSymbol results per ref name within this call.
 	cache := make(map[string]bool)
-	hasSymbolCached := func(name string) bool {
-		if v, ok := cache[name]; ok {
-			return v
+	hasSymbolCached := func(name string) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
-		v := hasProjectSymbol(database, name)
+		if v, ok := cache[name]; ok {
+			return v, nil
+		}
+		v, err := hasProjectSymbolContext(ctx, database, name)
+		if err != nil {
+			return false, err
+		}
 		cache[name] = v
-		return v
+		return v, nil
 	}
 
 	scrubList := func(status string) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		var refs []db.UnresolvedRef
 		if files == nil {
 			var err error
-			refs, err = database.ListUnresolvedRefs("", status)
+			refs, err = database.ListUnresolvedRefsContext(ctx, "", status)
 			if err != nil {
 				return 0, err
 			}
 		} else {
 			var err error
-			refs, err = database.ListUnresolvedRefsByFiles(files, status)
+			refs, err = database.ListUnresolvedRefsByFilesContext(ctx, files, status)
 			if err != nil {
 				return 0, err
 			}
 		}
 		count := 0
 		for _, r := range refs {
+			if err := ctx.Err(); err != nil {
+				return count, err
+			}
 			if !IsNoisyRefName(r.ReferenceName) {
 				continue
 			}
-			if hasSymbolCached(r.ReferenceName) {
+			hasSymbol, err := hasSymbolCached(r.ReferenceName)
+			if err != nil {
+				return count, err
+			}
+			if hasSymbol {
 				continue
 			}
 			if derr := database.DeleteUnresolvedRef(r.ID); derr != nil {

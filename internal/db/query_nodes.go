@@ -211,10 +211,16 @@ func (d *DB) ForEachNodeByFileLightContext(ctx context.Context, file string, fn 
 			break
 		}
 		for _, n := range nodes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := fn(n); err != nil {
 				return err
 			}
 			lastID = n.ID
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if len(nodes) < batchSize {
 			break
@@ -304,10 +310,16 @@ func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(
 			break
 		}
 		for _, n := range nodes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := fn(n); err != nil {
 				return err
 			}
 			lastID = n.ID
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if len(nodes) < batchSize {
 			break
@@ -318,10 +330,15 @@ func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(
 
 // GetNodeByID loads one node by primary key.
 func (d *DB) GetNodeByID(id int64) (*Node, error) {
+	return d.GetNodeByIDContext(context.Background(), id)
+}
+
+// GetNodeByIDContext propagates cancellation into synthesis node lookups.
+func (d *DB) GetNodeByIDContext(ctx context.Context, id int64) (*Node, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	row := d.conn.QueryRow(`SELECT `+nodeSelectCols+` FROM nodes WHERE id = ?`, id)
+	row := d.conn.QueryRowContext(ctx, `SELECT `+nodeSelectCols+` FROM nodes WHERE id = ?`, id)
 	return scanOneNode(row)
 }
 
@@ -336,7 +353,12 @@ var getNodesByKindCap = 50_000
 // time. Callers that need the full set with explicit truncation reporting
 // should use GetNodesByKindLimited.
 func (d *DB) GetNodesByKind(kind string) ([]Node, error) {
-	nodes, _, err := d.GetNodesByKindLimited(kind, getNodesByKindCap)
+	return d.GetNodesByKindContext(context.Background(), kind)
+}
+
+// GetNodesByKindContext keeps the existing cap while allowing active scans to cancel.
+func (d *DB) GetNodesByKindContext(ctx context.Context, kind string) ([]Node, error) {
+	nodes, _, err := d.GetNodesByKindLimitedContext(ctx, kind, getNodesByKindCap)
 	return nodes, err
 }
 
@@ -344,13 +366,18 @@ func (d *DB) GetNodesByKind(kind string) ([]Node, error) {
 // id for deterministic truncation) plus whether more rows exist. limit <= 0
 // falls back to the getNodesByKindCap default.
 func (d *DB) GetNodesByKindLimited(kind string, limit int) ([]Node, bool, error) {
+	return d.GetNodesByKindLimitedContext(context.Background(), kind, limit)
+}
+
+// GetNodesByKindLimitedContext is the cancellable bounded kind scan.
+func (d *DB) GetNodesByKindLimitedContext(ctx context.Context, kind string, limit int) ([]Node, bool, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	if limit <= 0 {
 		limit = getNodesByKindCap
 	}
-	rows, err := d.conn.Query(`SELECT `+nodeSelectCols+` FROM nodes WHERE kind = ? ORDER BY id LIMIT ?`, kind, limit+1)
+	rows, err := d.conn.QueryContext(ctx, `SELECT `+nodeSelectCols+` FROM nodes WHERE kind = ? ORDER BY id LIMIT ?`, kind, limit+1)
 	if err != nil {
 		return nil, false, err
 	}

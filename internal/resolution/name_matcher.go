@@ -1,6 +1,7 @@
 package resolution
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 
@@ -134,6 +135,10 @@ func MatchName(candidates []db.Node, refName, fromFile string, preferCall bool) 
 // CollectCandidates gathers nodes whose name equals ref or its tail segment,
 // paginating through all matches to avoid silently losing candidates.
 func CollectCandidates(database *db.DB, refName string) ([]db.Node, error) {
+	return collectCandidatesContext(context.Background(), database, refName)
+}
+
+func collectCandidatesContext(ctx context.Context, database *db.DB, refName string) ([]db.Node, error) {
 	refName = strings.TrimSpace(refName)
 	if refName == "" {
 		return nil, nil
@@ -148,7 +153,7 @@ func CollectCandidates(database *db.DB, refName string) ([]db.Node, error) {
 		}
 	}
 
-	if err := database.ForEachNodeByName(refName, func(n db.Node) error {
+	if err := database.ForEachNodeByNameContext(ctx, refName, func(n db.Node) error {
 		add(n)
 		return nil
 	}); err != nil {
@@ -157,7 +162,7 @@ func CollectCandidates(database *db.DB, refName string) ([]db.Node, error) {
 
 	// Class.method / pkg.Func / util.greet
 	if tail := nameTail(refName); tail != "" && tail != refName {
-		if err := database.ForEachNodeByName(tail, func(n db.Node) error {
+		if err := database.ForEachNodeByNameContext(ctx, tail, func(n db.Node) error {
 			add(n)
 			return nil
 		}); err != nil {

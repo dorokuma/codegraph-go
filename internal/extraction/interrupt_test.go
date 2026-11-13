@@ -1,6 +1,8 @@
 package extraction
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -9,7 +11,115 @@ import (
 	"testing"
 
 	"github.com/dorokuma/codegraph-go/internal/db"
+	"modernc.org/sqlite"
 )
+
+var deletionCancellationID atomic.Uint64
+
+// Cancel from the first real ClearFile transaction, not before the operation.
+// That file may commit atomically; the remaining files must stay indexed.
+func TestFileDeletionStopsBetweenTransactions(t *testing.T) {
+	for _, mode := range []string{"tree", "root", "prune"} {
+		t.Run(mode, func(t *testing.T) {
+			done := make(chan struct{})
+			var calls atomic.Int32
+			function := fmt.Sprintf("cancel_file_delete_%d", deletionCancellationID.Add(1))
+			if err := sqlite.RegisterScalarFunction(function, 0, func(_ *sqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+				if calls.Add(1) == 1 {
+					close(done)
+				}
+				return int64(0), nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			database, err := db.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			for i := 0; i < 6; i++ {
+				if err := database.UpsertFile(fmt.Sprintf("gone/f%d.go", i), 1, 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			conn, err := sql.Open("sqlite", database.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.Exec(`CREATE TRIGGER cancel_file_delete AFTER DELETE ON files BEGIN SELECT ` + function + `(); END`); err != nil {
+				t.Fatal(err)
+			}
+			orch := NewOrchestrator(database, root)
+			orch.SetDone(done)
+			switch mode {
+			case "tree":
+				err = orch.DeleteTree(filepath.Join(root, "gone"))
+			case "root":
+				err = orch.DeleteTree(root)
+			case "prune":
+				err = orch.pruneMissingFiles(nil)
+			}
+			if !errors.Is(err, ErrIndexInterrupted) || calls.Load() != 1 {
+				t.Fatalf("%s: delete calls=%d err=%v, want one committed unit then interruption", mode, calls.Load(), err)
+			}
+			files, err := database.ListFiles()
+			if err != nil || len(files) != 5 {
+				t.Fatalf("%s: remaining files=%d err=%v, want 5", mode, len(files), err)
+			}
+			// Without a shutdown signal the same real write chain must finish.
+			control := NewOrchestrator(database, root)
+			if err := control.DeleteTree(root); err != nil {
+				t.Fatal(err)
+			}
+			files, err = database.ListFiles()
+			if err != nil || len(files) != 0 || calls.Load() != 6 {
+				t.Fatalf("normal deletion: remaining=%d calls=%d err=%v", len(files), calls.Load(), err)
+			}
+		})
+	}
+}
+
+// Cancellation after extraction/resolution must not start noise cleanup or
+// synthesis, nor report a completed pass to the schema-revision caller.
+func TestRunSynthesisInterrupted(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	id, err := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Caller", File: "a.go", Line: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.InsertUnresolvedRef(&db.UnresolvedRef{
+		FromNode: id, ReferenceName: "setTimeout", ReferenceKind: db.EdgeCalls,
+		FilePath: "a.go", Line: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	orch := NewOrchestrator(database, root)
+	done := make(chan struct{})
+	orch.SetDone(done)
+	close(done)
+	if err := orch.runSynthesis(nil); !errors.Is(err, ErrIndexInterrupted) {
+		t.Fatalf("post-extraction shutdown: err=%v, want ErrIndexInterrupted", err)
+	}
+	pending, err := database.CountUnresolvedRefs("pending")
+	if err != nil || pending != 1 {
+		t.Fatalf("shutdown started noise cleanup: pending=%d err=%v", pending, err)
+	}
+	control := NewOrchestrator(database, root)
+	if err := control.runSynthesis(nil); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = database.CountUnresolvedRefs("pending")
+	if err != nil || pending != 0 {
+		t.Fatalf("normal cleanup: pending=%d err=%v", pending, err)
+	}
+}
 
 func writeGoFiles(t *testing.T, root string, n int) []string {
 	t.Helper()

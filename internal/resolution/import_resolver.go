@@ -1,6 +1,7 @@
 package resolution
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,16 +249,20 @@ func uniqueExisting(paths []string) []string {
 // FilterByImports prefers candidates living in files reached via this file's imports.
 // Returns (filtered, true) when import closure yields a non-empty subset.
 func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates []db.Node) ([]db.Node, bool) {
+	return filterByImportsContext(context.Background(), database, workdir, fromFile, lang, candidates)
+}
+
+func filterByImportsContext(ctx context.Context, database *db.DB, workdir, fromFile, lang string, candidates []db.Node) ([]db.Node, bool) {
 	if len(candidates) == 0 {
 		return nil, false
 	}
 	// Import edges are keyed by the same storage path as nodes (relative preferred).
 	storeFrom := db.StoragePath(workdir, fromFile)
-	specs, err := database.GetImportTargetNames(storeFrom)
+	specs, err := database.GetImportTargetNamesContext(ctx, storeFrom)
 	if err != nil || len(specs) == 0 {
 		// Legacy absolute keys
 		if storeFrom != fromFile {
-			specs, err = database.GetImportTargetNames(fromFile)
+			specs, err = database.GetImportTargetNamesContext(ctx, fromFile)
 		}
 		if err != nil || len(specs) == 0 {
 			return candidates, false
@@ -265,6 +270,9 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 	}
 	importedFiles := map[string]bool{}
 	for _, spec := range specs {
+		if ctx.Err() != nil {
+			return nil, false
+		}
 		for _, p := range ResolveImportPath(workdir, fromFile, spec, lang) {
 			// Index keys are workdir-relative; ResolveImportPath returns abs paths.
 			importedFiles[db.StoragePath(workdir, p)] = true
@@ -273,6 +281,9 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 		// Also accept candidates whose file path contains spec as a complete
 		// path segment (boundary-aware, avoids short name over-matching).
 		for _, c := range candidates {
+			if ctx.Err() != nil {
+				return nil, false
+			}
 			if specMatchesFile(c.File, spec) {
 				importedFiles[db.StoragePath(workdir, c.File)] = true
 				importedFiles[c.File] = true
@@ -284,6 +295,9 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 	}
 	var hit []db.Node
 	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return nil, false
+		}
 		ck := db.StoragePath(workdir, c.File)
 		if importedFiles[c.File] || importedFiles[ck] {
 			hit = append(hit, c)
