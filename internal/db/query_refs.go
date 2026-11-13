@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -236,6 +237,11 @@ func (d *DB) CountUnresolvedRefs(status string) (int, error) {
 // ListUnresolvedRefs returns unresolved_refs rows, optionally filtered by file path
 // and/or status (empty string = no filter).
 func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error) {
+	return d.ListUnresolvedRefsContext(context.Background(), filePath, status)
+}
+
+// ListUnresolvedRefsContext allows shutdown to interrupt a large reference scan.
+func (d *DB) ListUnresolvedRefsContext(ctx context.Context, filePath, status string) ([]UnresolvedRef, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -251,13 +257,16 @@ func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error
 		q += ` AND status = ?`
 		args = append(args, status)
 	}
-	rows, err := d.conn.Query(q, args...)
+	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []UnresolvedRef
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var r UnresolvedRef
 		if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
 			&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
@@ -276,6 +285,14 @@ func (d *DB) ListUnresolvedRefs(filePath, status string) ([]UnresolvedRef, error
 // filter. A row can only match one chunk (each path appears once), so no
 // dedup is needed.
 func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]UnresolvedRef, error) {
+	return d.ListUnresolvedRefsByFilesContext(context.Background(), files, status)
+}
+
+// ListUnresolvedRefsByFilesContext interrupts both chunk queries and row scans.
+func (d *DB) ListUnresolvedRefsByFilesContext(ctx context.Context, files []string, status string) ([]UnresolvedRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(files) == 0 {
 		return nil, nil
 	}
@@ -289,6 +306,9 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 
 	var out []UnresolvedRef
 	for start := 0; start < len(files); start += maxFilesPerChunk {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := start + maxFilesPerChunk
 		if end > len(files) {
 			end = len(files)
@@ -305,11 +325,15 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 			q += ` AND status = ?`
 			args = append(args, status)
 		}
-		rows, err := d.conn.Query(q, args...)
+		rows, err := d.conn.QueryContext(ctx, q, args...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				rows.Close()
+				return nil, err
+			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
 				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
@@ -335,6 +359,14 @@ func (d *DB) ListUnresolvedRefsByFiles(files []string, status string) ([]Unresol
 // the IN lists stay under SQLite's variable-number ceiling; a row matching
 // both branches is returned once.
 func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]UnresolvedRef, error) {
+	return d.ListUnresolvedRefsByNamesContext(context.Background(), names, statuses)
+}
+
+// ListUnresolvedRefsByNamesContext retains the indexed query and dedupe semantics.
+func (d *DB) ListUnresolvedRefsByNamesContext(ctx context.Context, names []string, statuses []string) ([]UnresolvedRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -347,13 +379,17 @@ func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]Unr
 		FROM unresolved_refs`
 
 	run := func(where string, args []interface{}) ([]UnresolvedRef, error) {
-		rows, err := d.conn.Query(where, args...)
+		rows, err := d.conn.QueryContext(ctx, where, args...)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
 		var out []UnresolvedRef
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				rows.Close()
+				return nil, err
+			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
 				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
@@ -397,6 +433,9 @@ func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]Unr
 			statusArgs = []interface{}{status}
 		}
 		for start := 0; start < len(names); start += maxNamesPerChunk {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			end := start + maxNamesPerChunk
 			if end > len(names) {
 				end = len(names)
@@ -433,6 +472,14 @@ func (d *DB) ListUnresolvedRefsByNames(names []string, statuses []string) ([]Unr
 // idx_unresolved_status); the normal extraction path always writes a non-empty
 // name_tail and is never touched by it.
 func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, error) {
+	return d.ListUnresolvedRefsEmptyTailContext(context.Background(), statuses)
+}
+
+// ListUnresolvedRefsEmptyTailContext cancels historical empty-tail scans.
+func (d *DB) ListUnresolvedRefsEmptyTailContext(ctx context.Context, statuses []string) ([]UnresolvedRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -453,7 +500,10 @@ func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, er
 			prefix = "status = ? AND "
 			statusArgs = []interface{}{status}
 		}
-		rows, err := d.conn.Query(`
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rows, err := d.conn.QueryContext(ctx, `
 			SELECT id, from_node, reference_name, reference_kind, line, col,
 				file_path, language, status, name_tail, COALESCE(candidates,'')
 			FROM unresolved_refs WHERE `+prefix+`name_tail = ''`, statusArgs...)
@@ -461,6 +511,10 @@ func (d *DB) ListUnresolvedRefsEmptyTail(statuses []string) ([]UnresolvedRef, er
 			return nil, err
 		}
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				rows.Close()
+				return nil, err
+			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
 				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {

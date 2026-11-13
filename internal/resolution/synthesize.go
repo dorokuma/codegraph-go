@@ -2,6 +2,7 @@ package resolution
 
 import (
 	"container/list"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,9 +53,18 @@ var (
 // inserts share a transaction, so a failure rolls back cleanly instead of
 // leaving the graph partially cleared.
 func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
-	st := SynthStats{ByPass: map[string]int{}}
+	return SynthesizeAllContext(context.Background(), database, workdir)
+}
 
-	ctx, err := newSynthCtx(database, workdir)
+// SynthesizeAllContext cancels within passes, preserving the previous complete
+// synthesized edge set instead of replacing it with partial results.
+func SynthesizeAllContext(cancelCtx context.Context, database *db.DB, workdir string) (SynthStats, error) {
+	st := SynthStats{ByPass: map[string]int{}}
+	if err := cancelCtx.Err(); err != nil {
+		return st, err
+	}
+
+	ctx, err := newSynthCtxContext(cancelCtx, database, workdir)
 	if err != nil {
 		return st, err
 	}
@@ -78,9 +88,15 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 	var merged []synthEdge
 	var passErrs []error
 	for _, p := range passes {
+		if err := cancelCtx.Err(); err != nil {
+			return st, err
+		}
 		edges, err := p.run(ctx)
 		if err == nil && failSynthPass != nil {
 			err = failSynthPass(p.name)
+		}
+		if cerr := cancelCtx.Err(); cerr != nil {
+			return st, cerr
 		}
 		if err != nil {
 			log.Printf("synthesis %s: %v", p.name, err)
@@ -89,6 +105,9 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 		}
 		n := 0
 		for _, e := range edges {
+			if err := cancelCtx.Err(); err != nil {
+				return st, err
+			}
 			key := edgeKey(e.SourceID, e.TargetID, e.Kind)
 			if seen[key] || e.SourceID == 0 || e.TargetID == 0 || e.SourceID == e.TargetID {
 				continue
@@ -108,6 +127,9 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 	// set inside one transaction (F2).
 	edges := make([]db.Edge, 0, len(merged))
 	for _, e := range merged {
+		if err := cancelCtx.Err(); err != nil {
+			return st, err
+		}
 		meta, _ := json.Marshal(e.Meta)
 		edges = append(edges, db.Edge{
 			SourceID:   e.SourceID,
@@ -119,12 +141,15 @@ func SynthesizeAll(database *db.DB, workdir string) (SynthStats, error) {
 			Metadata:   string(meta),
 		})
 	}
+	if err := cancelCtx.Err(); err != nil {
+		return st, err
+	}
 	if err := database.ReplaceSynthesizedEdges(edges); err != nil {
 		log.Printf("synthesize replace edges: %v", err)
 		return st, err
 	}
 	st.Written = len(edges)
-	return st, nil
+	return st, cancelCtx.Err()
 }
 
 func edgeKey(src, tgt int64, kind string) string {
@@ -198,8 +223,9 @@ func (l *lruCache) len() int { return l.ll.Len() }
 const fileContentMaxEntries = 256
 
 type synthCtx struct {
-	db      *db.DB
-	workdir string
+	cancelCtx context.Context
+	db        *db.DB
+	workdir   string
 	// caches — avoid repeated full-table GetNodesByKind scans (memory/CPU).
 	fileContent *lruCache
 	nodesByName map[string][]db.Node
@@ -209,7 +235,12 @@ type synthCtx struct {
 }
 
 func newSynthCtx(database *db.DB, workdir string) (*synthCtx, error) {
+	return newSynthCtxContext(context.Background(), database, workdir)
+}
+
+func newSynthCtxContext(cancelCtx context.Context, database *db.DB, workdir string) (*synthCtx, error) {
 	ctx := &synthCtx{
+		cancelCtx:   cancelCtx,
 		db:          database,
 		workdir:     workdir,
 		fileContent: newLRUCache(fileContentMaxEntries),
@@ -217,7 +248,7 @@ func newSynthCtx(database *db.DB, workdir string) (*synthCtx, error) {
 		nodesInFile: map[string][]db.Node{},
 		nodesByKind: map[string][]db.Node{},
 	}
-	files, err := database.ListFiles()
+	files, err := database.ListFilesContext(cancelCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -225,12 +256,24 @@ func newSynthCtx(database *db.DB, workdir string) (*synthCtx, error) {
 	return ctx, nil
 }
 
+func (c *synthCtx) context() context.Context {
+	if c.cancelCtx == nil {
+		return context.Background()
+	}
+	return c.cancelCtx
+}
+
+func (c *synthCtx) err() error { return c.context().Err() }
+
 // nodesOfKind returns all nodes of kind, cached for the synthesis pass.
 func (c *synthCtx) nodesOfKind(kind string) ([]db.Node, error) {
+	if err := c.err(); err != nil {
+		return nil, err
+	}
 	if v, ok := c.nodesByKind[kind]; ok {
 		return v, nil
 	}
-	nodes, err := c.db.GetNodesByKind(kind)
+	nodes, err := c.db.GetNodesByKindContext(c.context(), kind)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +282,7 @@ func (c *synthCtx) nodesOfKind(kind string) ([]db.Node, error) {
 }
 
 func (c *synthCtx) readFile(path string) string {
-	if path == "" {
+	if path == "" || c.err() != nil {
 		return ""
 	}
 	if s, ok := c.fileContent.get(path); ok {
@@ -253,6 +296,9 @@ func (c *synthCtx) readFile(path string) string {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		// try as-is
+		if c.err() != nil {
+			return ""
+		}
 		data, err = os.ReadFile(path)
 		if err != nil {
 			c.fileContent.put(path, "")
@@ -269,7 +315,7 @@ func (c *synthCtx) getNodesByName(name string) []db.Node {
 		return v
 	}
 	var nodes []db.Node
-	err := c.db.ForEachNodeByName(name, func(n db.Node) error {
+	err := c.db.ForEachNodeByNameContext(c.context(), name, func(n db.Node) error {
 		nodes = append(nodes, n)
 		return nil
 	})
@@ -286,7 +332,7 @@ func (c *synthCtx) getNodesInFile(file string) []db.Node {
 	}
 	// Truncation-aware variant: a generated file can hold more symbols than
 	// the per-file cap; log it instead of silently dropping the tail.
-	nodes, truncated, err := c.db.GetNodesByFileBodiesLimited(file, 0)
+	nodes, truncated, err := c.db.GetNodesByFileBodiesLimitedContext(c.context(), file, 0)
 	if err != nil {
 		nodes = nil
 	}
@@ -480,6 +526,9 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 	}
 	var registrars, dispatchers []pair
 	for _, m := range candidates {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		isReg := registrarNameRe.MatchString(m.Name)
 		isDisp := dispatcherNameRe.MatchString(m.Name)
 		if !isReg && !isDisp {
@@ -509,8 +558,14 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 	var edges []synthEdge
 	seen := map[string]bool{}
 	for _, reg := range registrars {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		var chDisp []pair
 		for _, d := range dispatchers {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if d.node.File == reg.node.File && d.field == reg.field {
 				chDisp = append(chDisp, d)
 			}
@@ -519,19 +574,28 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 			continue
 		}
 		argRe := getArgRe(reg.node.Name)
-		incoming, err := ctx.db.GetIncomingEdges(reg.node.ID, []string{db.EdgeCalls})
+		incoming, err := ctx.db.GetIncomingEdgesContext(ctx.context(), reg.node.ID, []string{db.EdgeCalls})
 		if err != nil {
+			if cerr := ctx.err(); cerr != nil {
+				return nil, cerr
+			}
 			continue
 		}
 		added := 0
 		for _, e := range incoming {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if added >= maxCallbacksPerChannel {
 				break
 			}
 			if e.Line <= 0 {
 				continue
 			}
-			caller, err := ctx.db.GetNodeByID(e.SourceID)
+			caller, err := ctx.db.GetNodeByIDContext(ctx.context(), e.SourceID)
+			if cerr := ctx.err(); cerr != nil {
+				return nil, cerr
+			}
 			if err != nil || caller == nil {
 				continue
 			}
@@ -550,6 +614,9 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 				continue
 			}
 			for _, disp := range chDisp {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				if disp.node.ID == fn.ID {
 					continue
 				}
@@ -575,7 +642,7 @@ func fieldChannelEdges(ctx *synthCtx) ([]synthEdge, error) {
 			}
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
 // eventEmitterEdges: emit('e') dispatcher → on('e', handler).
@@ -589,6 +656,9 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 	handlersByEvent := map[string]map[int64]string{} // handler id → registeredAt
 
 	for _, file := range ctx.allFiles {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		content := ctx.readFile(file)
 		if content == "" {
 			continue
@@ -601,6 +671,9 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 		nodes := ctx.getNodesInFile(file)
 		if hasEmit {
 			for _, m := range emitEventRe.FindAllStringSubmatchIndex(content, -1) {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				if len(m) < 4 {
 					continue
 				}
@@ -620,6 +693,9 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 		}
 		if hasOn {
 			for _, m := range onEventRe.FindAllStringSubmatchIndex(content, -1) {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				// groups: full, event, functionName?, identName?
 				if len(m) < 8 {
 					continue
@@ -655,6 +731,9 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 	var edges []synthEdge
 	seen := map[string]bool{}
 	for event, dispatchers := range emitsByEvent {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		handlers := handlersByEvent[event]
 		if len(handlers) == 0 {
 			continue
@@ -687,7 +766,7 @@ func eventEmitterEdges(ctx *synthCtx) ([]synthEdge, error) {
 			}
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
 // reactRenderEdges: class methods calling this.setState → sibling render().
@@ -699,10 +778,19 @@ func reactRenderEdges(ctx *synthCtx) ([]synthEdge, error) {
 	var edges []synthEdge
 	seen := map[string]bool{}
 	for _, cls := range classes {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		// Prefer contains edges; fall back to same-file methods inside class line range.
-		children := classMethods(ctx, cls)
+		children, err := classMethods(ctx, cls)
+		if err != nil {
+			return nil, err
+		}
 		var render *db.Node
 		for i := range children {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if children[i].Name == "render" {
 				render = &children[i]
 				break
@@ -713,6 +801,9 @@ func reactRenderEdges(ctx *synthCtx) ([]synthEdge, error) {
 		}
 		added := 0
 		for i := range children {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			m := &children[i]
 			if added >= maxCallbacksPerChannel {
 				break
@@ -747,22 +838,34 @@ func reactRenderEdges(ctx *synthCtx) ([]synthEdge, error) {
 			added++
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
-func classMethods(ctx *synthCtx, cls db.Node) []db.Node {
-	outEdges, err := ctx.db.GetOutgoingEdges(cls.ID, []string{db.EdgeContains})
+func classMethods(ctx *synthCtx, cls db.Node) ([]db.Node, error) {
+	if err := ctx.err(); err != nil {
+		return nil, err
+	}
+	outEdges, err := ctx.db.GetOutgoingEdgesContext(ctx.context(), cls.ID, []string{db.EdgeContains})
+	if cerr := ctx.err(); cerr != nil {
+		return nil, cerr
+	}
 	if err == nil && len(outEdges) > 0 {
 		var methods []db.Node
 		for _, e := range outEdges {
-			n, err := ctx.db.GetNodeByID(e.TargetID)
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
+			n, err := ctx.db.GetNodeByIDContext(ctx.context(), e.TargetID)
+			if cerr := ctx.err(); cerr != nil {
+				return nil, cerr
+			}
 			if err != nil || n == nil || n.Kind != db.KindMethod {
 				continue
 			}
 			methods = append(methods, *n)
 		}
 		if len(methods) > 0 {
-			return methods
+			return methods, nil
 		}
 	}
 	// Fallback: methods in same file within class line span.
@@ -772,6 +875,9 @@ func classMethods(ctx *synthCtx, cls db.Node) []db.Node {
 	}
 	var methods []db.Node
 	for _, n := range ctx.getNodesInFile(cls.File) {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		if n.Kind != db.KindMethod {
 			continue
 		}
@@ -779,7 +885,7 @@ func classMethods(ctx *synthCtx, cls db.Node) []db.Node {
 			methods = append(methods, n)
 		}
 	}
-	return methods
+	return methods, ctx.err()
 }
 
 // reactJSXChildEdges: parent render/function → PascalCase JSX child component.
@@ -787,12 +893,18 @@ func reactJSXChildEdges(ctx *synthCtx) ([]synthEdge, error) {
 	var edges []synthEdge
 	seen := map[string]bool{}
 	for _, file := range ctx.allFiles {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		content := ctx.readFile(file)
 		if content == "" || (!strings.Contains(content, "</") && !strings.Contains(content, "/>")) {
 			continue
 		}
 		parents := ctx.getNodesInFile(file)
 		for i := range parents {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			parent := &parents[i]
 			if !isCallableKind(parent.Kind) {
 				continue
@@ -806,12 +918,18 @@ func reactJSXChildEdges(ctx *synthCtx) ([]synthEdge, error) {
 			}
 			names := map[string]bool{}
 			for _, m := range jsxTagRe.FindAllStringSubmatch(src, -1) {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				if len(m) > 1 {
 					names[m[1]] = true
 				}
 			}
 			added := 0
 			for name := range names {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				if added >= maxJSXChildren {
 					break
 				}
@@ -839,17 +957,20 @@ func reactJSXChildEdges(ctx *synthCtx) ([]synthEdge, error) {
 			}
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
 // bridgeSymbolEdges links parked cross-file bridge refs that resolution missed,
 // tagging them as synthesized bridge edges when a unique callable target exists.
 func bridgeSymbolEdges(ctx *synthCtx) ([]synthEdge, error) {
-	pending, err := ctx.db.ListUnresolvedRefs("", "failed")
+	if err := ctx.err(); err != nil {
+		return nil, err
+	}
+	pending, err := ctx.db.ListUnresolvedRefsContext(ctx.context(), "", "failed")
 	if err != nil {
 		return nil, err
 	}
-	pending2, err := ctx.db.ListUnresolvedRefs("", "pending")
+	pending2, err := ctx.db.ListUnresolvedRefsContext(ctx.context(), "", "pending")
 	if err != nil {
 		return nil, err
 	}
@@ -858,18 +979,24 @@ func bridgeSymbolEdges(ctx *synthCtx) ([]synthEdge, error) {
 	var edges []synthEdge
 	seen := map[string]bool{}
 	for _, r := range pending {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		if r.ReferenceKind != db.EdgeBridge && r.ReferenceKind != "bridge" {
 			continue
 		}
 		if r.FromNode == 0 || r.ReferenceName == "" {
 			continue
 		}
-		cands, err := CollectCandidates(ctx.db, r.ReferenceName)
+		cands, err := collectCandidatesContext(ctx.context(), ctx.db, r.ReferenceName)
 		if err != nil || len(cands) == 0 {
 			continue
 		}
 		var callables []db.Node
 		for _, c := range cands {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if c.ID == r.FromNode {
 				continue
 			}
@@ -902,5 +1029,5 @@ func bridgeSymbolEdges(ctx *synthCtx) ([]synthEdge, error) {
 			},
 		})
 	}
-	return edges, nil
+	return edges, ctx.err()
 }

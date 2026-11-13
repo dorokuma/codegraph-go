@@ -65,15 +65,25 @@ func (d *DB) GetEdgeByEndpoints(sourceID, targetID int64, kind string) (*Edge, e
 
 // GetIncomingEdges returns edges targeting nodeID, optionally filtered by kinds.
 func (d *DB) GetIncomingEdges(nodeID int64, kinds []string) ([]Edge, error) {
-	return d.listEdges(`target_id = ?`, nodeID, kinds)
+	return d.GetIncomingEdgesContext(context.Background(), nodeID, kinds)
+}
+
+// GetIncomingEdgesContext cancels active incoming-edge scans.
+func (d *DB) GetIncomingEdgesContext(ctx context.Context, nodeID int64, kinds []string) ([]Edge, error) {
+	return d.listEdgesContext(ctx, `target_id = ?`, nodeID, kinds)
 }
 
 // GetOutgoingEdges returns edges originating at nodeID, optionally filtered by kinds.
 func (d *DB) GetOutgoingEdges(nodeID int64, kinds []string) ([]Edge, error) {
-	return d.listEdges(`source_id = ?`, nodeID, kinds)
+	return d.GetOutgoingEdgesContext(context.Background(), nodeID, kinds)
 }
 
-func (d *DB) listEdges(endpointClause string, nodeID int64, kinds []string) ([]Edge, error) {
+// GetOutgoingEdgesContext cancels active outgoing-edge scans.
+func (d *DB) GetOutgoingEdgesContext(ctx context.Context, nodeID int64, kinds []string) ([]Edge, error) {
+	return d.listEdgesContext(ctx, `source_id = ?`, nodeID, kinds)
+}
+
+func (d *DB) listEdgesContext(ctx context.Context, endpointClause string, nodeID int64, kinds []string) ([]Edge, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -87,13 +97,16 @@ func (d *DB) listEdges(endpointClause string, nodeID int64, kinds []string) ([]E
 		}
 		q += ` AND kind IN (` + strings.Join(ph, ",") + `)`
 	}
-	rows, err := d.conn.Query(q, args...)
+	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Edge
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var e Edge
 		var file, provenance, metadata sql.NullString
 		var line, col sql.NullInt64

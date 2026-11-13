@@ -32,7 +32,7 @@ func (o *Orchestrator) IndexFile(path string) (int, error) {
 	}
 	key := o.storePath(path)
 	var join error
-	if _, rerr := resolution.ResolveForFiles(o.db, o.workdir, []string{key}); rerr != nil {
+	if _, rerr := resolution.ResolveForFilesContext(o.indexContext(), o.db, o.workdir, []string{key}); rerr != nil {
 		log.Printf("resolve after index %s: %v", path, rerr)
 		join = errors.Join(join, rerr)
 	}
@@ -56,26 +56,29 @@ func (o *Orchestrator) DeleteTree(path string) error {
 	if key == "" {
 		return nil
 	}
-	files, err := o.db.ListFiles()
+	files, err := o.db.ListFilesContext(o.indexContext())
 	if err != nil {
+		if o.interrupted() {
+			return errors.Join(err, ErrIndexInterrupted)
+		}
 		return err
 	}
 	var errs []error
-	if key == "." {
-		for _, f := range files {
-			if cerr := o.db.ClearFile(f); cerr != nil {
-				errs = append(errs, cerr)
-			}
-		}
-		return errors.Join(errs...)
-	}
 	prefix := key + "/"
 	for _, f := range files {
-		if f == key || strings.HasPrefix(f, prefix) {
+		if o.interrupted() {
+			return errors.Join(append(errs, ErrIndexInterrupted)...)
+		}
+		if key == "." || f == key || strings.HasPrefix(f, prefix) {
+			// A started ClearFile transaction completes atomically. Check the
+			// shutdown signal before starting the next file's transaction.
 			if cerr := o.db.ClearFile(f); cerr != nil {
 				errs = append(errs, cerr)
 			}
 		}
+	}
+	if o.interrupted() {
+		errs = append(errs, ErrIndexInterrupted)
 	}
 	return errors.Join(errs...)
 }
@@ -86,20 +89,32 @@ func (o *Orchestrator) DeleteTree(path string) error {
 func (o *Orchestrator) pruneMissingFiles(jobs []indexJob) error {
 	keep := make(map[string]struct{}, len(jobs))
 	for _, j := range jobs {
+		if o.interrupted() {
+			return ErrIndexInterrupted
+		}
 		keep[o.storePath(j.path)] = struct{}{}
 	}
-	listed, err := o.db.ListFiles()
+	listed, err := o.db.ListFilesContext(o.indexContext())
 	if err != nil {
+		if o.interrupted() {
+			return errors.Join(err, ErrIndexInterrupted)
+		}
 		return err
 	}
 	var errs []error
 	for _, f := range listed {
+		if o.interrupted() {
+			return errors.Join(append(errs, ErrIndexInterrupted)...)
+		}
 		if _, ok := keep[f]; ok {
 			continue
 		}
 		if cerr := o.db.ClearFile(f); cerr != nil {
 			errs = append(errs, fmt.Errorf("prune %s: %w", f, cerr))
 		}
+	}
+	if o.interrupted() {
+		errs = append(errs, ErrIndexInterrupted)
 	}
 	return errors.Join(errs...)
 }

@@ -1,6 +1,7 @@
 package resolution
 
 import (
+	"context"
 	"log"
 	"path/filepath"
 
@@ -29,20 +30,35 @@ var maxResolveAttempts = 20
 // ResolveAll turns pending (and retryable failed) unresolved_refs into edges.
 // Cross-file graph edges are born here — not during extraction (step 2/3 split).
 func ResolveAll(database *db.DB, workdir string) (Stats, error) {
-	var st Stats
+	return ResolveAllContext(context.Background(), database, workdir)
+}
 
-	pending, err := database.ListUnresolvedRefs("", "pending")
+// ResolveAllContext stops between references and cancels read-side SQL on shutdown.
+// Unflushed plans remain pending in the DB and are retried on the next pass.
+func ResolveAllContext(ctx context.Context, database *db.DB, workdir string) (Stats, error) {
+	var st Stats
+	if err := ctx.Err(); err != nil {
+		return st, err
+	}
+
+	pending, err := database.ListUnresolvedRefsContext(ctx, "", "pending")
 	if err != nil {
 		return st, err
 	}
-	failed, err := database.ListUnresolvedRefs("", "failed")
+	failed, err := database.ListUnresolvedRefsContext(ctx, "", "failed")
 	if err != nil {
 		return st, err
 	}
 	// Retry failed refs when a candidate name now exists.
 	var retry []db.UnresolvedRef
 	for _, r := range failed {
-		cands, err := CollectCandidates(database, r.ReferenceName)
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		cands, err := collectCandidatesContext(ctx, database, r.ReferenceName)
+		if cerr := ctx.Err(); cerr != nil {
+			return st, cerr
+		}
 		if err != nil || len(cands) == 0 {
 			continue
 		}
@@ -51,9 +67,18 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 	st.Retried = len(retry)
 
 	batch := append(pending, retry...)
-	w := newEdgeWriter(database)
+	w := newEdgeWriterContext(ctx, database)
 	for _, r := range batch {
-		plan, err := resolveOne(database, workdir, r)
+		if err := ctx.Err(); err != nil {
+			st.Resolved += w.resolved
+			return st, err
+		}
+		plan, err := resolveOneContext(ctx, database, workdir, r)
+		// Cancellation is not a failed reference: do not age/abandon it.
+		if cerr := ctx.Err(); cerr != nil {
+			st.Resolved += w.resolved
+			return st, cerr
+		}
 		if err != nil {
 			// A per-ref resolution error is a failure for THIS ref this pass:
 			// count it and park the ref as failed (failed rows are retried by
@@ -77,15 +102,22 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 		}
 		w.add(*plan)
 	}
+	if err := ctx.Err(); err != nil {
+		st.Resolved += w.resolved
+		return st, err
+	}
 	w.flush()
 	st.Resolved += w.resolved
 	for _, p := range w.failed {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
 		st.Failed++
 		if markRefFailed(database, p.ref, maxResolveAttempts) {
 			st.Abandoned++
 		}
 	}
-	return st, nil
+	return st, ctx.Err()
 }
 
 // resolveOne decides the resolution outcome for one ref without writing:
@@ -93,7 +125,7 @@ func ResolveAll(database *db.DB, workdir string) (Stats, error) {
 // when the ref has no resolvable match (the caller parks it as failed), or
 // an error when the read-side lookups fail. Persistence itself is batched
 // through edgeWriter so a pass does not commit per ref.
-func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan, error) {
+func resolveOneContext(ctx context.Context, database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan, error) {
 	if r.FromNode == 0 || r.ReferenceName == "" {
 		return nil, nil
 	}
@@ -103,7 +135,7 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan,
 	}
 	preferCall := kind == db.EdgeCalls || kind == db.EdgeReferences || kind == "bridge"
 
-	candidates, err := CollectCandidates(database, r.ReferenceName)
+	candidates, err := collectCandidatesContext(ctx, database, r.ReferenceName)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +146,9 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan,
 	// Never link a node to itself.
 	filtered := candidates[:0]
 	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if c.ID != r.FromNode {
 			filtered = append(filtered, c)
 		}
@@ -127,7 +162,7 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan,
 	fromFile := r.FilePath
 
 	// Import-closure preference
-	if imp, ok := FilterByImports(database, workdir, fromFile, lang, candidates); ok {
+	if imp, ok := filterByImportsContext(ctx, database, workdir, fromFile, lang, candidates); ok {
 		m := MatchName(imp, r.ReferenceName, fromFile, preferCall)
 		if m.TargetID != 0 {
 			return &edgePlan{ref: r, targetID: m.TargetID, kind: kind, provenance: ProvImport}, nil
@@ -144,6 +179,9 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan,
 		if preferCall {
 			var callables []db.Node
 			for _, c := range candidates {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if callTargetKinds[c.Kind] {
 					callables = append(callables, c)
 				}
@@ -154,7 +192,7 @@ func resolveOne(database *db.DB, workdir string, r db.UnresolvedRef) (*edgePlan,
 				// lives inside a subdirectory of the caller's directory).
 				cdir := filepath.Dir(callables[0].File)
 				fromDir := filepath.Dir(fromFile)
-				if _, ok := FilterByImports(database, workdir, fromFile, lang, []db.Node{callables[0]}); ok {
+				if _, ok := filterByImportsContext(ctx, database, workdir, fromFile, lang, []db.Node{callables[0]}); ok {
 					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvImport}
 				} else if cdir == fromDir {
 					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
@@ -199,6 +237,7 @@ type edgePlan struct {
 // plans that still fail the per-ref retry are recorded in failed (the
 // caller logs, counts them as failures and parks their refs).
 type edgeWriter struct {
+	ctx      context.Context
 	database *db.DB
 	batch    []edgePlan
 	resolved int
@@ -206,7 +245,11 @@ type edgeWriter struct {
 }
 
 func newEdgeWriter(database *db.DB) *edgeWriter {
-	return &edgeWriter{database: database, batch: make([]edgePlan, 0, resolveBatchSize)}
+	return newEdgeWriterContext(context.Background(), database)
+}
+
+func newEdgeWriterContext(ctx context.Context, database *db.DB) *edgeWriter {
+	return &edgeWriter{ctx: ctx, database: database, batch: make([]edgePlan, 0, resolveBatchSize)}
 }
 
 // add queues a plan, flushing a full batch first when the buffer is at cap.
@@ -240,7 +283,7 @@ func (w *edgeWriter) applyOne(p edgePlan) error {
 // batch fails, each plan is retried individually so a single bad row (e.g.
 // an edge violating a constraint) is isolated instead of poisoning the batch.
 func (w *edgeWriter) flush() {
-	if len(w.batch) == 0 {
+	if len(w.batch) == 0 || w.ctx.Err() != nil {
 		return
 	}
 	refs := make([]db.ResolvedRef, len(w.batch))
@@ -258,8 +301,17 @@ func (w *edgeWriter) flush() {
 			},
 		}
 	}
+	// Do not initiate another transaction once cancellation is observed.
+	// ApplyResolvedRefs uses a non-context transaction: once started, it
+	// completes atomically despite cancellation. Stop new fallback writes too.
+	if w.ctx.Err() != nil {
+		return
+	}
 	if err := w.database.ApplyResolvedRefs(refs); err != nil {
 		for _, p := range w.batch {
+			if w.ctx.Err() != nil {
+				return
+			}
 			if w.applyOne(p) == nil {
 				w.resolved++
 			} else {
@@ -293,21 +345,32 @@ func markRefFailed(database *db.DB, r db.UnresolvedRef, maxAttempts int) bool {
 // ResolveForFiles re-runs resolution focusing on refs from the given files
 // (and retries failed tails that may now resolve after those files changed).
 func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, error) {
+	return ResolveForFilesContext(context.Background(), database, workdir, files)
+}
+
+// ResolveForFilesContext is the cancellable incremental-resolution path.
+func ResolveForFilesContext(ctx context.Context, database *db.DB, workdir string, files []string) (Stats, error) {
+	if err := ctx.Err(); err != nil {
+		return Stats{}, err
+	}
 	if len(files) == 0 {
-		return ResolveAll(database, workdir)
+		return ResolveAllContext(ctx, database, workdir)
 	}
 	want := map[string]bool{}
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return Stats{}, err
+		}
 		want[f] = true
 	}
 	var st Stats
 
 	// Load refs for changed files directly via SQL (avoid full-table scan + Go filter).
-	pendingByFiles, err := database.ListUnresolvedRefsByFiles(files, "pending")
+	pendingByFiles, err := database.ListUnresolvedRefsByFilesContext(ctx, files, "pending")
 	if err != nil {
 		return st, err
 	}
-	failedByFiles, err := database.ListUnresolvedRefsByFiles(files, "failed")
+	failedByFiles, err := database.ListUnresolvedRefsByFilesContext(ctx, files, "failed")
 	if err != nil {
 		return st, err
 	}
@@ -318,13 +381,22 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	// Also any pending/failed whose name might be defined in changed files.
 	changedNames := map[string]bool{}
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
 		// ForEach paginates through ALL matches: a file with more symbols
 		// than getNodesByFileCap must not silently lose name candidates.
-		err := database.ForEachNodeByFileLight(f, func(n db.Node) error {
+		err := database.ForEachNodeByFileLightContext(ctx, f, func(n db.Node) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			changedNames[n.Name] = true
 			return nil
 		})
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return st, cerr
+			}
 			continue
 		}
 	}
@@ -334,13 +406,19 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		// a full-table ListUnresolvedRefs("", status) scan in Go).
 		names := make([]string, 0, len(changedNames))
 		for n := range changedNames {
+			if err := ctx.Err(); err != nil {
+				return st, err
+			}
 			names = append(names, n)
 		}
-		refs, err := database.ListUnresolvedRefsByNames(names, []string{"pending", "failed"})
+		refs, err := database.ListUnresolvedRefsByNamesContext(ctx, names, []string{"pending", "failed"})
 		if err != nil {
 			return st, err
 		}
 		for _, r := range refs {
+			if err := ctx.Err(); err != nil {
+				return st, err
+			}
 			if want[r.FilePath] {
 				continue // already queued via ByFiles
 			}
@@ -356,11 +434,14 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		// scan matched those via nameTail(reference_name); re-apply that for
 		// empty-tail rows only — the SQL branches above already cover every
 		// non-empty tail row and every reference_name exact match.
-		emptyTail, err := database.ListUnresolvedRefsEmptyTail([]string{"pending", "failed"})
+		emptyTail, err := database.ListUnresolvedRefsEmptyTailContext(ctx, []string{"pending", "failed"})
 		if err != nil {
 			return st, err
 		}
 		for _, r := range emptyTail {
+			if err := ctx.Err(); err != nil {
+				return st, err
+			}
 			if want[r.FilePath] {
 				continue // already queued via ByFiles
 			}
@@ -377,13 +458,22 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 	}
 	// Dedupe by id
 	seen := map[int64]bool{}
-	w := newEdgeWriter(database)
+	w := newEdgeWriterContext(ctx, database)
 	for _, r := range batch {
 		if seen[r.ID] {
 			continue
 		}
 		seen[r.ID] = true
-		plan, err := resolveOne(database, workdir, r)
+		if err := ctx.Err(); err != nil {
+			st.Resolved += w.resolved
+			return st, err
+		}
+		plan, err := resolveOneContext(ctx, database, workdir, r)
+		// Cancellation is not a failed reference: do not age/abandon it.
+		if cerr := ctx.Err(); cerr != nil {
+			st.Resolved += w.resolved
+			return st, cerr
+		}
 		if err != nil {
 			log.Printf("resolve ref %s: %v", r.ReferenceName, err)
 			st.Failed++
@@ -404,13 +494,20 @@ func ResolveForFiles(database *db.DB, workdir string, files []string) (Stats, er
 		}
 		w.add(*plan)
 	}
+	if err := ctx.Err(); err != nil {
+		st.Resolved += w.resolved
+		return st, err
+	}
 	w.flush()
 	st.Resolved += w.resolved
 	for _, p := range w.failed {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
 		st.Failed++
 		if markRefFailed(database, p.ref, maxResolveAttempts) {
 			st.Abandoned++
 		}
 	}
-	return st, nil
+	return st, ctx.Err()
 }

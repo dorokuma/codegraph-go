@@ -457,10 +457,15 @@ func (d *DB) DeleteFile(path string) error {
 
 // GetImportTargetNames returns module/symbol names imported by a source file.
 func (d *DB) GetImportTargetNames(filePath string) ([]string, error) {
+	return d.GetImportTargetNamesContext(context.Background(), filePath)
+}
+
+// GetImportTargetNamesContext cancels the import-edge lookup with its caller.
+func (d *DB) GetImportTargetNamesContext(ctx context.Context, filePath string) ([]string, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.conn.Query(`
+	rows, err := d.conn.QueryContext(ctx, `
 		SELECT DISTINCT n.name
 		FROM edges e
 		JOIN nodes n ON n.id = e.target_id

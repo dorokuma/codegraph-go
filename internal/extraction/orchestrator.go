@@ -82,7 +82,7 @@ func NewOrchestrator(database *db.DB, workdir string) *Orchestrator {
 
 // SetDone wires a shutdown signal channel into the index loops. After the
 // channel is closed, in-flight index passes wind down within one unit of work
-// (one file, one walk callback).
+// (a file, walk callback, reference, or synthesis item).
 func (o *Orchestrator) SetDone(done <-chan struct{}) {
 	o.done = done
 }
@@ -401,7 +401,7 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	}
 
 	// Step 3: turn pending unresolved_refs into cross-file edges.
-	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
+	if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 || st.Failed > 0 {
@@ -435,10 +435,20 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 // runSynthesis runs noise scrubbing + dynamic-dispatch synthesis.
 // When files is non-nil only refs related to those files are scrubbed;
 // nil means scrub all. SynthesizeAll is always full-table (its bottom pass).
-func (o *Orchestrator) runSynthesis(files []string) error {
+func (o *Orchestrator) runSynthesis(files []string) (err error) {
+	// Include the interruption sentinel even if cancellation arrived during
+	// the final pass/atomic write, so a rebuild never marks a partial index.
+	defer func() {
+		if o.interrupted() {
+			err = errors.Join(err, ErrIndexInterrupted)
+		}
+	}()
+	if o.interrupted() {
+		return ErrIndexInterrupted
+	}
 	// Drop pure-noise failed/pending refs with no project symbol first.
 	o.scrubNoise(files)
-	st, err := resolution.SynthesizeAll(o.db, o.workdir)
+	st, err := resolution.SynthesizeAllContext(o.indexContext(), o.db, o.workdir)
 	if err != nil {
 		log.Printf("synthesize: %v", err)
 		return err
@@ -453,7 +463,7 @@ func (o *Orchestrator) runSynthesis(files []string) error {
 // When files is non-nil, only refs belonging to those files are examined;
 // nil means scrub all. hasProjectSymbol results are cached per-call.
 func (o *Orchestrator) scrubNoise(files []string) {
-	n, err := ScrubNoisyFailedRefsForFiles(o.db, files)
+	n, err := scrubNoisyFailedRefsForFilesContext(o.indexContext(), o.db, files)
 	if err != nil {
 		log.Printf("scrub noisy refs: %v", err)
 		return
@@ -621,7 +631,7 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 	if o.interrupted() {
 		return totalFiles, totalNodes, errors.Join(append(errs, ErrIndexInterrupted)...)
 	}
-	if _, err := resolution.ResolveForFiles(o.db, o.workdir, storeKeys); err != nil {
+	if _, err := resolution.ResolveForFilesContext(o.indexContext(), o.db, o.workdir, storeKeys); err != nil {
 		log.Printf("resolve changes: %v", err)
 		errs = append(errs, err)
 	}
@@ -668,7 +678,7 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	if o.interrupted() {
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
-	if st, rerr := resolution.ResolveAll(o.db, o.workdir); rerr != nil {
+	if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 {

@@ -402,6 +402,13 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 			slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
 		}
 
+		// Do not start a git probe after shutdown; an already-started probe
+		// retains its existing timeout and non-context API.
+		select {
+		case <-s.BgDone:
+			return
+		default:
+		}
 		// Optional git-status assist: catch edits missed while nothing was watching.
 		if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
 			select {

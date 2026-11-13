@@ -165,6 +165,7 @@ func NewMCPServer(s *Server) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: daemon.PackageVersion}, &mcp.ServerOptions{
 		Instructions: serverInstructions,
 	})
+	srv.AddReceivingMiddleware(argUnwrapMiddleware)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "codegraph",

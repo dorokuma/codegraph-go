@@ -3,14 +3,111 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
+
+var cancellationFunctionID atomic.Uint64
+
+// Cancel inside SQLite evaluation, after the query has started rather than
+// before QueryContext. A second-row cancellation also exercises Rows.Next.
+func TestReferenceScansCancelDuringSQLiteExecution(t *testing.T) {
+	for _, mode := range []string{"all", "files", "names", "empty-tail"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls atomic.Int32
+			function := fmt.Sprintf("shutdown_cancel_%d", cancellationFunctionID.Add(1))
+			if err := sqlite.RegisterScalarFunction(function, 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+				if calls.Add(1) == 2 {
+					cancel()
+				}
+				return args[0], nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			database, cleanup := setupTestDB(t)
+			defer cleanup()
+			caller, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "caller", File: "a.go", Line: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 8; i++ {
+				if _, err := database.InsertUnresolvedRef(&UnresolvedRef{
+					FromNode: caller, ReferenceName: "target", ReferenceKind: EdgeCalls,
+					FilePath: "a.go", Line: i + 1, Status: "pending",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Only this scratch DB is modified. Preserve every column used by
+			// the real reference queries; inject cancellation into their reads.
+			if _, err := database.conn.Exec(`ALTER TABLE unresolved_refs RENAME TO cancellation_refs`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.conn.Exec(`CREATE VIEW unresolved_refs AS SELECT
+				id, from_node, ` + function + `(reference_name) AS reference_name,
+				reference_kind, line, col, file_path, language, status, name_tail, candidates
+				FROM cancellation_refs`); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "all":
+				_, err = database.ListUnresolvedRefsContext(ctx, "", "pending")
+			case "files":
+				_, err = database.ListUnresolvedRefsByFilesContext(ctx, []string{"a.go"}, "pending")
+			case "names":
+				_, err = database.ListUnresolvedRefsByNamesContext(ctx, []string{"target"}, []string{"pending"})
+			case "empty-tail":
+				_, err = database.ListUnresolvedRefsEmptyTailContext(ctx, []string{"pending"})
+			}
+			if !errors.Is(err, context.Canceled) || calls.Load() < 2 {
+				t.Fatalf("active %s scan: calls=%d err=%v", mode, calls.Load(), err)
+			}
+			// A canceled scan must release Rows and the read lock so a writer
+			// can proceed, and must not delete or age any reference.
+			if _, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "writer", File: "writer.go", Line: 1}); err != nil {
+				t.Fatalf("writer lock after cancellation: %v", err)
+			}
+			if _, err := database.conn.Exec(`UPDATE cancellation_refs SET candidates = ''`); err != nil {
+				t.Fatalf("write after cancellation: %v", err)
+			}
+			var pending int
+			if err := database.conn.QueryRow(`SELECT COUNT(*) FROM cancellation_refs WHERE status = 'pending'`).Scan(&pending); err != nil || pending != 8 {
+				t.Fatalf("pending=%d err=%v", pending, err)
+			}
+		})
+	}
+}
+
+func TestNodeIterationCancelsBetweenBufferedRows(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+	for i := 0; i < 3; i++ {
+		if _, err := database.UpsertNode(&Node{Kind: KindFunction, Name: fmt.Sprintf("F%d", i), File: "a.go", Line: i + 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	visited := 0
+	err := database.ForEachNodeByFileLightContext(ctx, "a.go", func(Node) error {
+		visited++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || visited != 1 {
+		t.Fatalf("buffered iteration: visited=%d err=%v", visited, err)
+	}
+}
 
 func setupTestDB(t *testing.T) (*DB, func()) {
 	t.Helper()

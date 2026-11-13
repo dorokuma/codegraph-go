@@ -39,6 +39,9 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 	regs := map[string][]fnptrHit{} // field → handlers
 
 	for _, file := range ctx.allFiles {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		lang := langOfPath(file)
 		if lang != "c" && lang != "cpp" {
 			continue
@@ -51,6 +54,9 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 		funcsInFile := callableByName(ctx.getNodesInFile(file))
 
 		for _, m := range fnptrAssignRe.FindAllStringSubmatchIndex(safe, -1) {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if len(m) < 6 {
 				continue
 			}
@@ -71,13 +77,19 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 		}
 	}
 	if len(regs) == 0 {
-		return nil, nil
+		return nil, ctx.err()
 	}
 
 	for f, list := range regs {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		seen := map[int64]bool{}
 		var uniq []fnptrHit
 		for _, h := range list {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if seen[h.id] {
 				continue
 			}
@@ -92,6 +104,9 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 	added := 0
 
 	for _, file := range ctx.allFiles {
+		if err := ctx.err(); err != nil {
+			return nil, err
+		}
 		lang := langOfPath(file)
 		if lang != "c" && lang != "cpp" {
 			continue
@@ -104,6 +119,9 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 		fileNodes := ctx.getNodesInFile(file)
 
 		for _, m := range fnptrDispatchRe.FindAllStringSubmatchIndex(safe, -1) {
+			if err := ctx.err(); err != nil {
+				return nil, err
+			}
 			if len(m) < 4 {
 				continue
 			}
@@ -123,6 +141,9 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 			}
 			n := 0
 			for _, h := range handlers {
+				if err := ctx.err(); err != nil {
+					return nil, err
+				}
 				if h.id == enc.ID {
 					continue
 				}
@@ -150,11 +171,11 @@ func cFnPointerDispatchEdges(ctx *synthCtx) ([]synthEdge, error) {
 				}
 			}
 			if added >= fnptrFanoutCap*20 {
-				return edges, nil
+				return edges, ctx.err()
 			}
 		}
 	}
-	return edges, nil
+	return edges, ctx.err()
 }
 
 func langOfPath(path string) string {
