@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-11-15
+
 ### Added
 - **`-warm-daemon` 预热入口**：`codegraph-go -workdir <wd> [-config <cfg>] -warm-daemon` 跑完整客户端启动链（`LoadConfig` → `NarrowExcludedWorkdirs` → `ValidateWorkdirs`）后调 `daemon.EnsureAndDial`，经 `SpawnDetached` 拉起守护进程，连上即挂断连接并退 0（连不上则非零退出，供部署日志记账）。存在理由见下方 Fixed 的部属预热条目。
 - **可配置的冗余目录排除**：`config.yaml` 新增 `exclude_dirs`（亦可用 `CODEGRAPH_EXCLUDE_DIRS` 逗号分隔追加），支持四类规则——裸目录名 / glob（如 `*-backup*`，按 basename 匹配）、相对 workdir 的 slash 路径（如 `experiments/scratch`）、以及 `"./sub"` / `"/sub"` 顶层锚定语法（仅排除 `<workdir>/sub` 及其子树，不误伤深层同名目录如 `proj/internal/ref`），统一作用于索引遍历、文件监听、git-assist 的 `ShouldSkipDirIn` 及 rg 侧搜索排除；内置跳过名单新增 `.wt`（git worktree 容器目录），同时新增 workdir 根保护——当 workdir 本身落在被排除路径（含单个 `.wt/<repo>/<branch>` worktree）时根及其子树绝不误跳过。rg 兜底（`search`/`files`/`callers`/`callees`/`impact`）现在经新增的 `extraction.BuiltinSkipGlobs(root)` 单一真源导出同一套内置排除——`skipDirNames` 单段目录名、`skipPathFragments` 多段缓存树（`.local/lib`、`.cargo/registry`、`code_references`、`gopath/pkg` 等）及 Go 工具链段（`go/pkg`、`go/bin`、`go/src`，经 `isGopathRoot` 判定顶层 `go`），不再只排除 `.wt` 与 `exclude_dirs`；`search`/`files` 在已收窄进跳过祖先目录（如 `node_modules/pkg`、`.local/lib/pkg`、`.wt/repo/feat`）的 workdir 下仍正常命中根内文件，不误清空。`index_workers` 亦可经 YAML 配置（优先级：`CODEGRAPH_INDEX_WORKERS` 环境变量 > `index_workers` > 默认 min(8, NumCPU-1)）。
@@ -37,6 +39,28 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - AGENTS.md 补充全局 commit-msg hook 提交规范。
 - `integrations/pi/codegraph-go.ts` 注释中的过时仓库路径回灌修正（`/root/codegraph-go` → `/root/workspace/codegraph-go`，仅注释，无逻辑改动）。
 - `AGENTS.md`（本地忽略文件）「关联仓库」章节移除已归档退役的 `prism` 条目（详见 `.agents/notes/20261016-drop-prism-related-repo.md`）。
+
+## [0.9.13] - 2026-11-07
+
+### Added
+- **`exclude_dirs` 冗余目录排除**：`config.yaml` 新增 `exclude_dirs`（亦可用 `CODEGRAPH_EXCLUDE_DIRS` 逗号分隔追加），支持裸目录名 / glob / 相对 workdir 的 slash 路径 / `./sub` 顶层锚定四类规则，统一作用于索引遍历、文件监听、`ShouldSkipDirIn` 及 rg 侧搜索排除；内置跳过名单纳入 `.wt` worktree 容器目录并加 workdir 根保护。
+- **守护进程资源限制**：`config.yaml` 新增 `nice` / `max_procs` / `cpu_quota_percent`（各含 `CODEGRAPH_*` 环境变量覆盖）；Linux+root+systemd 下经 `systemd-run --scope -p CPUQuota=<N>%` 拉起带硬配额的守护进程，失败自动回退直接启动。
+- **`index_workers` 可经 YAML 配置**（优先级：`CODEGRAPH_INDEX_WORKERS` > `index_workers` > 默认 min(8, NumCPU-1)）。
+- **`deploy.sh` 二进制不可变锁**：新二进制 `install -m 0555`，替换改为锁内单次原子 `mv` + `chattr +i`，中断 trap 自动重锁清理；不支持不可变位的环境逐级降级为纯 0555。
+- **Pi 扩展随部署同步**：新增 `integrations/pi/install.sh` 并由 `deploy.sh` 调用（md5 幂等，含原生 Go 扩展共存保护）。
+- **Agent 协作骨架**：接入 `AGENTS.md` 协作规范、`.agents/notes/` 决策笔记机制及 `scripts/notes-index.sh` 索引生成工具。
+
+### Fixed
+- **rg 与索引器的 `exclude_dirs` glob 语义统一**：新增 `extraction.RgExcludeGlob(s)` 单一转换层（花括号转义、`filepath.Match` 拒收模式按字面量转义、Go 词法逐 token 翻译、字符类按 ripgrep 14.1.1 词法归一化、`'*'` 后缀非法语法防护），任何 `exclude_dirs` 配置都不再令 rg 报错且两侧排除结果一致。
+- **daemon spawn 诊断 fail-closed 与叶安全文件读写**：`daemon.log` 打开失败直接报错不再静默丢子进程输出；新增 `watchDaemonExit` 统一 reap 并打 warn；`daemon.log` 打开加固为 `unix.Open(O_NOFOLLOW|O_CLOEXEC)` + fstat 复核，软链/FIFO/目录/设备一律 fail closed，尾迹绑定已打开 fd 并整行脱敏有界截取；`daemonAliveAt` 改单次叶安全 open 读 pidfile（FIFO 不再卡死、叶软链不跟链）。
+- **`WorkdirAllowlist` 不再被无关旋钮的非法值击穿**：配置解析改用只读 `workdirs` 的最小结构，`nice`/`max_procs`/`index_workers`/`cpu_quota_percent` 等非法值不再让整份 YAML 解析失败而把权限根退回 `$HOME`。
+- **systemd-run 同步回退双重拉起**：`cmd.Start()` 同步失败回退直接启动前显式清空 `quotaArgs`，不再把直接启动子进程的失败误判为 scope 失败而二次拉起 daemon。
+- **`integrations/pi/install.sh` `PI_EXT_DEST` 与 `HOME` 校验顺序**：显式 `PI_EXT_DEST` 不再被「HOME is not set」误拦。
+- **`deploy.sh` 分支/洁净度门禁与 `install.sh` 尾部斜杠拦截**：编译前校验 `main` 分支与干净工作区（`DEPLOY_ALLOW_DIRTY`/`DEPLOY_COMMIT` 豁免）；`PI_EXT_DEST` 拒绝 `*/` 结尾路径。
+- **Pi 扩展目标解析修正**：agent 扩展目录解析为 `~/.pig/agent`，不再写 `~/.pi`。
+
+### Changed
+- Display / daemon wire version **0.9.13**。
 
 ## [0.9.12] - 2026-09-13
 
