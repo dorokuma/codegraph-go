@@ -89,6 +89,64 @@ func TestGitDirtyNonRepo(t *testing.T) {
 	}
 }
 
+// TestGitDirtySourceFilesSubdir pins the workdir-is-a-repo-subdirectory
+// regression: porcelain paths are relative to the REPOSITORY ROOT, so they
+// must be joined onto the toplevel (not workdir) and entries outside the
+// workdir subtree must be dropped.
+func TestGitDirtySourceFilesSubdir(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = root
+		cmd.Env = isolatedGitEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s (%v)", args, out, err)
+		}
+	}
+	run("git", "init")
+	run("git", "config", "user.email", "t@t.com")
+	run("git", "config", "user.name", "t")
+
+	sub := filepath.Join(root, "sub")
+	other := filepath.Join(root, "other")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := filepath.Join(sub, "a.go")
+	b := filepath.Join(other, "b.go")
+	if err := os.WriteFile(a, []byte("package sub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("git", "add", ".")
+	run("git", "commit", "-m", "init")
+
+	// Dirty both files; only the one inside the workdir subtree may surface.
+	if err := os.WriteFile(a, []byte("package sub\n// edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("package other\n// edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := GitDirtySourceFiles(sub)
+	// GitDirtySourceFiles canonicalizes workdir (EvalSymlinks, matching the
+	// cmd entry path), so compare against the resolved path.
+	want, err := filepath.EvalSymlinks(a)
+	if err != nil {
+		want = filepath.Clean(a)
+	}
+	if len(got) != 1 || filepath.Clean(got[0]) != want {
+		t.Fatalf("dirty=%v want [%s]", got, want)
+	}
+}
+
 // TestGitDirtySourceFilesRename verifies that a git rename surfaces BOTH the
 // old path (to drop from the index) and the new path (to index).
 func TestGitDirtySourceFilesRename(t *testing.T) {

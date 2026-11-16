@@ -103,55 +103,10 @@ func hasProjectSymbolContext(ctx context.Context, database *db.DB, refName strin
 	return false, nil
 }
 
-// ScrubNoisyFailedRefs deletes failed unresolved rows that are pure noise and
-// still have no matching project symbol. Call after ResolveAll / ResolveForFiles.
-func ScrubNoisyFailedRefs(database *db.DB) (removed int, err error) {
-	if database == nil {
-		return 0, nil
-	}
-	failed, err := database.ListUnresolvedRefs("", "failed")
-	if err != nil {
-		return 0, err
-	}
-	for _, r := range failed {
-		if !IsNoisyRefName(r.ReferenceName) {
-			continue
-		}
-		if hasProjectSymbol(database, r.ReferenceName) {
-			continue // real symbol — leave for retry
-		}
-		if err := database.DeleteUnresolvedRef(r.ID); err != nil {
-			return removed, err
-		}
-		removed++
-	}
-	// Also drop pending pure-noise with no symbol (stale parks from older builds).
-	pending, err := database.ListUnresolvedRefs("", "pending")
-	if err != nil {
-		return removed, err
-	}
-	for _, r := range pending {
-		if !IsNoisyRefName(r.ReferenceName) {
-			continue
-		}
-		if hasProjectSymbol(database, r.ReferenceName) {
-			continue
-		}
-		if err := database.DeleteUnresolvedRef(r.ID); err != nil {
-			return removed, err
-		}
-		removed++
-	}
-	return removed, nil
-}
-
-// ScrubNoisyFailedRefsForFiles is like ScrubNoisyFailedRefs but only processes
-// refs belonging to the given files. When files is nil, processes all files.
+// scrubNoisyFailedRefsForFilesContext deletes failed/pending unresolved rows
+// that are pure noise and still have no matching project symbol, scoped to
+// the given files. When files is nil, all files are processed.
 // hasProjectSymbol results are cached per-call to avoid repeated DB lookups.
-func ScrubNoisyFailedRefsForFiles(database *db.DB, files []string) (removed int, err error) {
-	return scrubNoisyFailedRefsForFilesContext(context.Background(), database, files)
-}
-
 func scrubNoisyFailedRefsForFilesContext(ctx context.Context, database *db.DB, files []string) (removed int, err error) {
 	if database == nil {
 		return 0, nil
