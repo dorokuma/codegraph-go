@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **`GitDirtySourceFiles` 在仓库子目录下路径错位并混入子树外脏文件（`internal/sync/git_assist.go`）**：`git status --porcelain` 输出路径相对仓库根而非 `-C` 目录，当 workdir 为 `<repoRoot>/sub` 时输出 `sub/foo.go`，旧实现直接拼到 workdir 得到 `<repoRoot>/sub/sub/foo.go`，同时把子树外的脏文件一并吞入。现先经 `git rev-parse --show-toplevel` 取仓库根、两侧 `EvalSymlinks` 对齐规范路径后，再拼接绝对路径并按被索引子树过滤。回归：`TestGitDirtySourceFilesSubdir`。
+
+### Removed
+- **清理无调用方的非 context 导出包装（`internal/extraction/noise.go`）**：移除 `ScrubNoisyFailedRefs` 与 `ScrubNoisyFailedRefsForFiles`；生产路径使用的 `ShouldParkRef`、`hasProjectSymbol` 与 `scrubNoisyFailedRefsForFilesContext` 保留不变。
+
 ## [0.9.14] - 2026-11-15
 
 ### Added

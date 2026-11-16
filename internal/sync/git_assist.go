@@ -29,6 +29,46 @@ const gitStatusTimeout = 10 * time.Second
 func GitDirtySourceFiles(workdir string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitStatusTimeout)
 	defer cancel()
+
+	// Porcelain paths are relative to the REPOSITORY ROOT, not to the -C
+	// directory: with workdir=<repoRoot>/sub, `git status` emits "sub/foo.go",
+	// so joining onto workdir would produce <repoRoot>/sub/sub/foo.go and would
+	// also swallow dirty siblings outside the indexed subtree. Resolve the
+	// toplevel first, then join + filter below.
+	rootCmd := exec.CommandContext(ctx, "git", "-C", workdir, "rev-parse", "--show-toplevel")
+	rootOut, err := rootCmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("git-assist: git rev-parse timed out after %s in %s", gitStatusTimeout, workdir)
+		} else {
+			log.Printf("git-assist: git rev-parse failed in %s: %v", workdir, err)
+		}
+		return nil
+	}
+	repoRoot := strings.TrimSpace(string(rootOut))
+	if repoRoot == "" {
+		log.Printf("git-assist: git rev-parse returned empty toplevel in %s", workdir)
+		return nil
+	}
+	if !filepath.IsAbs(repoRoot) {
+		repoRoot = filepath.Join(workdir, repoRoot)
+	}
+
+	// Align the comparison base: callers pass a canonicalized workdir
+	// (Abs+EvalSymlinks in cmd) while --show-toplevel prints the physical
+	// path. If either side still differs (uncanonicalized caller, linked
+	// checkout), EvalSymlinks both sides before the subtree test so files
+	// are not wrongly dropped — and the joined absolute path is computed
+	// against the same canonical root it is compared to.
+	canonical := func(p string) string {
+		if rp, err := filepath.EvalSymlinks(p); err == nil && rp != "" {
+			return rp
+		}
+		return filepath.Clean(p)
+	}
+	workdir = canonical(workdir)
+	repoRoot = canonical(repoRoot)
+
 	cmd := exec.CommandContext(ctx, "git", "-c", "core.quotePath=false", "-C", workdir, "status", "--porcelain", "--untracked-files=no")
 	out, err := cmd.Output()
 	if err != nil {
@@ -62,9 +102,14 @@ func GitDirtySourceFiles(workdir string) []string {
 			}
 			abs := p
 			if !filepath.IsAbs(abs) {
-				abs = filepath.Join(workdir, p)
+				abs = filepath.Join(repoRoot, p)
 			}
 			abs = filepath.Clean(abs)
+			// Porcelain output spans the whole repository; drop entries
+			// outside the indexed workdir subtree.
+			if rel, rerr := filepath.Rel(workdir, abs); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
 			if _, ok := seen[abs]; ok {
 				continue
 			}
