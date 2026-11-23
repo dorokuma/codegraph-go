@@ -6,10 +6,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ## [Unreleased]
 
 ### Fixed
+- **MCP `impact` action 透传 `depth` 参数（`internal/server/tools.go`）**：`toolImpact` 此前把 `Depth: 2` 硬编码进 `tools.ToolImpactGraph`，顶层 `args.Depth` 被丢弃；现 `nameArgs` 新增 `depth` 字段并在单一 `codegraph` action 路由中透传——未传或 `<=0` 保持默认 2 的向后兼容，上限封顶 5（与 `ToolImpactGraph` 内部钳制一致）。回归：`TestToolImpactDepth`（默认 2、depth=1/3 透传、<=0 回退）。
 - **`GitDirtySourceFiles` 在仓库子目录下路径错位并混入子树外脏文件（`internal/sync/git_assist.go`）**：`git status --porcelain` 输出路径相对仓库根而非 `-C` 目录，当 workdir 为 `<repoRoot>/sub` 时输出 `sub/foo.go`，旧实现直接拼到 workdir 得到 `<repoRoot>/sub/sub/foo.go`，同时把子树外的脏文件一并吞入。现先经 `git rev-parse --show-toplevel` 取仓库根、两侧 `EvalSymlinks` 对齐规范路径后，再拼接绝对路径并按被索引子树过滤。回归：`TestGitDirtySourceFilesSubdir`。
 
 ### Removed
 - **清理无调用方的非 context 导出包装（`internal/extraction/noise.go`）**：移除 `ScrubNoisyFailedRefs` 与 `ScrubNoisyFailedRefsForFiles`；生产路径使用的 `ShouldParkRef`、`hasProjectSymbol` 与 `scrubNoisyFailedRefsForFilesContext` 保留不变。
+- **删除遗留死代码包 `internal/search/`**：`BoundedEditDistance`/`SplitIdentifierSegments`/`FuzzyMatchScore` 及其测试在全仓无任何生产调用方（仅自包内自测），为早期移植的未接线遗留；同步移除 README.md / README.zh-CN.md 结构图中的 `internal/search/` 条目。
 
 ## [0.9.14] - 2026-11-15
 

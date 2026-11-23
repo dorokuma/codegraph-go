@@ -59,6 +59,7 @@ type nameArgs struct {
 	Path        string `json:"path,omitempty"        jsonschema:"optional subdirectory under workspace,optional"`
 	Glob        string `json:"glob,omitempty"        jsonschema:"optional file glob filter, e.g. \"*.go\",optional"`
 	MaxResults  int    `json:"max_results,omitempty" jsonschema:"cap (default 40),optional"`
+	Depth       int    `json:"depth,omitempty"       jsonschema:"impact: dependency traversal depth (default 2, max 5),optional"`
 	ProjectPath string `json:"projectPath,omitempty" jsonschema:"absolute path to the project to query (or any directory inside it) — uses the nearest .codegraph/ index at or above that path. Omit for this session's default project.,optional"`
 }
 
@@ -136,7 +137,7 @@ type codegraphArgs struct {
 	Limit        int      `json:"limit,omitempty" jsonschema:"node file mode: max lines,optional"`
 	SkipCode     *bool    `json:"skipCode,omitempty" jsonschema:"explore: omit source bodies (default true),optional"`
 	Files        []string `json:"files,omitempty" jsonschema:"affected: changed source files,optional"`
-	Depth        int      `json:"depth,omitempty" jsonschema:"affected: traversal depth,optional"`
+	Depth        int      `json:"depth,omitempty" jsonschema:"impact/affected: traversal depth (impact default 2, max 5; affected default 5),optional"`
 	Filter       string   `json:"filter,omitempty" jsonschema:"affected: test file glob,optional"`
 	MinSize      int      `json:"minSize,omitempty" jsonschema:"communities: min community size,optional"`
 	TargetFile   string   `json:"targetFile,omitempty" jsonschema:"store_fact/search_facts: target file,optional"`
@@ -282,7 +283,7 @@ func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, ar
 	case "impact":
 		return s.toolImpact(ctx, req, nameArgs{
 			Name: args.Name, File: args.File, Path: args.Path, Glob: args.Glob,
-			MaxResults: cap, ProjectPath: args.ProjectPath,
+			MaxResults: cap, Depth: args.Depth, ProjectPath: args.ProjectPath,
 		})
 	case "status":
 		return s.toolStatus(ctx, req, statusArgs{Path: args.Path, ProjectPath: args.ProjectPath})
@@ -769,7 +770,7 @@ func (s *Server) toolImpact(ctx context.Context, _ *mcp.CallToolRequest, args na
 
 	// Graph BFS first (official getImpactRadius).
 	if text, ok, err := tools.ToolImpactGraph(ctx, database, projRoot, tools.GraphQueryArgs{
-		Name: args.Name, Path: args.Path, File: args.File, Glob: args.Glob, MaxResults: args.MaxResults, Depth: 2,
+		Name: args.Name, Path: args.Path, File: args.File, Glob: args.Glob, MaxResults: args.MaxResults, Depth: args.Depth,
 	}); err != nil {
 		return nil, nil, err
 	} else if ok {

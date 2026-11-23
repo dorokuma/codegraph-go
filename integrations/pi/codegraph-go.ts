@@ -1247,7 +1247,7 @@ function registerTools(pi: ExtensionAPI, getClient: () => Promise<CodeGraphClien
 			limit: Type.Optional(Type.Number({ description: "node: max lines (cap 2000)" })),
 			skipCode: Type.Optional(Type.Boolean({ description: "explore: omit source code (default true)" })),
 			files: Type.Optional(Type.Array(Type.String(), { description: "affected: list of changed source files" })),
-			depth: Type.Optional(Type.Number({ description: "affected: max dependency traversal depth (default 5, max 10)" })),
+			depth: Type.Optional(Type.Number({ description: "impact/affected: max dependency traversal depth (impact default 2, max 5; affected default 5, max 10)" })),
 			filter: Type.Optional(Type.String({ description: "affected: custom glob to identify test files" })),
 			minSize: Type.Optional(Type.Number({ description: "communities: minimum community size (default 3)" })),
 			targetFile: Type.Optional(Type.String({ description: "store_fact/search_facts: target file path" })),

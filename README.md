@@ -191,8 +191,6 @@ codegraph-go/
 │   │                        # ripgrep integration + rg-side exclude translation
 │   ├── tools/               # explore / node / graph / affected / communities
 │   ├── sync/                # File watcher with 2s debounce
-│   ├── search/              # Identifier splitting + fuzzy scoring/edit
-│   │                        # distance helpers
 │   ├── config/              # YAML config discovery & validation
 │   ├── cgdir/               # .codegraph/ root discovery
 │   └── safelog/             # Redaction-aware logging
