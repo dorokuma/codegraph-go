@@ -5,6 +5,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-11-23
+
 ### Added
 - **巨型工作区解析内存与时延优化（19 万 nodes / 70 万 refs 规模）**：`ResolveAllContext` 改为对 pending/failed 两段 `ForEachUnresolvedRefsContext` keyset 流式处理（单页物化、游标关闭后才调回调，单连接不迭代死锁），删除 `pending+failed+retry+batch` 四个大切片；`UnresolvedRef` 结构随列表 SELECT 同批带出 `attempts` 列，`failureWriter.markFailed` 不再每 ref 一次 `UnresolvedRefAttempts` 点查；`ForEachNodeByNameResolveContext` 用 `CASE WHEN length(body)>0` 哨兵投影取代全列候选物化（`CollectCandidates` 导出 API 语义不变，MatchName 的 `Body!=""` 真值由哨兵保持）；缓存命中改为每 `resolveCacheProbeStride`（默认 4096）次命中一次真实 `NodeNameExistsContext` 探测，保留「SQL 内取消落在后续 ref」的取消面同时把 110 万次往返降到 ~270 次；`failureWriter` 队列达 `failureFlushChunk`（5 万）即分片提交并重置 queuedAbandoned 口径，取消时只回退未落盘尾部；`resolveOne` 自引用过滤先扫描再按需拷贝（不污染 `s.cand`）。`IndexAll`/`IndexAllWithProgress` 在 files==0 且无 prune/索引错误且 pending==0 时跳过 resolve+synthesis（遗留 pending 行仍触发完整重试）；daemon 新增 `TrackBackgroundWork` 计数器，仅「idle timeout」自动停机在后台索引进行中推迟至下个窗口（`Stop`/信号与 workdir 看门狗仍立即停机）；`ShouldSkipDirIn` 新增 `.wt-*` 前缀排除（`.wt-archive` 等），`BuiltinSkipGlobs` 同步 `.wt-*` glob；`pruneMissingFiles` 尾部追加两条 `..` 形态孤儿行定向清退 DELETE（逐条经 `o.interrupted()` 检查）；`IndexChanges` 对含 `..` 的 store key 防御性跳过；`noisyRefNames` 增补 Go 内建高频调用名（panic/recover/Fatal*/Errorf/Sprintf/Printf/Fprint* 等，用户可自定义名不列入）。回归：`TestDaemonIdleDefersDuringBackgroundWork`、`TestResolveScopeCachesCandidates`、`TestResolutionCancellationPreservesPendingRefs`、`TestCancelledFlushDropsQueuedMarks`、`TestFailureWriterBatchesMarks`、`TestFileDeletionStopsBetweenTransactions`。
 
@@ -19,6 +21,9 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 ### Removed
 - **清理无调用方的非 context 导出包装（`internal/extraction/noise.go`）**：移除 `ScrubNoisyFailedRefs` 与 `ScrubNoisyFailedRefsForFiles`；生产路径使用的 `ShouldParkRef`、`hasProjectSymbol` 与 `scrubNoisyFailedRefsForFilesContext` 保留不变。
 - **删除遗留死代码包 `internal/search/`**：`BoundedEditDistance`/`SplitIdentifierSegments`/`FuzzyMatchScore` 及其测试在全仓无任何生产调用方（仅自包内自测），为早期移植的未接线遗留；同步移除 README.md / README.zh-CN.md 结构图中的 `internal/search/` 条目。
+
+### Changed
+- Display / daemon wire version **0.9.15**。
 
 ## [0.9.14] - 2026-11-15
 
