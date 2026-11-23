@@ -1,8 +1,119 @@
 package db
 
 import (
+	"strings"
 	"testing"
 )
+
+// TestEdgesKindFileIndexPresent verifies the composite (kind,file) index
+// exists on a fresh schema AND is created by ensureSchema on a pre-existing
+// database that lacks it (the GetImportTargetNames lookups filter
+// kind='imports' AND file=?; kind-only indexing scanned every imports edge).
+func TestEdgesKindFileIndexPresent(t *testing.T) {
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cols, err := database.indexColumns("idx_edges_kind_file")
+	if err != nil {
+		t.Fatalf("probe idx_edges_kind_file: %v", err)
+	}
+	if len(cols) != 2 || cols[0] != "kind" || cols[1] != "file" {
+		t.Fatalf("idx_edges_kind_file columns = %v, want [kind file]", cols)
+	}
+
+	// Now drop it and re-run the migration path — it must come back.
+	if _, err := database.conn.Exec(`DROP INDEX idx_edges_kind_file`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ensureSchema(); err != nil {
+		t.Fatal(err)
+	}
+	cols, err = database.indexColumns("idx_edges_kind_file")
+	if err != nil || len(cols) != 2 {
+		t.Fatalf("idx_edges_kind_file after ensureSchema: cols=%v err=%v", cols, err)
+	}
+}
+
+// TestGetImportTargetNamesUsesKindFileIndex pins the query plan: the
+// kind='imports' AND file=? lookup must SEARCH edges via idx_edges_kind_file
+// instead of scanning the kind-only index bucket (~all imports edges).
+func TestGetImportTargetNamesUsesKindFileIndex(t *testing.T) {
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	src, err := database.UpsertNode(&Node{Kind: KindFile, Name: "a.go", File: "a.go", Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := database.UpsertNode(&Node{Kind: "module", Name: "fmt", File: "fmt", Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.UpsertEdge(&Edge{SourceID: src, TargetID: dst, Kind: "imports", File: "a.go", Line: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := database.conn.Query(`EXPLAIN QUERY PLAN
+		SELECT DISTINCT n.name
+		FROM edges e
+		JOIN nodes n ON n.id = e.target_id
+		WHERE e.kind = 'imports' AND e.file = ?`, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want := "idx_edges_kind_file"; !strings.Contains(plan, want) {
+		t.Fatalf("query plan does not use %s:\n%s", want, plan)
+	}
+	if strings.Contains(plan, "SCAN e USING INDEX idx_edges_kind") {
+		t.Fatalf("query plan still scans the kind-only index:\n%s", plan)
+	}
+}
+
+// TestEdgesKindFileIndexOnOldDB creates a DB whose edges table lacks the
+// composite index (simulating an old on-disk index), closes it, re-opens,
+// and checks ensureSchema installed idx_edges_kind_file.
+func TestEdgesKindFileIndexOnOldDB(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.conn.Exec(`DROP INDEX IF EXISTS idx_edges_kind_file`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err = Open(dir)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	defer database.Close()
+	cols, err := database.indexColumns("idx_edges_kind_file")
+	if err != nil || len(cols) != 2 {
+		t.Fatalf("idx_edges_kind_file after re-open: cols=%v err=%v", cols, err)
+	}
+}
 
 // TestPromoteEdgesNewFailureRetry verifies S3: when the promotion transaction
 // fails after the RENAME (an index-creation statement errors), the rollback

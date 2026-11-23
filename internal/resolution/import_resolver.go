@@ -252,10 +252,31 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 	return filterByImportsContext(context.Background(), database, workdir, fromFile, lang, candidates)
 }
 
+// importClosure is one source file's import-closure view: the spec names on
+// its import edges plus the index file keys those specs resolve to on disk.
+// Both are candidate-independent, which is what resolveScope caches per file
+// per pass — the specMatchesFile seeding stays per-call (see below).
+type importClosure struct {
+	specs []string
+	files map[string]bool // nil/empty → no import info, caller keeps candidates
+}
+
 func filterByImportsContext(ctx context.Context, database *db.DB, workdir, fromFile, lang string, candidates []db.Node) ([]db.Node, bool) {
 	if len(candidates) == 0 {
 		return nil, false
 	}
+	closure, err := loadImportClosureContext(ctx, database, workdir, fromFile, lang)
+	if err != nil {
+		return candidates, false
+	}
+	return filterByImportedFiles(ctx, workdir, closure, candidates)
+}
+
+// loadImportClosureContext reads the import spec names on fromFile's import
+// edges and resolves them to index file keys — the DB query plus every
+// os.Stat inside ResolveImportPath. This is the expensive half of import
+// filtering and the piece resolveScope memoizes per (file, lang) per pass.
+func loadImportClosureContext(ctx context.Context, database *db.DB, workdir, fromFile, lang string) (*importClosure, error) {
 	// Import edges are keyed by the same storage path as nodes (relative preferred).
 	storeFrom := db.StoragePath(workdir, fromFile)
 	specs, err := database.GetImportTargetNamesContext(ctx, storeFrom)
@@ -265,18 +286,45 @@ func filterByImportsContext(ctx context.Context, database *db.DB, workdir, fromF
 			specs, err = database.GetImportTargetNamesContext(ctx, fromFile)
 		}
 		if err != nil || len(specs) == 0 {
-			return candidates, false
+			if err != nil {
+				return nil, err
+			}
+			return &importClosure{files: map[string]bool{}}, nil
 		}
 	}
-	importedFiles := map[string]bool{}
+	files := map[string]bool{}
 	for _, spec := range specs {
-		if ctx.Err() != nil {
-			return nil, false
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		for _, p := range ResolveImportPath(workdir, fromFile, spec, lang) {
 			// Index keys are workdir-relative; ResolveImportPath returns abs paths.
-			importedFiles[db.StoragePath(workdir, p)] = true
-			importedFiles[filepath.ToSlash(filepath.Clean(p))] = true
+			files[db.StoragePath(workdir, p)] = true
+			files[filepath.ToSlash(filepath.Clean(p))] = true
+		}
+	}
+	return &importClosure{specs: specs, files: files}, nil
+}
+
+// filterByImportedFiles applies one file's import closure to this call's
+// candidate list — the per-call half of filterByImportsContext. The
+// spec→file seeding (specMatchesFile over THESE candidates) lives here, not
+// in the cached closure, because the candidate set differs between calls.
+// Returns (filtered, true) when import closure yields a non-empty subset.
+func filterByImportedFiles(ctx context.Context, workdir string, closure *importClosure, candidates []db.Node) ([]db.Node, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	if closure == nil || len(closure.specs) == 0 {
+		return candidates, false
+	}
+	importedFiles := map[string]bool{}
+	for k := range closure.files {
+		importedFiles[k] = true
+	}
+	for _, spec := range closure.specs {
+		if ctx.Err() != nil {
+			return nil, false
 		}
 		// Also accept candidates whose file path contains spec as a complete
 		// path segment (boundary-aware, avoids short name over-matching).

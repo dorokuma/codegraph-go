@@ -241,3 +241,90 @@ func TestMarkUnresolvedFailedAttemptsAbandon(t *testing.T) {
 		t.Fatalf("missing row: abandoned=%v err=%v", abandoned, err)
 	}
 }
+
+// TestApplyUnresolvedFailedBatchSemantics verifies the batched failure
+// update applies the same per-row semantics as MarkUnresolvedFailed —
+// attempts increment, status flips to failed then abandoned at the cap —
+// inside ONE transaction, and reports per-row abandoned flags in input
+// order. This is the write path resolution's failureWriter uses.
+func TestApplyUnresolvedFailedBatchSemantics(t *testing.T) {
+	dir := t.TempDir()
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { database.Close(); os.RemoveAll(dir) }()
+
+	fromID, err := database.UpsertNode(&Node{Kind: KindFunction, Name: "caller", File: "a.go", Line: 1, Language: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, 3)
+	for i, name := range []string{"one", "two", "three"} {
+		ids[i], err = database.InsertUnresolvedRef(&UnresolvedRef{
+			FromNode:      fromID,
+			ReferenceName: name,
+			ReferenceKind: EdgeCalls,
+			Line:          10 + i,
+			FilePath:      "a.go",
+			Language:      "go",
+			Status:        "pending",
+			NameTail:      name,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	refs := []UnresolvedFailedRef{
+		{ID: ids[0], NameTail: "one"},
+		{ID: ids[1], NameTail: "two"},
+		{ID: ids[2], NameTail: "three"},
+	}
+	// Batch 1 with cap 2: all marked failed, none abandoned.
+	abandoned, err := database.ApplyUnresolvedFailed(refs, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(abandoned) != 3 || abandoned[0] || abandoned[1] || abandoned[2] {
+		t.Fatalf("batch 1 abandoned flags = %v, want all false", abandoned)
+	}
+	for i, id := range ids {
+		attempts, err := database.UnresolvedRefAttempts(id)
+		if err != nil || attempts != 1 {
+			t.Fatalf("id %d attempts=%d err=%v, want 1", i, attempts, err)
+		}
+	}
+	if n, _ := database.CountUnresolvedRefs("failed"); n != 3 {
+		t.Fatalf("failed count=%d, want 3", n)
+	}
+
+	// Batch 2 reaches the cap: all flip to abandoned, flags in input order.
+	abandoned, err = database.ApplyUnresolvedFailed(refs, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, a := range abandoned {
+		if !a {
+			t.Fatalf("batch 2 abandoned[%d] = false, want true", i)
+		}
+	}
+	if n, _ := database.CountUnresolvedRefs("abandoned"); n != 3 {
+		t.Fatalf("abandoned count=%d, want 3", n)
+	}
+
+	// Mixed batch: a missing row is a tolerated no-op reporting false,
+	// matching MarkUnresolvedFailed.
+	if err := database.DeleteUnresolvedRef(ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	abandoned, err = database.ApplyUnresolvedFailed([]UnresolvedFailedRef{{ID: ids[0], NameTail: "gone"}}, 5)
+	if err != nil || len(abandoned) != 1 || abandoned[0] {
+		t.Fatalf("missing row: abandoned=%v err=%v, want [false] nil", abandoned, err)
+	}
+
+	// Empty batch is a no-op.
+	if abandoned, err := database.ApplyUnresolvedFailed(nil, 5); err != nil || len(abandoned) != 0 {
+		t.Fatalf("empty batch: abandoned=%v err=%v", abandoned, err)
+	}
+}

@@ -20,25 +20,8 @@ func (d *DB) UpsertNode(n *Node) (int64, error) {
 	if n.IsExported {
 		exported = 1
 	}
-	_, err := d.conn.Exec(`
-		INSERT INTO nodes (
-			kind, name, file, line, end_line, body, language,
-			qualified_name, signature, docstring,
-			start_column, end_column, visibility, is_exported, return_type
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(file, line, kind, name) DO UPDATE SET
-			end_line = excluded.end_line,
-			body = excluded.body,
-			language = excluded.language,
-			qualified_name = excluded.qualified_name,
-			signature = excluded.signature,
-			docstring = excluded.docstring,
-			start_column = excluded.start_column,
-			end_column = excluded.end_column,
-			visibility = excluded.visibility,
-			is_exported = excluded.is_exported,
-			return_type = excluded.return_type
-	`, n.Kind, n.Name, n.File, n.Line, n.EndLine, body, n.Language,
+	_, err := d.conn.Exec(upsertNodeSQL,
+		n.Kind, n.Name, n.File, n.Line, n.EndLine, body, n.Language,
 		n.QualifiedName, n.Signature, n.Docstring,
 		nullInt(n.StartColumn), nullInt(n.EndColumn), n.Visibility, exported, n.ReturnType)
 	if err != nil {
@@ -52,6 +35,124 @@ func (d *DB) UpsertNode(n *Node) (int64, error) {
 		return 0, fmt.Errorf("upsert node id lookup: %w", err)
 	}
 	return id, nil
+}
+
+// upsertNodeSQL is the shared nodes upsert statement (UpsertNode and the
+// UpsertNodes batch below run the identical conflict/merge clause).
+const upsertNodeSQL = `
+	INSERT INTO nodes (
+		kind, name, file, line, end_line, body, language,
+		qualified_name, signature, docstring,
+		start_column, end_column, visibility, is_exported, return_type
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(file, line, kind, name) DO UPDATE SET
+		end_line = excluded.end_line,
+		body = excluded.body,
+		language = excluded.language,
+		qualified_name = excluded.qualified_name,
+		signature = excluded.signature,
+		docstring = excluded.docstring,
+		start_column = excluded.start_column,
+		end_column = excluded.end_column,
+		visibility = excluded.visibility,
+		is_exported = excluded.is_exported,
+		return_type = excluded.return_type
+`
+
+// UpsertNodes inserts or updates a batch of nodes inside ONE transaction,
+// returning each row's real id in input order. It runs the exact same upsert
+// statement and id-lookup as UpsertNode per node; the only difference is the
+// commits are collapsed to one. Batch callers (index rebuilds, large test
+// fixtures) used to drive thousands of UpsertNode autocommit transactions —
+// each commit an fsync under synchronous=FULL — which made 10k-node fixtures
+// take minutes. One transaction amortizes that to a single commit. On any
+// error the whole batch rolls back (same atomicity contract as
+// ApplyResolvedRefs / ParkInboundRefsForFile).
+func (d *DB) UpsertNodes(nodes []*Node) ([]int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("upsert nodes begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// RETURNING id folds the old INSERT-then-SELECT round trip into one
+	// statement per row (same pattern ReplaceFileIndex uses; SQLite 3.35+).
+	ins, err := tx.Prepare(upsertNodeSQL + `
+		RETURNING id`)
+	if err != nil {
+		return nil, fmt.Errorf("upsert nodes prepare: %w", err)
+	}
+	defer ins.Close()
+
+	ids := make([]int64, len(nodes))
+	for i, n := range nodes {
+		body := TruncateBody(n.Body)
+		exported := 0
+		if n.IsExported {
+			exported = 1
+		}
+		if err := ins.QueryRow(n.Kind, n.Name, n.File, n.Line, n.EndLine, body, n.Language,
+			n.QualifiedName, n.Signature, n.Docstring,
+			nullInt(n.StartColumn), nullInt(n.EndColumn), n.Visibility, exported, n.ReturnType).Scan(&ids[i]); err != nil {
+			return nil, fmt.Errorf("upsert node %d (%s:%d): %w", i, n.File, n.Line, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("upsert nodes commit: %w", err)
+	}
+	return ids, nil
+}
+
+// nodesFTSTriggers are the three AFTER triggers that keep nodes_fts in sync
+// with nodes writes. DisableNodesFTSForTest drops them; EnableNodesFTSForTest
+// recreates them exactly as schema.sql declares.
+var nodesFTSTriggers = []string{
+	`CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+		INSERT INTO nodes_fts(rowid, name, body, language) VALUES (new.id, new.name, new.body, new.language);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+		INSERT INTO nodes_fts(nodes_fts, rowid, name, body, language) VALUES('delete', old.id, old.name, old.body, old.language);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+		INSERT INTO nodes_fts(nodes_fts, rowid, name, body, language) VALUES('delete', old.id, old.name, old.body, old.language);
+		INSERT INTO nodes_fts(rowid, name, body, language) VALUES (new.id, new.name, new.body, new.language);
+	END`,
+}
+
+// DisableNodesFTSForTest drops the nodes_fts sync triggers so a large test
+// fixture can insert nodes without paying the per-row FTS5 shadow-table
+// maintenance (the dominant cost of a 10k-node fixture on a slow-fsync
+// host). nodes_fts is left stale: this is only for tests that never run a
+// full-text search on the fixture. Pair with EnableNodesFTSForTest.
+func (d *DB) DisableNodesFTSForTest() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, trg := range []string{"nodes_ai", "nodes_ad", "nodes_au"} {
+		if _, err := d.conn.Exec(`DROP TRIGGER IF EXISTS ` + trg); err != nil {
+			return fmt.Errorf("disable fts trigger %s: %w", trg, err)
+		}
+	}
+	return nil
+}
+
+// EnableNodesFTSForTest recreates the nodes_fts sync triggers dropped by
+// DisableNodesFTSForTest. It does NOT backfill nodes_fts — tests that need a
+// consistent FTS index must rebuild it explicitly.
+func (d *DB) EnableNodesFTSForTest() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, ddl := range nodesFTSTriggers {
+		if _, err := d.conn.Exec(ddl); err != nil {
+			return fmt.Errorf("enable fts trigger: %w", err)
+		}
+	}
+	return nil
 }
 
 // nullInt stores 0 columns as NULL so "unset" stays distinguishable later if needed.
@@ -326,6 +427,90 @@ func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(
 		}
 	}
 	return nil
+}
+
+// ForEachNodeByNameLightContext iterates nodes matching name using the
+// light column set (body omitted) and keyset pagination. The filter
+// predicate is applied per row before emit: rows it rejects are skipped
+// entirely — cheap for callers that only need some candidate kinds (the
+// resolution retry filter streams thousands of failed refs' name lookups
+// without materializing bodies for rows resolution would reject anyway).
+// Cancellation and emit errors propagate like ForEachNodeByNameContext.
+func (d *DB) ForEachNodeByNameLightContext(ctx context.Context, name string, filter func(Node) bool, emit func(Node) error) error {
+	if name == "" {
+		return nil
+	}
+	const batchSize = 1000
+	var lastID int64
+	for {
+		nodes, err := func() ([]Node, error) {
+			d.mu.RLock()
+			defer d.mu.RUnlock()
+			rows, err := d.conn.QueryContext(ctx, `
+				SELECT `+nodeLightSelectCols+`
+				FROM nodes WHERE name = ? AND id > ?
+				ORDER BY id LIMIT ?
+			`, name, lastID, batchSize)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			return scanNodes(rows)
+		}()
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			lastID = n.ID
+			if !filter(n) {
+				continue
+			}
+			if err := emit(n); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(nodes) < batchSize {
+			break
+		}
+	}
+	return nil
+}
+
+// NodeNameExistsContext reports whether any node carries this name — a
+// one-row probe through idx_nodes_name. Resolution's per-pass candidate
+// cache runs it on every cache hit so each ref still performs a real SQL
+// read (keeping the un-cached path's cancellation surface: a cancellation
+// fired inside node SQL lands on the NEXT ref, never on a value replayed
+// out of the in-memory cache). The probe intentionally selects body (not
+// just an index column): cancellation hooks in tests wrap the body
+// projection, and the production query plan is equally cheap either way.
+func (d *DB) NodeNameExistsContext(ctx context.Context, name string) (bool, error) {
+	if name == "" {
+		return false, nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	// body is a nullable column: a NULL-scannable target keeps the probe
+	// working on rows inserted without a body (e.g. old/index-lite rows).
+	var body sql.NullString
+	err := d.conn.QueryRowContext(ctx,
+		`SELECT body FROM nodes WHERE name = ? LIMIT 1`, name).Scan(&body)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetNodeByID loads one node by primary key.

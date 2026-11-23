@@ -1666,6 +1666,35 @@ func TestFullTextSearchRefsSkipsBody(t *testing.T) {
 	}
 }
 
+// TestNodeNameExistsContextNullBody: nodes.body is a nullable column — rows
+// inserted without a body (e.g. by collectors that only record
+// kind/name/file/line) carry NULL. The existence probe must still report
+// (true, nil): scanning NULL into a plain string used to fail with
+// "converting NULL to string is unsupported", breaking resolution's
+// cached-candidate hit path.
+func TestNodeNameExistsContextNullBody(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert a node row with body IS NULL, bypassing UpsertNode (which
+	// always binds a string). Column list mirrors the full nodes schema.
+	if _, err := database.conn.Exec(`INSERT INTO nodes (
+		kind, name, file, line, end_line, body, language,
+		qualified_name, signature, docstring,
+		start_column, end_column, visibility, is_exported, return_type
+	) VALUES ('function', 'NullBody', 'a.go', 1, NULL, NULL, 'go', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL)`); err != nil {
+		t.Fatalf("insert null-body node: %v", err)
+	}
+
+	exists, err := database.NodeNameExistsContext(context.Background(), "NullBody")
+	if err != nil {
+		t.Fatalf("NodeNameExistsContext on NULL body: %v", err)
+	}
+	if !exists {
+		t.Fatal("NodeNameExistsContext must report the NULL-body row as existing")
+	}
+}
+
 // TestListFilesInDirDirectChildrenOnly: only files directly in dir are
 // returned — nested paths are excluded (in SQL, so the LIMIT counts direct
 // children, not the whole subtree).

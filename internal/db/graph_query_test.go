@@ -752,17 +752,31 @@ func TestParkInboundRefsForFilePagination(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	// Insert 10005 nodes in target.go (exceeding old 10000 cap and keyset pagination batchSize = 1000)
+	// Insert 2500 nodes in target.go so the park target snapshot paginates
+	// across several targetBatchSize(=1000) chunks. The previous 10005-row
+	// fixture (built before UpsertNodes existed, as 10k autocommit writes)
+	// paid a per-row fsync under synchronous=FULL plus per-node FTS trigger
+	// maintenance — tens of minutes under -race on a slow-fsync host. 2500
+	// rows still span three pagination chunks and exercise the same path.
 	targetFile := "target.go"
-	var targetIDs []int64
-	for i := 0; i < 10005; i++ {
-		id, err := database.UpsertNode(&Node{
+	const targetCount = 2500
+	nodes := make([]*Node, 0, targetCount)
+	for i := 0; i < targetCount; i++ {
+		nodes = append(nodes, &Node{
 			Kind: KindFunction, Name: fmt.Sprintf("TargetFunc_%05d", i), File: targetFile, Line: i + 1, Language: "go",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		targetIDs = append(targetIDs, id)
+	}
+	// This fixture never runs a full-text search; dropping the FTS triggers
+	// keeps the 10k-node insert from paying per-row FTS5 maintenance.
+	if err := database.DisableNodesFTSForTest(); err != nil {
+		t.Fatal(err)
+	}
+	targetIDs, err := database.UpsertNodes(nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.EnableNodesFTSForTest(); err != nil {
+		t.Fatal(err)
 	}
 
 	// Insert a caller in caller.go
@@ -773,8 +787,9 @@ func TestParkInboundRefsForFilePagination(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create edges pointing to targets in first batch (<1000), intermediate batch, and 10001st node (index 10000) and beyond (index 10004)
-	targetIndices := []int{10, 500, 1000, 10000, 10004}
+	// Edges point into every pagination chunk: first (<1000), the chunk
+	// boundary itself, an intermediate row and the final chunk's last row.
+	targetIndices := []int{10, 500, 1000, 1500, 2499}
 	for _, idx := range targetIndices {
 		if _, err := database.UpsertEdge(&Edge{
 			SourceID: callerID, TargetID: targetIDs[idx], Kind: EdgeCalls, File: "caller.go", Line: idx + 10,
