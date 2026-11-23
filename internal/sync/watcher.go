@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/extraction"
 
 	"github.com/fsnotify/fsnotify"
@@ -511,8 +512,15 @@ func (w *Watcher) processPending() {
 		return
 	}
 
-	// Reindex changed files.
-	fileCount, nodeCount, err := w.orchestrator.IndexChanges(existing)
+	// Reindex changed files. Track as daemon-visible background work so the
+	// autonomous idle timer defers an in-flight pass instead of cancelling
+	// it mid-flight (explicit Stop / workdir watchdog still cut promptly).
+	var fileCount, nodeCount int
+	var err error
+	func() {
+		defer daemon.TrackBackgroundWork()()
+		fileCount, nodeCount, err = w.orchestrator.IndexChanges(existing)
+	}()
 	if err != nil {
 		if errors.Is(err, extraction.ErrIndexInterrupted) {
 			return // shutting down; do not requeue

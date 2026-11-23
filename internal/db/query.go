@@ -104,6 +104,11 @@ type UnresolvedRef struct {
 	Status        string // pending | failed
 	NameTail      string
 	Candidates    string // JSON array
+	// Attempts is the row's pre-write failed-attempt count, selected alongside
+	// the other columns so resolution's failureWriter can predict abandonment
+	// without a per-ref UnresolvedRefAttempts point query. Inserts that bypass
+	// the list SELECTs (e.g. test-built refs) leave it 0, matching a fresh row.
+	Attempts int
 }
 
 // UpsertNode inserts or updates a node. Returns the real row ID.

@@ -1,7 +1,11 @@
 package extraction
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/dorokuma/codegraph-go/internal/db"
 )
 
 func TestSplitRustUsePaths(t *testing.T) {
@@ -90,6 +94,100 @@ func TestSplitNameLineKey(t *testing.T) {
 			t.Errorf("splitNameLineKey(%q) = (%q, %d, %v), want (%q, %d, %v)",
 				tt.key, name, line, ok, tt.wantName, tt.wantLine, tt.wantOk)
 		}
+	}
+}
+
+// TestHasParentDirSegment verifies the exact ".." path-segment check used by
+// IndexChanges' storeKeys filter: legitimate double-dot file names must pass
+// while out-of-workdir segment shapes are intercepted.
+func TestHasParentDirSegment(t *testing.T) {
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{"..", true},
+		{"../outside.go", true},
+		{"pkg/../gone.go", true},
+		{"pkg/..", true},
+		{"a..b.go", false},
+		{"v1..v2_test.go", false},
+		{"pkg/a..b.go", false},
+		{"normal.go", false},
+		{"pkg/sub/file.go", false},
+		{".", false},
+		{"pkg/.hidden.go", false},
+	}
+	for _, tt := range tests {
+		if got := hasParentDirSegment(tt.key); got != tt.want {
+			t.Errorf("hasParentDirSegment(%q) = %v, want %v", tt.key, got, tt.want)
+		}
+	}
+}
+
+// TestIndexChangesDoubleDotFileName is the regression for the substring
+// ".." filter that dropped every storeKey containing two dots: a legal
+// file named a..b.go must be indexed, while an explicit out-of-workdir
+// path is still intercepted by the exact-segment check.
+func TestIndexChangesDoubleDotFileName(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	doubleDot := filepath.Join(root, "a..b.go")
+	if err := os.WriteFile(doubleDot, []byte("package p\nfunc DoubleDot() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := NewOrchestrator(database, root)
+	if _, _, err := orch.IndexChanges([]string{doubleDot}); err != nil {
+		t.Fatalf("IndexChanges a..b.go: %v", err)
+	}
+	files, err := database.ListFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, f := range files {
+		if f == "a..b.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a..b.go must be indexed, files=%v", files)
+	}
+	if nodes, _ := database.GetNodeByName("DoubleDot"); len(nodes) == 0 {
+		t.Fatal("a..b.go's DoubleDot node should be indexed")
+	}
+
+	// Bad ".."-segment keys that reach the DB by other means (old writers,
+	// manual inserts) are cleaned by pruneMissingFiles' tail statements —
+	// including the files table, which the keep-set pass alone can never
+	// remove (a "../x" path never appears in the walk job list). Seed rows
+	// in all three tables and confirm the tail cleanup drops every shape,
+	// including a key ENDING in "/.." which the earlier patterns missed.
+	for _, badKey := range []string{"../escape.go", "pkg/../gone.go", "pkg/..", ".."} {
+		if err := database.UpsertFile(badKey, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruned, err := orch.pruneMissingFiles(nil)
+	if err != nil {
+		t.Fatalf("pruneMissingFiles: %v", err)
+	}
+	files, err = database.ListFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if hasParentDirSegment(f) {
+			t.Fatalf("..-segment files row survived prune: %v", files)
+		}
+	}
+	if pruned == 0 {
+		t.Fatal("pruneMissingFiles reported 0 pruned rows for seeded bad keys")
 	}
 }
 

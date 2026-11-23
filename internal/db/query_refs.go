@@ -276,7 +276,7 @@ func (d *DB) ListUnresolvedRefsContext(ctx context.Context, filePath, status str
 	defer d.mu.RUnlock()
 
 	q := `SELECT id, from_node, reference_name, reference_kind, line, col,
-		file_path, language, status, name_tail, COALESCE(candidates,'')
+		file_path, language, status, name_tail, COALESCE(candidates,''), attempts
 		FROM unresolved_refs WHERE 1=1`
 	var args []interface{}
 	if filePath != "" {
@@ -299,7 +299,7 @@ func (d *DB) ListUnresolvedRefsContext(ctx context.Context, filePath, status str
 		}
 		var r UnresolvedRef
 		if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
-			&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+			&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates, &r.Attempts); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -331,7 +331,7 @@ func (d *DB) ListUnresolvedRefsByFilesContext(ctx context.Context, files []strin
 
 	const maxFilesPerChunk = 400 // 1 IN list x 400 + 1 status arg stays under SQLite's 999-var cap
 	selectCols := `SELECT id, from_node, reference_name, reference_kind, line, col,
-		file_path, language, status, name_tail, COALESCE(candidates,'')
+		file_path, language, status, name_tail, COALESCE(candidates,''), attempts
 		FROM unresolved_refs WHERE file_path IN (`
 
 	var out []UnresolvedRef
@@ -366,7 +366,7 @@ func (d *DB) ListUnresolvedRefsByFilesContext(ctx context.Context, files []strin
 			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
-				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates, &r.Attempts); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -405,7 +405,7 @@ func (d *DB) ListUnresolvedRefsByNamesContext(ctx context.Context, names []strin
 
 	const maxNamesPerChunk = 400 // 2 IN lists x 400 + 1 status arg stays under SQLite's 999-var cap
 	selectCols := `SELECT id, from_node, reference_name, reference_kind, line, col,
-		file_path, language, status, name_tail, COALESCE(candidates,'')
+		file_path, language, status, name_tail, COALESCE(candidates,''), attempts
 		FROM unresolved_refs`
 
 	run := func(where string, args []interface{}) ([]UnresolvedRef, error) {
@@ -422,7 +422,7 @@ func (d *DB) ListUnresolvedRefsByNamesContext(ctx context.Context, names []strin
 			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
-				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates, &r.Attempts); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
@@ -535,7 +535,7 @@ func (d *DB) ListUnresolvedRefsEmptyTailContext(ctx context.Context, statuses []
 		}
 		rows, err := d.conn.QueryContext(ctx, `
 			SELECT id, from_node, reference_name, reference_kind, line, col,
-				file_path, language, status, name_tail, COALESCE(candidates,'')
+				file_path, language, status, name_tail, COALESCE(candidates,''), attempts
 			FROM unresolved_refs WHERE `+prefix+`name_tail = ''`, statusArgs...)
 		if err != nil {
 			return nil, err
@@ -547,7 +547,7 @@ func (d *DB) ListUnresolvedRefsEmptyTailContext(ctx context.Context, statuses []
 			}
 			var r UnresolvedRef
 			if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
-				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates); err != nil {
+				&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates, &r.Attempts); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -567,6 +567,79 @@ func (d *DB) ListUnresolvedRefsEmptyTailContext(ctx context.Context, statuses []
 }
 
 // GetEdgeByEndpoints loads one edge by endpoints + kind (for tests / inspection).
+
+// ForEachUnresolvedRefsContext streams unresolved_refs rows in keyset pages
+// (id > lastID ORDER BY id LIMIT 10000) instead of materializing a
+// multi-hundred-thousand-row []UnresolvedRef — ResolveAllContext walks a huge
+// pending/failed backlog through it without holding the whole table in
+// memory. Each page is fully scanned into a local slice and the cursor is
+// closed BEFORE fn is invoked: the pool is single-connection
+// (MaxOpenConns(1)), so calling fn while a *sql.Rows is still open would
+// deadlock the moment the callback runs its own SQL (e.g. the candidate
+// probe or a batched-write flush inside resolution).
+func (d *DB) ForEachUnresolvedRefsContext(ctx context.Context, filePath, status string, fn func(UnresolvedRef) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	const pageSize = 10000
+	var lastID int64
+	for {
+		page, err := func() ([]UnresolvedRef, error) {
+			d.mu.RLock()
+			defer d.mu.RUnlock()
+			q := `SELECT id, from_node, reference_name, reference_kind, line, col,
+				file_path, language, status, name_tail, COALESCE(candidates,''), attempts
+				FROM unresolved_refs WHERE id > ?`
+			args := []interface{}{lastID}
+			if filePath != "" {
+				q += ` AND file_path = ?`
+				args = append(args, filePath)
+			}
+			if status != "" {
+				q += ` AND status = ?`
+				args = append(args, status)
+			}
+			q += ` ORDER BY id LIMIT ?`
+			args = append(args, pageSize)
+			rows, err := d.conn.QueryContext(ctx, q, args...)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var out []UnresolvedRef
+			for rows.Next() {
+				var r UnresolvedRef
+				if err := rows.Scan(&r.ID, &r.FromNode, &r.ReferenceName, &r.ReferenceKind,
+					&r.Line, &r.Col, &r.FilePath, &r.Language, &r.Status, &r.NameTail, &r.Candidates, &r.Attempts); err != nil {
+					return nil, err
+				}
+				out = append(out, r)
+			}
+			return out, rows.Err()
+		}()
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, r := range page {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(r); err != nil {
+				return err
+			}
+			lastID = r.ID
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(page) < pageSize {
+			return nil
+		}
+	}
+}
 
 // UnresolvedRefAttempts reads the attempts counter of one unresolved_refs
 // row. attempts is not part of the UnresolvedRef list results (list callers
@@ -589,6 +662,20 @@ func (d *DB) DeleteUnresolvedRef(id int64) error {
 	defer d.mu.Unlock()
 	_, err := d.conn.Exec(`DELETE FROM unresolved_refs WHERE id = ?`, id)
 	return err
+}
+
+// ExecContext runs a raw write statement under the write lock with context
+// cancellation. Reserved for statements too rare to deserve a dedicated
+// API (e.g. pruning orphan rows whose storage keys can never be produced
+// by the current writer paths).
+func (d *DB) ExecContext(ctx context.Context, q string, args ...interface{}) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.conn.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ResolvedRef is one resolved unresolved_ref awaiting persistence: the edge
@@ -700,23 +787,64 @@ func (d *DB) ApplyUnresolvedFailed(refs []UnresolvedFailedRef, maxAttempts int) 
 	}
 	defer tx.Rollback()
 
-	for i, r := range refs {
-		var status string
-		err := tx.QueryRow(`
-			UPDATE unresolved_refs SET
-				attempts = attempts + 1,
-				status = CASE WHEN attempts + 1 >= ? THEN 'abandoned' ELSE 'failed' END,
-				name_tail = ?
-			WHERE id = ?
-			RETURNING status
-		`, maxAttempts, r.NameTail, r.ID).Scan(&status)
-		if err == sql.ErrNoRows {
-			continue
+	// One set-based UPDATE per ~900-var sub-chunk instead of one UPDATE per
+	// row: a 550k-failure backlog used to run half a million statements
+	// (~2-3 min); the VALUES-join form runs ~600 statements total with the
+	// same attempts+1 / cap-park / tail-backfill semantics. The VALUES
+	// table-value form replaces a 450-term `SELECT ... UNION ALL SELECT ...`
+	// compound: the latter built a 450-level compound-SELECT AST on every
+	// chunk (parse/optimize cost scaling with depth), while VALUES is a
+	// flat row list. RETURNING lists (id, status) for every row actually
+	// updated, so rows whose ref vanished mid-pass map back to the same
+	// per-ref result indexes.
+	const varsPerRow = 2 // (id, tail) pairs bound per VALUES row
+	const maxVars = 900  // stay under SQLite's 999-variable cap
+	const chunkSize = maxVars / varsPerRow
+	for start := 0; start < len(refs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(refs) {
+			end = len(refs)
 		}
+		sub := refs[start:end]
+		idx := make(map[int64]int, len(sub))
+		for i := start; i < end; i++ {
+			idx[refs[i].ID] = i
+		}
+		var sb strings.Builder
+		sb.WriteString(`UPDATE unresolved_refs SET
+			attempts = attempts + 1,
+			status = CASE WHEN attempts + 1 >= ? THEN 'abandoned' ELSE 'failed' END,
+			name_tail = v.column2
+			FROM (VALUES (?, ?)`)
+		args := make([]interface{}, 0, 1+len(sub)*2)
+		args = append(args, maxAttempts, sub[0].ID, sub[0].NameTail)
+		for _, r := range sub[1:] {
+			sb.WriteString(`, (?, ?)`)
+			args = append(args, r.ID, r.NameTail)
+		}
+		sb.WriteString(`) AS v WHERE unresolved_refs.id = v.column1 RETURNING unresolved_refs.id, unresolved_refs.status`)
+		rows, err := tx.Query(sb.String(), args...)
 		if err != nil {
 			return nil, fmt.Errorf("mark unresolved_ref failed: %w", err)
 		}
-		abandoned[i] = status == "abandoned"
+		for rows.Next() {
+			var id int64
+			var status string
+			if err := rows.Scan(&id, &status); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("mark unresolved_ref failed: %w", err)
+			}
+			if status == "abandoned" {
+				if i, ok := idx[id]; ok {
+					abandoned[i] = true
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("mark unresolved_ref failed: %w", err)
+		}
+		rows.Close()
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

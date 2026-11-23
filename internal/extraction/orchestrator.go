@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -380,9 +381,10 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 	if o.interrupted() {
 		return 0, 0, ErrIndexInterrupted
 	}
+	var pruned int
 	var pruneErr error
 	if walkErrs == 0 {
-		pruneErr = o.pruneMissingFiles(jobs)
+		pruned, pruneErr = o.pruneMissingFiles(jobs)
 	}
 	// M7: the partial-failure count is per-pass; reset so a stale count from
 	// an earlier pass cannot trigger a warning on a clean pass.
@@ -400,8 +402,26 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 
+	// Zero-change short-circuit: when nothing was indexed and nothing was
+	// pruned, the node set is identical to the previous pass, so resolve +
+	// synthesis can only replay the same outcome. Still resolve when pending
+	// refs remain — a previously cancelled pass leaves pending rows that
+	// must be retried here (the "skip" is about unchanged work, not about
+	// abandoning leftover work). A prune that deleted rows (pruned>0) is a
+	// real change: resolve+synthesis must still run so references pointing
+	// at the removed nodes are dropped instead of skipped.
+	var pending int
+	var perr error
+	if totalFiles == 0 && pruned == 0 && walkErrs == 0 && pruneErr == nil && jerr == nil {
+		pending, perr = o.db.CountUnresolvedRefs("pending")
+	}
+	skipResolve := totalFiles == 0 && pruned == 0 && walkErrs == 0 &&
+		pruneErr == nil && jerr == nil && perr == nil && pending == 0
+
 	// Step 3: turn pending unresolved_refs into cross-file edges.
-	if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
+	if skipResolve {
+		log.Printf("index pass: no changes; skipping resolve+synthesis")
+	} else if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 || st.Failed > 0 {
@@ -415,8 +435,10 @@ func (o *Orchestrator) IndexAll() (int, int, error) {
 		return totalFiles, totalNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
 	// Step 7: dynamic-dispatch synthesis (callback / React / bridge…).
-	if serr := o.runSynthesis(nil); serr != nil {
-		jerr = errors.Join(jerr, serr)
+	if !skipResolve {
+		if serr := o.runSynthesis(nil); serr != nil {
+			jerr = errors.Join(jerr, serr)
+		}
 	}
 	if n := o.PartialFailures(); n > 0 {
 		// Neutral per-pass report, same position as IndexAllWithProgress:
@@ -590,9 +612,12 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		if err != nil {
 			if os.IsNotExist(err) {
 				// File was deleted (or renamed away): remove the stale index.
-				if derr := o.db.DeleteFile(o.storePath(path)); derr != nil {
-					errs = append(errs, fmt.Errorf("delete index %s: %w", path, derr))
-					o.recordIndexFailure(path)
+				key := o.storePath(path)
+				if !hasParentDirSegment(key) {
+					if derr := o.db.DeleteFile(key); derr != nil {
+						errs = append(errs, fmt.Errorf("delete index %s: %w", path, derr))
+						o.recordIndexFailure(path)
+					}
 				}
 			} else {
 				errs = append(errs, fmt.Errorf("stat %s: %w", path, err))
@@ -625,7 +650,14 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 			}
 			o.recordIndexFailure(path)
 		}
-		storeKeys = append(storeKeys, o.storePath(path))
+		if key := o.storePath(path); !hasParentDirSegment(key) {
+			// Defensive: a storage key with a ".." path SEGMENT can never be
+			// produced by a normal in-workdir path (StoragePath always yields a
+			// workdir-relative key); skip instead of parking a bad ref. Exact
+			// segment matching keeps legitimate double-dot file names like
+			// "a..b.go" or "v1..v2_test.go" indexable.
+			storeKeys = append(storeKeys, key)
+		}
 	}
 
 	if o.interrupted() {
@@ -639,6 +671,15 @@ func (o *Orchestrator) IndexChanges(files []string) (int, int, error) {
 		errs = append(errs, serr)
 	}
 	return totalFiles, totalNodes, errors.Join(errs...)
+}
+
+// hasParentDirSegment reports whether a storage key contains a ".." path
+// SEGMENT — the only shape an out-of-workdir key can take — while leaving
+// legal file names that merely contain two dots (a..b.go, v1..v2_test.go)
+// alone. Matches exact segment boundaries on slash-normalized keys.
+func hasParentDirSegment(key string) bool {
+	return key == ".." || strings.HasPrefix(key, "../") ||
+		strings.HasSuffix(key, "/..") || strings.Contains(key, "/../")
 }
 
 // ProgressFunc is called during indexing to report progress.
@@ -658,9 +699,10 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	if o.interrupted() {
 		return 0, 0, ErrIndexInterrupted
 	}
+	var pruned int
 	var pruneErr error
 	if walkErrs == 0 {
-		pruneErr = o.pruneMissingFiles(jobs)
+		pruned, pruneErr = o.pruneMissingFiles(jobs)
 	}
 	totalCandidates := len(jobs)
 	// M7: per-pass partial-failure count (see IndexAll).
@@ -678,7 +720,19 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	if o.interrupted() {
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
-	if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
+	// Same zero-change short-circuit as IndexAll: an unchanged node set
+	// cannot change resolve/synthesis outcomes, while leftover pending refs
+	// from an interrupted pass still must be retried.
+	var pending int
+	var perr error
+	if indexedFiles == 0 && pruned == 0 && walkErrs == 0 && pruneErr == nil && jerr == nil {
+		pending, perr = o.db.CountUnresolvedRefs("pending")
+	}
+	skipResolve := indexedFiles == 0 && pruned == 0 && walkErrs == 0 &&
+		pruneErr == nil && jerr == nil && perr == nil && pending == 0
+	if skipResolve {
+		log.Printf("index pass: no changes; skipping resolve+synthesis")
+	} else if st, rerr := resolution.ResolveAllContext(o.indexContext(), o.db, o.workdir); rerr != nil {
 		log.Printf("resolve all: %v", rerr)
 		jerr = errors.Join(jerr, rerr)
 	} else if st.Resolved > 0 {
@@ -687,8 +741,10 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 	if o.interrupted() {
 		return indexedFiles, indexedNodes, errors.Join(ErrIndexInterrupted, jerr)
 	}
-	if serr := o.runSynthesis(nil); serr != nil {
-		jerr = errors.Join(jerr, serr)
+	if !skipResolve {
+		if serr := o.runSynthesis(nil); serr != nil {
+			jerr = errors.Join(jerr, serr)
+		}
 	}
 	if n := o.PartialFailures(); n > 0 {
 		// Neutral per-pass report, same wording as IndexAll: the schema-revision
@@ -698,7 +754,7 @@ func (o *Orchestrator) IndexAllWithProgress(onProgress ProgressFunc) (int, int, 
 		log.Printf("index pass: %d file(s) failed extraction; will retry on next pass", n)
 	}
 	elapsed := time.Since(start)
-	pending, _ := o.db.CountUnresolvedRefs("pending")
+	pending, _ = o.db.CountUnresolvedRefs("pending")
 	log.Printf("indexing complete: %d files, %d nodes, %d pending refs in %v (workers=%d)",
 		indexedFiles, indexedNodes, pending, elapsed, indexWorkerCount())
 

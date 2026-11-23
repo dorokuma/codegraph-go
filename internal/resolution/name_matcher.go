@@ -154,7 +154,12 @@ func collectCandidatesContext(ctx context.Context, database *db.DB, refName stri
 		}
 	}
 
-	if err := database.ForEachNodeByNameContext(ctx, refName, func(n db.Node) error {
+	// Resolution candidates need only ID/Kind/Name/File and the body's
+	// truthiness — ForEachNodeByNameResolveContext projects exactly that
+	// (body as a one-byte sentinel) instead of materializing full bodies.
+	// Verified: no CollectCandidates caller consumes Body/Signature/Docstring
+	// beyond MatchName's `Body != ""` truthiness, which the sentinel keeps.
+	if err := database.ForEachNodeByNameResolveContext(ctx, refName, func(n db.Node) error {
 		add(n)
 		return nil
 	}); err != nil {
@@ -163,7 +168,7 @@ func collectCandidatesContext(ctx context.Context, database *db.DB, refName stri
 
 	// Class.method / pkg.Func / util.greet
 	if tail := nameTail(refName); tail != "" && tail != refName {
-		if err := database.ForEachNodeByNameContext(ctx, tail, func(n db.Node) error {
+		if err := database.ForEachNodeByNameResolveContext(ctx, tail, func(n db.Node) error {
 			add(n)
 			return nil
 		}); err != nil {

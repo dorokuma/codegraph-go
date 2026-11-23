@@ -256,9 +256,42 @@ func FilterByImports(database *db.DB, workdir, fromFile, lang string, candidates
 // its import edges plus the index file keys those specs resolve to on disk.
 // Both are candidate-independent, which is what resolveScope caches per file
 // per pass — the specMatchesFile seeding stays per-call (see below).
+// patterns is the pre-compiled form of specs: each spec's segment-match
+// affixes are computed once at closure load so the per-ref candidate scan
+// runs with zero string-concatenation allocations.
 type importClosure struct {
-	specs []string
-	files map[string]bool // nil/empty → no import info, caller keeps candidates
+	specs    []string
+	patterns []specPattern
+	files    map[string]bool // nil/empty → no import info, caller keeps candidates
+}
+
+// specPattern is one import spec's precompiled path-segment matcher.
+// specMatchesFile tests spec against a slash-normalized file path via up to
+// four affix comparisons; computing slash/prefix/suffix/infix once per spec
+// (at closure load) removes the per-candidate-per-spec ToSlash + four
+// string concatenations the hot filter used to allocate.
+type specPattern struct {
+	slash  string // spec normalized to forward slashes
+	prefix string // slash + "/"
+	suffix string // "/" + slash
+	infix  string // "/" + slash + "/"
+}
+
+func compileSpecPattern(spec string) specPattern {
+	s := filepath.ToSlash(spec)
+	return specPattern{
+		slash:  s,
+		prefix: s + "/",
+		suffix: "/" + s,
+		infix:  "/" + s + "/",
+	}
+}
+
+// matches reports whether file — already slash-normalized — contains this
+// spec as a complete path segment (same contract as specMatchesFile).
+func (p specPattern) matches(fileSlash string) bool {
+	return fileSlash == p.slash || strings.HasPrefix(fileSlash, p.prefix) ||
+		strings.HasSuffix(fileSlash, p.suffix) || strings.Contains(fileSlash, p.infix)
 }
 
 func filterByImportsContext(ctx context.Context, database *db.DB, workdir, fromFile, lang string, candidates []db.Node) ([]db.Node, bool) {
@@ -293,17 +326,19 @@ func loadImportClosureContext(ctx context.Context, database *db.DB, workdir, fro
 		}
 	}
 	files := map[string]bool{}
+	patterns := make([]specPattern, 0, len(specs))
 	for _, spec := range specs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		patterns = append(patterns, compileSpecPattern(spec))
 		for _, p := range ResolveImportPath(workdir, fromFile, spec, lang) {
 			// Index keys are workdir-relative; ResolveImportPath returns abs paths.
 			files[db.StoragePath(workdir, p)] = true
 			files[filepath.ToSlash(filepath.Clean(p))] = true
 		}
 	}
-	return &importClosure{specs: specs, files: files}, nil
+	return &importClosure{specs: specs, patterns: patterns, files: files}, nil
 }
 
 // filterByImportedFiles applies one file's import closure to this call's
@@ -357,23 +392,69 @@ func filterByImportedFiles(ctx context.Context, workdir string, closure *importC
 	return hit, true
 }
 
+// filterByImportedFiles is the resolveScope-bound hot-path form of
+// filterByImportedFiles. It reuses the scope's storeKeys cache for
+// db.StoragePath lookups and the closure's precompiled specPatterns, and
+// only allocates the importedFiles seed map when a spec actually matches a
+// candidate file — the common "no candidate file matches any spec" case
+// reads closure.files directly without a copy.
+func (s *resolveScope) filterByImportedFiles(ctx context.Context, closure *importClosure, candidates []db.Node) ([]db.Node, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	if closure == nil || len(closure.specs) == 0 {
+		return candidates, false
+	}
+	var importedFiles map[string]bool
+	for _, p := range closure.patterns {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		// Also accept candidates whose file path contains spec as a complete
+		// path segment (boundary-aware, avoids short name over-matching).
+		for _, c := range candidates {
+			if ctx.Err() != nil {
+				return nil, false
+			}
+			if p.matches(filepath.ToSlash(c.File)) {
+				if importedFiles == nil {
+					importedFiles = make(map[string]bool, len(closure.files)+8)
+					for k := range closure.files {
+						importedFiles[k] = true
+					}
+				}
+				importedFiles[s.storeKey(c.File)] = true
+				importedFiles[c.File] = true
+			}
+		}
+	}
+	if importedFiles == nil {
+		// No candidate file matched any spec: the seed set is exactly
+		// closure.files — query it read-only instead of copying a map that
+		// can only ever be consulted.
+		if len(closure.files) == 0 {
+			return candidates, false
+		}
+		importedFiles = closure.files
+	}
+	var hit []db.Node
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		if importedFiles[c.File] || importedFiles[s.storeKey(c.File)] {
+			hit = append(hit, c)
+		}
+	}
+	if len(hit) == 0 {
+		return candidates, false
+	}
+	return hit, true
+}
+
 // specMatchesFile returns true when spec appears as a complete path segment
 // in file. This avoids over-matching short/bare names like "util" or
 // "components" as substrings of unrelated paths.
 func specMatchesFile(file, spec string) bool {
-	spec = filepath.ToSlash(spec)
-	file = filepath.ToSlash(file)
-	if file == spec {
-		return true
-	}
-	if strings.HasPrefix(file, spec+"/") {
-		return true
-	}
-	if strings.HasSuffix(file, "/"+spec) {
-		return true
-	}
-	if strings.Contains(file, "/"+spec+"/") {
-		return true
-	}
-	return false
+	return compileSpecPattern(spec).matches(filepath.ToSlash(file))
 }

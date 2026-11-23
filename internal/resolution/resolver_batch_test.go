@@ -60,6 +60,11 @@ func installCancelLookup(t *testing.T, database *db.DB, function string) func() 
 }
 
 func TestResolutionCancellationPreservesPendingRefs(t *testing.T) {
+	// stride=1 restores the every-hit probe the test's cancel contract
+	// counts on: ref2's cache hit must still fire the SQL hook.
+	old := resolveCacheProbeStride
+	resolveCacheProbeStride = 1
+	t.Cleanup(func() { resolveCacheProbeStride = old })
 	for _, mode := range []string{"all", "files", "empty-files"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -255,6 +260,11 @@ func TestEdgeWriterFallsBackPerRefOnBatchFailure(t *testing.T) {
 // function on the name column), and a cancellation fired inside that SQL
 // still lands on the NEXT ref — never on a replayed cache value.
 func TestResolveScopeCachesCandidates(t *testing.T) {
+	// stride=1: every cache hit probes, so the "1 full + 2 probes" count
+	// the assertion below encodes stays exactly 3.
+	old := resolveCacheProbeStride
+	resolveCacheProbeStride = 1
+	t.Cleanup(func() { resolveCacheProbeStride = old })
 	var calls atomic.Int32
 	function := registerCancelLookup(t, func(name string) { calls.Add(1) })
 	database, _, _, _ := newBatchTestDB(t, 3)
@@ -513,6 +523,97 @@ func TestCancelledFlushDropsQueuedMarks(t *testing.T) {
 	if calls.Load() < 1 {
 		t.Fatalf("cancel hook never fired (calls=%d): the cancel did not happen "+
 			"inside the target lookup as intended", calls.Load())
+	}
+}
+
+// TestFailureWriterCancelAfterCommittedChunk is the S1 fixup regression:
+// an abandoned-marking CHUNK that already committed mid-pass must survive
+// in both the DB and the returned Stats when a later cancel aborts the
+// pass. The old ReportDroppedFailureMarks formula
+// (`st.Abandoned -= queuedAbandoned - persistedAbandoned`, subtracting from
+// a Stats.Abandoned of 0 because markFailed always reports false) dropped
+// the committed chunk's count — Stats and DB disagreed.
+func TestFailureWriterCancelAfterCommittedChunk(t *testing.T) {
+	// Chunk every 2 marks: refs 1-2 commit as one chunk before the cancel.
+	oldChunk := failureFlushChunk
+	failureFlushChunk = 2
+	t.Cleanup(func() { failureFlushChunk = oldChunk })
+	// Cap of 1: the FIRST failed attempt already parks a ref as abandoned.
+	oldCap := maxResolveAttempts
+	maxResolveAttempts = 1
+	t.Cleanup(func() { maxResolveAttempts = oldCap })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	// The fourth ref names "target" (a real node newBatchTestDB created):
+	// its candidate lookup's full collect query evaluates the hooked body
+	// projection on that row, so the cancel fires inside real SQL and the
+	// query returns context.Canceled — the ref is never marked or applied.
+	function := registerCancelLookup(t, func(name string) {
+		calls.Add(1)
+		if name == "target" {
+			cancel()
+		}
+	})
+	database, caller, _, _ := newBatchTestDB(t, 0)
+	restore := installCancelLookup(t, database, function)
+	defer restore()
+
+	var refs []db.UnresolvedRef
+	for i, name := range []string{"ghost0", "ghost1", "ghost2", "target"} {
+		id, err := database.InsertUnresolvedRef(&db.UnresolvedRef{
+			FromNode: caller, ReferenceName: name, ReferenceKind: db.EdgeCalls,
+			Line: 30 + i, FilePath: "a.go", Language: "go", Status: "pending",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, db.UnresolvedRef{ID: id, ReferenceName: name})
+	}
+
+	st, err := ResolveAllContext(ctx, database, t.TempDir())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got stats=%+v err=%v", st, err)
+	}
+
+	// Chunk 1 (refs 1-2) committed before the cancel: both rows parked as
+	// abandoned with one attempt. Ref 3 sat in the un-flushed queue and
+	// stays pending/untouched. Stats must equal the persisted state
+	// exactly — Failed=2 Abandoned=2, not Failed=3/Abandoned=0.
+	if st.Failed != 2 || st.Abandoned != 2 {
+		t.Fatalf("stats after cancel = %+v, want Failed=2 Abandoned=2 "+
+			"(committed chunk must not be dropped from the report)", st)
+	}
+	rows, lerr := database.ListUnresolvedRefs("", "")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	byID := map[int64]db.UnresolvedRef{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	for _, want := range []struct {
+		ref      db.UnresolvedRef
+		status   string
+		attempts int
+	}{
+		{refs[0], "abandoned", 1},
+		{refs[1], "abandoned", 1},
+		{refs[2], "pending", 0},
+		{refs[3], "pending", 0},
+	} {
+		got := byID[want.ref.ID]
+		if got.Status != want.status {
+			t.Fatalf("ref %d (%s) status=%q, want %q", want.ref.ID, want.ref.ReferenceName, got.Status, want.status)
+		}
+		attempts, aerr := database.UnresolvedRefAttempts(want.ref.ID)
+		if aerr != nil || attempts != want.attempts {
+			t.Fatalf("ref %d (%s) attempts=%d err=%v, want %d", want.ref.ID, want.ref.ReferenceName, attempts, aerr, want.attempts)
+		}
+	}
+	if calls.Load() < 1 {
+		t.Fatalf("cancel hook never fired (calls=%d)", calls.Load())
 	}
 }
 

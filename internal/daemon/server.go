@@ -24,6 +24,25 @@ import (
 // It should block until the session ends.
 type SessionHandler func(ctx context.Context, rwc io.ReadWriteCloser) error
 
+// backgroundWork counts in-flight index/sync passes the daemon itself
+// cannot see through its client/inFlight sessions (the server's
+// BgWg-driven IndexAll/RebuildAll and the watcher's IndexChanges run on
+// goroutines that hold no MCP conn). stopIfIdle consults it ONLY for the
+// autonomous "idle timeout" stop: explicit Stop/signal and the workdir
+// watchdog must never defer, so a real shutdown still cuts a hung index.
+var backgroundWork atomic.Int64
+
+// TrackBackgroundWork marks a background index/sync pass as running until
+// the returned release func runs. It only defers the autonomous idle
+// timer's stopIfIdle — never Stop, never the workdir watchdog — so an
+// in-flight index is allowed to finish (or be cut by a real shutdown)
+// instead of being cancelled mid-pass by the idle timer, which previously
+// orphaned the revision marker and re-burned the whole index next start.
+func TrackBackgroundWork() func() {
+	backgroundWork.Add(1)
+	return func() { backgroundWork.Add(-1) }
+}
+
 // Daemon is the shared single-writer MCP process for one project root.
 type Daemon struct {
 	root      string
@@ -272,9 +291,17 @@ func (d *Daemon) Stop(reason string) {
 // listener and runs the shared shutdown — so no Accept can slip between
 // the count check and the stop. Returns false (nothing stopped) when the
 // daemon is busy or already stopping.
+//
+// busyReason gates the TrackBackgroundWork check to "idle timeout" only:
+// a background index pass must defer the idle timer (it would otherwise
+// cancel the pass mid-flight and leave the revision unmarked), while the
+// workdir watchdog still stops immediately — a deleted workdir must not
+// be masked by a background pass.
 func (d *Daemon) stopIfIdle(reason string) bool {
 	d.mu.Lock()
-	if d.clients > 0 || d.inFlight > 0 {
+	busy := d.clients > 0 || d.inFlight > 0 ||
+		(reason == "idle timeout" && backgroundWork.Load() > 0)
+	if busy {
 		d.mu.Unlock()
 		return false
 	}
@@ -528,13 +555,29 @@ func (d *Daemon) armIdleTimer() {
 	if d.clients > 0 || d.inFlight > 0 || d.idleTimer != nil {
 		return
 	}
-	d.idleTimer = time.AfterFunc(d.idleAfter, func() {
-		// Atomic idle stop: a busy daemon (session live or handshake in
-		// flight) refuses and simply rearms for the next window.
+	// self binds the callback to THIS timer instance: a refused stop releases
+	// d.mu before re-arming, and in that window a connection add/drop pair can
+	// install a NEW idleTimer — clearing d.idleTimer unconditionally would
+	// then drop that new timer's handle (leaking it unstopped) while the old
+	// timer re-arms a duplicate on top of it.
+	var self *time.Timer
+	self = time.AfterFunc(d.idleAfter, func() {
+		// Atomic idle stop: a busy daemon (session live, handshake in
+		// flight, or tracked background work) refuses and rearms for the
+		// next window. The fired timer must be detached first — armIdleTimer
+		// refuses to install a second timer while idleTimer is non-nil, so
+		// without this clear a refused stop could never rearm (the daemon
+		// would then never idle-exit once a tracked pass released).
 		if !d.stopIfIdle("idle timeout") {
+			d.mu.Lock()
+			if d.idleTimer == self && !d.stopping.Load() {
+				d.idleTimer = nil
+			}
+			d.mu.Unlock()
 			d.armIdleTimer()
 		}
 	})
+	d.idleTimer = self
 }
 
 func (d *Daemon) cleanupArtifacts() {

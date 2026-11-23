@@ -50,49 +50,20 @@ func ResolveAllContext(ctx context.Context, database *db.DB, workdir string) (St
 	// the NEXT pass are re-resolved there, exactly as before).
 	s := newResolveScope(database, workdir)
 
-	pending, err := database.ListUnresolvedRefsContext(ctx, "", "pending")
-	if err != nil {
-		return st, err
-	}
-	failed, err := database.ListUnresolvedRefsContext(ctx, "", "failed")
-	if err != nil {
-		return st, err
-	}
-	// Retry failed refs when a candidate name now exists. The candidates
-	// lookup is cached per reference_name within this pass: hundreds of
-	// thousands of failed rows share a small name space, and the previous
-	// per-row query ran once here and again inside resolveOneContext.
-	var retry []db.UnresolvedRef
-	for _, r := range failed {
-		if err := ctx.Err(); err != nil {
-			return st, err
-		}
-		hit, err := s.hasCandidates(ctx, r.ReferenceName)
-		if cerr := ctx.Err(); cerr != nil {
-			return st, cerr
-		}
-		if err != nil || !hit {
-			continue
-		}
-		retry = append(retry, r)
-	}
-	st.Retried = len(retry)
-
-	batch := append(pending, retry...)
 	w := newEdgeWriterContext(ctx, database)
 	fw := newFailureWriterContext(ctx, database)
-	for _, r := range batch {
+
+	// processRef is the shared per-ref body of the two streamed loops below
+	// (pending first, then retried-failed — the same order the old
+	// pending+retry batch slice produced).
+	processRef := func(r db.UnresolvedRef) error {
 		if err := ctx.Err(); err != nil {
-			st.Resolved += w.resolved
-			st.ReportDroppedFailureMarks(fw)
-			return st, err
+			return err
 		}
 		plan, err := s.resolveOne(ctx, r)
 		// Cancellation is not a failed reference: do not age/abandon it.
 		if cerr := ctx.Err(); cerr != nil {
-			st.Resolved += w.resolved
-			st.ReportDroppedFailureMarks(fw)
-			return st, cerr
+			return cerr
 		}
 		if err != nil {
 			// A per-ref resolution error is a failure for THIS ref this pass:
@@ -106,23 +77,65 @@ func ResolveAllContext(ctx context.Context, database *db.DB, workdir string) (St
 			if fw.markFailed(r, maxResolveAttempts) {
 				st.Abandoned++
 			}
-			continue
+			return nil
 		}
 		if plan == nil {
 			st.Failed++
 			if fw.markFailed(r, maxResolveAttempts) {
 				st.Abandoned++
 			}
-			continue
+			return nil
 		}
 		w.add(*plan)
+		return nil
+	}
+	finish := func(err error) (Stats, error) {
+		st.Resolved += w.resolved
+		st.ReportDroppedFailureMarks(fw)
+		return st, err
+	}
+
+	// Stream the pending backlog in keyset pages instead of materializing
+	// the whole []UnresolvedRef (hundreds of MB on large indexes).
+	err := database.ForEachUnresolvedRefsContext(ctx, "", "pending", func(r db.UnresolvedRef) error {
+		return processRef(r)
+	})
+	if err != nil {
+		return finish(err)
+	}
+	// Retry failed refs when a candidate name now exists. The candidates
+	// lookup is cached per reference_name within this pass: hundreds of
+	// thousands of failed rows share a small name space, and the previous
+	// per-row query ran once here and again inside resolveOneContext. The
+	// failed scan is streamed too — no second full-table slice. fw.seen
+	// skips refs this pass already parked as failed: the old snapshot read
+	// the failed set BEFORE the pending loop ran, so a pending→failed mark
+	// could never be retried in the same pass. The streamed scan would
+	// otherwise see those freshly-flipped rows and double-process them.
+	err = database.ForEachUnresolvedRefsContext(ctx, "", "failed", func(r db.UnresolvedRef) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, ok := fw.seen[r.ID]; ok {
+			return nil
+		}
+		hit, err := s.hasCandidates(ctx, r.ReferenceName)
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if err != nil || !hit {
+			return nil
+		}
+		st.Retried++
+		return processRef(r)
+	})
+	if err != nil {
+		return finish(err)
 	}
 	if err := ctx.Err(); err != nil {
 		// Cancellation drops every still-queued mark: ReportedState keeps
 		// Failed/Abandoned consistent with rows that were actually persisted.
-		st.Resolved += w.resolved
-		st.ReportDroppedFailureMarks(fw)
-		return st, err
+		return finish(err)
 	}
 	w.flush()
 	st.Resolved += w.resolved
@@ -155,6 +168,16 @@ type resolveScope struct {
 	workdir  string
 	// cand caches collectCandidatesContext results per reference name.
 	cand map[string][]db.Node
+	// byName caches ForEachNodeByNameResolveContext results per bare node
+	// name: thousands of "x.Close"-style refs share one tail segment, so
+	// the per-name SQLite scan runs once per name per pass instead of once
+	// per (refName, tail) pair — and a tail-only ref reuses the cached
+	// slice by reference instead of paying a fresh copy each time.
+	byName map[string][]db.Node
+	// storeKeys caches db.StoragePath(workdir, file) per candidate/source
+	// file: the import filter computes it once per candidate per ref and
+	// the hot paths reuse the same small file-name space.
+	storeKeys map[string]string
 	// hasCand caches the failed-retry existence check per reference name:
 	// hundreds of thousands of failed rows share a small name space, and a
 	// name that resolved to nothing moments ago still resolves to nothing.
@@ -165,6 +188,9 @@ type resolveScope struct {
 	// once per file per pass; the specMatchesFile seeding below stays
 	// per-call exactly as before.
 	imported map[importedKey]*importClosure
+	// probeHits counts cache hits across cand/hasCand so the strided
+	// NodeNameExistsContext probe fires every resolveCacheProbeStride hits.
+	probeHits int
 }
 
 // importedKey identifies one file's import-closure lookup: the two edge-file
@@ -177,47 +203,146 @@ type importedKey struct {
 
 func newResolveScope(database *db.DB, workdir string) *resolveScope {
 	return &resolveScope{
-		database: database,
-		workdir:  workdir,
-		cand:     map[string][]db.Node{},
-		hasCand:  map[string]bool{},
-		imported: map[importedKey]*importClosure{},
+		database:  database,
+		workdir:   workdir,
+		cand:      map[string][]db.Node{},
+		byName:    map[string][]db.Node{},
+		storeKeys: map[string]string{},
+		hasCand:   map[string]bool{},
+		imported:  map[importedKey]*importClosure{},
 	}
 }
 
+// resolveCacheProbeStride is how often a cache HIT in candidates/
+// hasCandidates still performs a real NodeNameExistsContext SQL probe. The
+// un-cached path ran one query per ref; after the per-pass caches landed,
+// every cached hit ran the probe so a cancellation fired inside SQL kept
+// landing on the NEXT ref — hundreds of thousands of cache hits meant
+// ~1.1M probe round trips on a large backlog. The stride keeps that SQL
+// cancellation surface (every Nth hit still probes, and ctx.Err() is
+// checked per ref in the loop anyway — a pure in-memory hit can never
+// block), while collapsing the round trips to ~hits/stride. A var so tests
+// can restore the every-hit probe (stride=1) where their assertions count
+// the probe calls.
+var resolveCacheProbeStride = 4096
+
 // candidates returns the candidate node set for a reference name. The first
 // call per name runs the full collectCandidatesContext query and stores the
-// result; later calls for the same name replay it. Every call — hit or miss
-// — still executes one real (cheap, body-free) existence query so the
-// un-cached path's per-ref SQL cancellation surface is preserved exactly:
-// a cancellation fired inside SQL still lands on the NEXT ref, never on a
-// value replayed out of the map.
+// result; later calls for the same name replay it. Cache hits still run the
+// real NodeNameExistsContext probe once per resolveCacheProbeStride hits so
+// a cancellation fired inside SQL lands on a later ref — never on a value
+// replayed out of the map.
 func (s *resolveScope) candidates(ctx context.Context, refName string) ([]db.Node, error) {
 	refName = strings.TrimSpace(refName)
 	if v, ok := s.cand[refName]; ok {
-		if _, err := s.database.NodeNameExistsContext(ctx, refName); err != nil {
-			return nil, err
+		s.probeHits++
+		if s.probeHits%resolveCacheProbeStride == 0 {
+			if _, err := s.database.NodeNameExistsContext(ctx, refName); err != nil {
+				return nil, err
+			}
 		}
 		return v, nil
 	}
-	nodes, err := collectCandidatesContext(ctx, s.database, refName)
+	if refName == "" {
+		// collectCandidatesContext's contract: empty names yield no
+		// candidates; the nil result is cached like any other miss.
+		s.cand[refName] = nil
+		return nil, nil
+	}
+	exact, err := s.nodesByName(ctx, refName)
 	if err != nil {
-		// Errors are NOT cached: each ref keeps the old per-row retry
-		// behavior, and ctx cancellation must re-fire for the next caller.
 		return nil, err
+	}
+	var nodes []db.Node
+	if tail := nameTail(refName); tail != "" && tail != refName {
+		// Class.method / pkg.Func / util.greet: merge the tail's nodes after
+		// the exact-name set (same order and ID-dedup as
+		// collectCandidatesContext).
+		tailNodes, terr := s.nodesByName(ctx, tail)
+		if terr != nil {
+			return nil, terr
+		}
+		switch {
+		case len(exact) == 0:
+			// Share the cached tail slice by reference — candidates are only
+			// ever read (the self-ref filter copies on write), so thousands
+			// of tail-only refs (x.Close, t.Fatalf, ...) reuse one backing
+			// array instead of each paying a fresh SQLite scan + copy.
+			nodes = tailNodes
+		case len(tailNodes) == 0:
+			nodes = exact
+		default:
+			seen := make(map[int64]bool, len(exact)+len(tailNodes))
+			nodes = make([]db.Node, 0, len(exact)+len(tailNodes))
+			for _, n := range exact {
+				if !seen[n.ID] {
+					seen[n.ID] = true
+					nodes = append(nodes, n)
+				}
+			}
+			for _, n := range tailNodes {
+				if !seen[n.ID] {
+					seen[n.ID] = true
+					nodes = append(nodes, n)
+				}
+			}
+		}
+	} else {
+		nodes = exact
 	}
 	s.cand[refName] = nodes
 	return nodes, nil
 }
 
+// nodesByName returns the resolve-projection nodes carrying exactly name,
+// cached per bare name for the pass — the resolution pass only writes
+// edges/unresolved_refs and never nodes, so a cached list stays valid for
+// the whole pass. Errors are NOT cached: each ref keeps the old per-row
+// retry behavior, and ctx cancellation must re-fire for the next caller.
+func (s *resolveScope) nodesByName(ctx context.Context, name string) ([]db.Node, error) {
+	if name == "" {
+		return nil, nil
+	}
+	if v, ok := s.byName[name]; ok {
+		return v, nil
+	}
+	var nodes []db.Node
+	err := s.database.ForEachNodeByNameResolveContext(ctx, name, func(n db.Node) error {
+		nodes = append(nodes, n)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.byName[name] = nodes
+	return nodes, nil
+}
+
+// storeKey returns the workdir-relative storage key for file, cached per
+// file for the pass — the import filter otherwise recomputes
+// db.StoragePath (filepath.Clean + Rel + ToSlash) once per candidate per
+// ref over the same small file-name space.
+func (s *resolveScope) storeKey(file string) string {
+	if v, ok := s.storeKeys[file]; ok {
+		return v
+	}
+	k := db.StoragePath(s.workdir, file)
+	s.storeKeys[file] = k
+	return k
+}
+
 // hasCandidates runs the failed-retry existence check for a reference
-// name, with the same hit-path probe query as candidates(): every ref
-// touches SQL once so cancellation inside SQL lands on the NEXT ref.
+// name, with the same strided probe query as candidates(): every
+// resolveCacheProbeStride'th cache hit touches SQL once so cancellation
+// inside SQL still lands on a later ref.
 func (s *resolveScope) hasCandidates(ctx context.Context, refName string) (bool, error) {
 	refName = strings.TrimSpace(refName)
 	if v, ok := s.hasCand[refName]; ok {
-		if _, err := s.database.NodeNameExistsContext(ctx, refName); err != nil {
-			return false, err
+		s.probeHits++
+		if s.probeHits%resolveCacheProbeStride == 0 {
+			if _, err := s.database.NodeNameExistsContext(ctx, refName); err != nil {
+				return false, err
+			}
 		}
 		return v, nil
 	}
@@ -269,19 +394,10 @@ func (s *resolveScope) resolveOne(ctx context.Context, r db.UnresolvedRef) (*edg
 		return nil, nil
 	}
 
-	// Never link a node to itself. The filter writes into a fresh slice:
-	// candidates() returns the scope's cached array, so filtering in place
-	// would corrupt s.cand[refName] for every later ref on this name.
-	filtered := make([]db.Node, 0, len(candidates))
-	for _, c := range candidates {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if c.ID != r.FromNode {
-			filtered = append(filtered, c)
-		}
+	candidates, err = s.dropSelfRef(ctx, candidates, r.FromNode)
+	if err != nil {
+		return nil, err
 	}
-	candidates = filtered
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -298,7 +414,7 @@ func (s *resolveScope) resolveOne(ctx context.Context, r db.UnresolvedRef) (*edg
 		// unfiltered candidates (ctx.Err() is re-checked below anyway).
 		closure = &importClosure{}
 	}
-	if imp, ok := filterByImportedFiles(ctx, s.workdir, closure, candidates); ok {
+	if imp, ok := s.filterByImportedFiles(ctx, closure, candidates); ok {
 		m := MatchName(imp, r.ReferenceName, fromFile, preferCall)
 		if m.TargetID != 0 {
 			return &edgePlan{ref: r, targetID: m.TargetID, kind: kind, provenance: ProvImport}, nil
@@ -310,32 +426,10 @@ func (s *resolveScope) resolveOne(ctx context.Context, r db.UnresolvedRef) (*edg
 		// No file/directory proximity: reject to let unique-callable check handle it.
 		m = MatchResult{}
 	}
-	if m.TargetID == 0 {
-		// Unique global callable: accept as heuristic.
-		if preferCall {
-			var callables []db.Node
-			for _, c := range candidates {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				if callTargetKinds[c.Kind] {
-					callables = append(callables, c)
-				}
-			}
-			if len(callables) == 1 {
-				// Only accept a unique callable when supported by import closure,
-				// same-directory, or direct-subdirectory proximity (the candidate
-				// lives inside a subdirectory of the caller's directory).
-				cdir := filepath.Dir(callables[0].File)
-				fromDir := filepath.Dir(fromFile)
-				if _, ok := filterByImportedFiles(ctx, s.workdir, closure, []db.Node{callables[0]}); ok {
-					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvImport}
-				} else if cdir == fromDir {
-					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
-				} else if filepath.Dir(cdir) == fromDir {
-					m = MatchResult{TargetID: callables[0].ID, Provenance: ProvHeuristic}
-				}
-			}
+	if m.TargetID == 0 && preferCall {
+		m, err = s.uniqueCallableMatch(ctx, closure, candidates, fromFile)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if m.TargetID == 0 {
@@ -345,6 +439,69 @@ func (s *resolveScope) resolveOne(ctx context.Context, r db.UnresolvedRef) (*edg
 		m.Provenance = ProvHeuristic
 	}
 	return &edgePlan{ref: r, targetID: m.TargetID, kind: kind, provenance: m.Provenance}, nil
+}
+
+// dropSelfRef removes the caller's own node from candidates (never link a
+// node to itself). Most candidate lists contain no self-reference, so this
+// scans first and only allocates a filtered copy when one is actually
+// present — filtering in place or copying eagerly would either corrupt
+// s.cand's shared array or pay a full copy per ref.
+func (s *resolveScope) dropSelfRef(ctx context.Context, candidates []db.Node, fromNode int64) ([]db.Node, error) {
+	hasSelf := false
+	for _, c := range candidates {
+		if c.ID == fromNode {
+			hasSelf = true
+			break
+		}
+	}
+	if !hasSelf {
+		return candidates, nil
+	}
+	filtered := make([]db.Node, 0, len(candidates)-1)
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if c.ID != fromNode {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered, nil
+}
+
+// uniqueCallableMatch accepts a sole global callable candidate as a
+// heuristic match, provided it is backed by import closure, same-directory,
+// or direct-subdirectory proximity (the candidate lives inside a
+// subdirectory of the caller's directory). A non-unique callable set yields
+// an empty MatchResult. Cancellation is checked per candidate scan.
+func (s *resolveScope) uniqueCallableMatch(ctx context.Context, closure *importClosure, candidates []db.Node, fromFile string) (MatchResult, error) {
+	callableCount := 0
+	var onlyCallable db.Node
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return MatchResult{}, err
+		}
+		if callTargetKinds[c.Kind] {
+			callableCount++
+			if callableCount == 1 {
+				onlyCallable = c
+			} else {
+				return MatchResult{}, nil // not unique — no single callable to accept
+			}
+		}
+	}
+	if callableCount != 1 {
+		return MatchResult{}, nil
+	}
+	cdir := filepath.Dir(onlyCallable.File)
+	fromDir := filepath.Dir(fromFile)
+	if _, ok := s.filterByImportedFiles(ctx, closure, []db.Node{onlyCallable}); ok {
+		return MatchResult{TargetID: onlyCallable.ID, Provenance: ProvImport}, nil
+	}
+	if cdir == fromDir || filepath.Dir(cdir) == fromDir {
+		return MatchResult{TargetID: onlyCallable.ID, Provenance: ProvHeuristic}, nil
+	}
+	return MatchResult{}, nil
 }
 
 // resolveBatchSize is how many resolved refs are persisted per write
@@ -471,16 +628,26 @@ type failureWriter struct {
 	ctx      context.Context
 	database *db.DB
 	marks    []failedMark
-	// queuedAbandoned counts how many queued marks would already reach the
-	// abandon cap, computed against the DB's CURRENT attempts value at queue
-	// time. These are still only attempts: the DB row is unchanged until
-	// flush commits, so Stats must report them as abandoned only once the
-	// flush actually lands (see flush) — not when they are queued.
+	// queuedAbandoned counts how many still-queued marks would already reach
+	// the abandon cap, computed against the DB's CURRENT attempts value at
+	// queue time. These are still only attempts: the DB row is unchanged
+	// until flush commits, so Stats must never report them as abandoned.
+	// ReportDroppedFailureMarks re-bases Stats.Abandoned straight onto
+	// persistedAbandoned, so this field is bookkeeping for flushChunk's
+	// rebase only — kept so a cancelled mid-fallback flush still separates
+	// the committed prefix's abandoned rows from the unstarted tail's.
 	queuedAbandoned int
 	// persistedAbandoned is how many queuedAbandoned rows flush actually
-	// committed as 'abandoned'. When a cancelled flush persists nothing this
-	// stays 0, which is what lets Stats keep its abandoned count honest.
+	// committed as 'abandoned' — the running total across every flush this
+	// pass (each mid-pass flushChunk AND the final flush). Stats.Abandoned
+	// must equal this after any early finish: chunks that already committed
+	// keep their rows even when a later cancel aborts the pass.
 	persistedAbandoned int
+	// seen records every ref id markFailed was called for in this pass so
+	// the streamed failed scan can skip rows this pass itself just parked
+	// — the old snapshot-based read could never see them (it was taken
+	// before the pending loop).
+	seen map[int64]struct{}
 }
 
 // failedMark is one queued failed-attempt update: the ref and its stored
@@ -499,21 +666,32 @@ func newFailureWriterContext(ctx context.Context, database *db.DB) *failureWrite
 // write, so nothing can have been abandoned yet — the abandoned count is
 // resolved when flush commits the batch and returned to the caller there.
 // It still predicts (queuedAbandoned) which queued rows would cross the cap
-// so a cancelled flush can keep Stats.Abandoned consistent with the rows
-// that were actually persisted, instead of the queue length.
+// so flushChunk can keep the prediction scoped to the still-queued marks
+// after a partially-committed cancelled flush.
 func (fw *failureWriter) markFailed(r db.UnresolvedRef, maxAttempts int) bool {
 	tail := r.NameTail
 	if tail == "" {
 		tail = nameTail(r.ReferenceName)
 	}
-	// Predict abandonment from the row's CURRENT attempts (pre-write). The
-	// row keeps its old attempts value until flush; if attempts+1 already
-	// reaches the cap, flush would park it. Tracking this lets the caller
-	// keep Stats consistent when cancellation drops the whole queue.
-	if attempts, err := fw.database.UnresolvedRefAttempts(r.ID); err == nil && attempts+1 >= maxAttempts {
+	// Predict abandonment from the row's CURRENT attempts (pre-write), read
+	// off the same ListUnresolvedRefs* scan that produced the ref — the old
+	// per-ref UnresolvedRefAttempts point query ran once per markFailed call
+	// (hundreds of thousands of extra round trips on a large backlog). The
+	// row keeps its pre-write attempts value until flush: the only writer of
+	// attempts inside a pass is this writer's own flush, which happens after
+	// all marks are queued, so the value read at list time IS the pre-write
+	// value every mark predicts against (same contract as before).
+	if r.Attempts+1 >= maxAttempts {
 		fw.queuedAbandoned++
 	}
 	fw.marks = append(fw.marks, failedMark{ref: r, tail: tail})
+	if fw.seen == nil {
+		fw.seen = map[int64]struct{}{}
+	}
+	fw.seen[r.ID] = struct{}{}
+	if len(fw.marks) >= failureFlushChunk {
+		fw.flushChunk(maxAttempts)
+	}
 	return false
 }
 
@@ -523,8 +701,15 @@ func (fw *failureWriter) markFailed(r db.UnresolvedRef, maxAttempts int) bool {
 // lose the rest, matching edgeWriter's isolation contract. Cancellation is
 // checked once up front (like edgeWriter.flush): a cancelled pass leaves
 // queued refs unmarked so they are retried, never aged — in that case the
-// whole queue is dropped, persistedAbandoned stays 0, and the caller must
+// queued tail is dropped, persistedAbandoned stays 0, and the caller must
 // report the dropped marks so Stats stays consistent with the DB.
+//
+// Queue discipline: fw.marks only ever holds UNPERSISTED marks — the batch
+// commit consumes the whole queue (marks reset to len 0), and the per-ref
+// fallback path consumes each mark it commits and each mark the context
+// check proves it can no longer start, leaving a cancelled flush with the
+// tail it never reached. A mark is removed the moment it is committed, so
+// droppedMarks()'s len(fw.marks) always equals the un-persisted count.
 func (fw *failureWriter) flush(maxAttempts int) int {
 	if len(fw.marks) == 0 || fw.ctx.Err() != nil {
 		return 0
@@ -539,15 +724,22 @@ func (fw *failureWriter) flush(maxAttempts int) int {
 	abandoned, err := fw.database.ApplyUnresolvedFailed(refs, maxAttempts)
 	if err != nil {
 		n := 0
+		// Per-ref fallback. Each iteration's ctx check fires BEFORE that
+		// ref's commit starts, so a mark lands iff the context allowed it —
+		// truncate below re-queues exactly the marks that never began.
+		k := 0 // count of prefix marks committed
 		for _, m := range fw.marks {
 			if fw.ctx.Err() != nil {
+				fw.marks = append(fw.marks[:0], fw.marks[k:]...)
 				fw.persistedAbandoned += n
 				return n
 			}
 			if markRefFailed(fw.database, m.ref, maxAttempts) {
 				n++
 			}
+			k++
 		}
+		fw.marks = fw.marks[:0]
 		fw.persistedAbandoned += n
 		return n
 	}
@@ -557,40 +749,75 @@ func (fw *failureWriter) flush(maxAttempts int) int {
 			n++
 		}
 	}
+	fw.marks = fw.marks[:0]
 	fw.persistedAbandoned += n
 	return n
 }
 
-// droppedMarks is how many queued failure markings were never persisted.
-// A mark counts as dropped while it sits in fw.marks (not yet flushed) or
-// when the flush that owned it was cancelled. edgeWriter-buffered plans that
-// surface as w.failed are counted by the caller before queueing them here,
-// so this only needs to cover marks that reached markFailed.
-func (fw *failureWriter) droppedMarks() int {
-	// marks that were never committed. A successful flush consumed the whole
-	// queue; a cancelled/aborted one leaves them. queuedAbandoned that were
-	// never persisted count as dropped-abandoned too.
-	if fw.ctx.Err() == nil {
-		return 0 // nothing dropped unless cancellation aborted the flush
+// failureFlushChunk is how many queued failed marks markFailed flushes
+// into one ApplyUnresolvedFailed transaction before continuing — an
+// unbounded fw.marks slice dominated peak RSS on a large all-fail backlog
+// (one mid-pass commit also shrinks the window a crash/cancel would drop,
+// matching the per-ref era's worst case rather than the whole tail).
+// queuedAbandoned tracks only the still-unflushed marks (see flushChunk),
+// so Stats stays consistent whether a pass commits zero, some, or every
+// chunk. A var so tests can shrink it.
+var failureFlushChunk = 50_000
+
+// flushChunk persists the marks queued so far as ONE chunk transaction.
+// queuedAbandoned tracks only the still-unflushed marks, so after a chunk
+// commit it is rebased to the queue that survived (empty on a full commit;
+// the unstarted tail on a cancelled mid-fallback flush) — droppedMarks must
+// count just those, or a cancelled pass would subtract rows a committed
+// chunk already landed and under-report Failed/Abandoned against the real
+// DB state.
+func (fw *failureWriter) flushChunk(maxAttempts int) {
+	if len(fw.marks) == 0 {
+		return
 	}
+	queued := fw.queuedAbandoned
+	n := fw.flush(maxAttempts)
+	if len(fw.marks) == 0 {
+		// Whole queue committed: nothing left to predict.
+		fw.queuedAbandoned = 0
+		return
+	}
+	// Cancellation aborted the flush part-way: n rows parked as abandoned
+	// committed into persistedAbandoned; the unstarted tail keeps only
+	// queued−n uncommitted predicted-abandoned marks.
+	fw.queuedAbandoned = queued - n
+}
+
+// droppedMarks is how many queued failure markings were never persisted.
+// Queue discipline (see flush) guarantees fw.marks holds ONLY unpersisted
+// marks: every committed chunk or fallback prefix is truncated out of
+// fw.marks the moment it lands, so len(fw.marks) is exactly the count still
+// owed to the DB — whether the pass is about to run its final flush, bailed
+// on cancellation, or died on a mid-scan SQL error (the previous
+// ctx.Err() gate wrongly treated a non-cancel early finish as
+// "nothing dropped" and left those marks counted in Stats.Failed).
+// edgeWriter-buffered plans that surface as w.failed are counted by the
+// caller before queueing them here, so this only needs to cover marks that
+// reached markFailed.
+func (fw *failureWriter) droppedMarks() int {
 	return len(fw.marks)
 }
 
 // ReportDroppedFailureMarks re-bases Failed/Abandoned on what the failure
-// writer actually persisted after a cancellation. markFailed increments
-// Stats.Failed and (predictively) Stats.Abandoned for every queued row, but
-// a cancelled flush persists none of them — so the cancelled pass must
-// subtract the still-queued attempts (and only the abandoned rows that
-// actually committed). On a fully-committed flush there is nothing to drop.
+// writer actually persisted, on every finish path — cancelled or not.
+// markFailed increments Stats.Failed for every queued row but reports
+// abandoned predictively; the queue discipline means len(fw.marks) is
+// exactly the marks never committed, and persistedAbandoned already tracks
+// the abandoned rows every flush (mid-pass chunk or final) committed — so
+// Stats is simply re-based onto the persisted totals instead of computed
+// from prediction deltas (the old `queuedAbandoned - persistedAbandoned`
+// subtraction could go negative and silently drop the count of chunks
+// that had already committed).
 func (st *Stats) ReportDroppedFailureMarks(fw *failureWriter) {
-	dropped := fw.droppedMarks()
-	st.Failed -= dropped
-	st.Abandoned -= fw.queuedAbandoned - fw.persistedAbandoned
+	st.Failed -= fw.droppedMarks()
+	st.Abandoned = fw.persistedAbandoned
 	if st.Failed < 0 {
 		st.Failed = 0
-	}
-	if st.Abandoned < 0 {
-		st.Abandoned = 0
 	}
 }
 

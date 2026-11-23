@@ -429,6 +429,77 @@ func (d *DB) ForEachNodeByNameContext(ctx context.Context, name string, fn func(
 	return nil
 }
 
+// ForEachNodeByNameResolveContext iterates nodes matching name for the
+// resolution candidate path using a minimal projection: id/kind/name/file
+// plus a one-byte body sentinel that preserves the `Body != ""` truthiness
+// MatchName scores on (a real body is never read — at MaxBodyChars per row
+// the full-column scan dominated the pass's peak RSS on large indexes).
+// Keyset pagination is identical to ForEachNodeByNameContext, and every
+// page is scanned into a local slice and its cursor closed BEFORE fn runs:
+// with MaxOpenConns(1), a callback that issues its own SQL while a
+// *sql.Rows is still open deadlocks the single connection.
+//
+// The CASE projection still evaluates the `body` column per row, so tests
+// that wrap `body` in a cancellation view (installCancelLookup) keep their
+// per-row SQL cancellation surface exactly as the full-column scan had.
+func (d *DB) ForEachNodeByNameResolveContext(ctx context.Context, name string, fn func(n Node) error) error {
+	if name == "" {
+		return nil
+	}
+	const batchSize = 1000
+	var lastID int64
+	for {
+		nodes, err := func() ([]Node, error) {
+			d.mu.RLock()
+			defer d.mu.RUnlock()
+			// length(body) reads the column once per row (a `body IS NULL OR
+			// body = ''` disjunction can evaluate the expression twice when
+			// wrapped by a test view's scalar UDF, doubling the hook count).
+			rows, err := d.conn.QueryContext(ctx, `
+				SELECT id, kind, name, file,
+					CASE WHEN length(body) > 0 THEN 'x' ELSE '' END AS body
+				FROM nodes WHERE name = ? AND id > ?
+				ORDER BY id LIMIT ?
+			`, name, lastID, batchSize)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var out []Node
+			for rows.Next() {
+				var n Node
+				if err := rows.Scan(&n.ID, &n.Kind, &n.Name, &n.File, &n.Body); err != nil {
+					return nil, err
+				}
+				out = append(out, n)
+			}
+			return out, rows.Err()
+		}()
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := fn(n); err != nil {
+				return err
+			}
+			lastID = n.ID
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(nodes) < batchSize {
+			break
+		}
+	}
+	return nil
+}
+
 // ForEachNodeByNameLightContext iterates nodes matching name using the
 // light column set (body omitted) and keyset pagination. The filter
 // predicate is applied per row before emit: rows it rejects are skipped
