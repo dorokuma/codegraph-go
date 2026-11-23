@@ -191,7 +191,6 @@ codegraph-go/
 │   │                        # ripgrep 集成 + rg 侧排除规则翻译
 │   ├── tools/               # explore / node / graph / affected / communities
 │   ├── sync/                # 2 秒防抖文件监听
-│   ├── search/              # 标识符分词 + 模糊评分/编辑距离辅助函数
 │   ├── config/              # YAML 配置发现与校验
 │   ├── cgdir/               # .codegraph/ 根定位
 │   └── safelog/             # 带脱敏的日志

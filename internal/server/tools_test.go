@@ -232,6 +232,88 @@ func TestToolImpact(t *testing.T) {
 	}
 }
 
+// setupImpactChainServer builds a caller chain Gamma <- Alpha <- Beta <- Delta
+// (each calls the next) so impact BFS depth is observable in the output.
+func setupImpactChainServer(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close(); os.RemoveAll(dir) })
+
+	for _, f := range []string{"alpha.go", "beta.go", "delta.go"} {
+		_ = os.WriteFile(filepath.Join(dir, f), []byte("package p\n"), 0o644)
+	}
+
+	idG, _ := database.UpsertNode(&db.Node{Kind: db.KindStruct, Name: "Gamma", File: "gamma.go", Line: 1, EndLine: 5, Language: "go"})
+	idA, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Alpha", File: "alpha.go", Line: 1, EndLine: 5, Language: "go"})
+	idB, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Beta", File: "beta.go", Line: 1, EndLine: 5, Language: "go"})
+	idD, _ := database.UpsertNode(&db.Node{Kind: db.KindFunction, Name: "Delta", File: "delta.go", Line: 1, EndLine: 5, Language: "go"})
+	database.UpsertEdge(&db.Edge{SourceID: idA, TargetID: idG, Kind: db.EdgeCalls, File: "alpha.go", Line: 2})
+	database.UpsertEdge(&db.Edge{SourceID: idB, TargetID: idA, Kind: db.EdgeCalls, File: "beta.go", Line: 2})
+	database.UpsertEdge(&db.Edge{SourceID: idD, TargetID: idB, Kind: db.EdgeCalls, File: "delta.go", Line: 2})
+
+	return &Server{Workdir: dir, Database: database}
+}
+
+func TestToolImpactDepth(t *testing.T) {
+	s := setupImpactChainServer(t)
+
+	// Default depth (unset/<=0) must keep the historical default of 2:
+	// alpha.go (depth 1) and beta.go (depth 2) appear, delta.go (depth 3) does not.
+	result, _, err := s.toolImpact(context.Background(), nil, nameArgs{Name: "Gamma"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := textContent(result)
+	if !strings.Contains(text, "alpha.go") {
+		t.Fatalf("expected alpha.go (depth 1) in default impact, got:\n%s", text)
+	}
+	if !strings.Contains(text, "beta.go") {
+		t.Fatalf("expected beta.go (depth 2) in default impact, got:\n%s", text)
+	}
+	if strings.Contains(text, "delta.go") {
+		t.Fatalf("default impact must not traverse to depth 3 (delta.go), got:\n%s", text)
+	}
+
+	// Explicit depth=1 narrows the blast radius to direct callers only.
+	result, _, err = s.toolImpact(context.Background(), nil, nameArgs{Name: "Gamma", Depth: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = textContent(result)
+	if !strings.Contains(text, "alpha.go") {
+		t.Fatalf("expected alpha.go (depth 1) with depth=1, got:\n%s", text)
+	}
+	if strings.Contains(text, "beta.go") || strings.Contains(text, "delta.go") {
+		t.Fatalf("depth=1 must exclude indirect callers, got:\n%s", text)
+	}
+
+	// Explicit depth=3 reaches one more hop than the default.
+	result, _, err = s.toolImpact(context.Background(), nil, nameArgs{Name: "Gamma", Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = textContent(result)
+	for _, want := range []string{"alpha.go", "beta.go", "delta.go"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %s in depth=3 impact, got:\n%s", want, text)
+		}
+	}
+
+	// Depth <=0 falls back to the same default-2 behavior (backward compat).
+	result, _, err = s.toolImpact(context.Background(), nil, nameArgs{Name: "Gamma", Depth: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = textContent(result)
+	if strings.Contains(text, "delta.go") || !strings.Contains(text, "beta.go") {
+		t.Fatalf("depth<=0 must behave like default depth=2, got:\n%s", text)
+	}
+}
+
 func TestToolStatus(t *testing.T) {
 	s, _ := setupToolServer(t)
 	result, _, err := s.toolStatus(context.Background(), nil, statusArgs{})
