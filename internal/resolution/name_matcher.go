@@ -2,6 +2,7 @@ package resolution
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 
@@ -171,6 +172,41 @@ func collectCandidatesContext(ctx context.Context, database *db.DB, refName stri
 	}
 	return out, nil
 }
+
+// hasCandidateContext reports whether refName has at least one candidate
+// node — the same existence check collectCandidatesContext implies, but
+// streaming light rows (no body/signature/docstring) and stopping at the
+// first hit. The failed-retry filter asks this per failed ref; over a large
+// backlog of refs whose names resolve to nothing it skips materializing
+// full Node values entirely.
+func hasCandidateContext(ctx context.Context, database *db.DB, refName string) (bool, error) {
+	refName = strings.TrimSpace(refName)
+	if refName == "" {
+		return false, nil
+	}
+	names := []string{refName}
+	if tail := nameTail(refName); tail != "" && tail != refName {
+		names = append(names, tail)
+	}
+	for _, name := range names {
+		hit := false
+		err := database.ForEachNodeByNameLightContext(ctx, name, func(db.Node) bool { return true }, func(n db.Node) error {
+			hit = true
+			return errStop
+		})
+		if err != nil && !errors.Is(err, errStop) {
+			return false, err
+		}
+		if hit {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// errStop aborts a ForEach* iteration early without surfacing an error to
+// the caller — hasCandidateContext only needs the first match.
+var errStop = errors.New("candidate scan stop")
 
 func nameTail(name string) string {
 	name = strings.TrimSpace(name)

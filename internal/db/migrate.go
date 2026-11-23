@@ -64,6 +64,7 @@ func (d *DB) ensureSchema() error {
 	for _, q := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_kind_file ON edges(kind, file)`,
 		`CREATE INDEX IF NOT EXISTS idx_files_language ON files(language)`,
 		`CREATE INDEX IF NOT EXISTS idx_unresolved_from_node ON unresolved_refs(from_node)`,
 		`CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_refs(reference_name)`,
@@ -286,6 +287,7 @@ func (d *DB) promoteEdgesNew() error {
 		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`},
 		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`},
 		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)`},
+		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_kind_file ON edges(kind, file)`},
 		{"index after promote", `CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`},
 	}
 	for _, q := range queries {
@@ -391,6 +393,7 @@ func (d *DB) rebuildEdgesUniqueKey() (retErr error) {
 		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)`,
+		`CREATE INDEX IF NOT EXISTS idx_edges_kind_file ON edges(kind, file)`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance)`,
 	} {
 		if _, err := tx.Exec(q); err != nil {

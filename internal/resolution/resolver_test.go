@@ -351,19 +351,30 @@ func TestNameResolution10001SameNameCandidates(t *testing.T) {
 	}
 	defer database.Close()
 
-	// Insert 10,001 nodes named "CommonService"
+	// Insert 10,001 nodes named "CommonService". Batched through UpsertNodes:
+	// 10k individual UpsertNode autocommit transactions (one fsync each under
+	// synchronous=FULL) made this fixture take minutes on a slow-fsync host.
 	const total = 10001
+	svcNodes := make([]*db.Node, 0, total)
 	for i := 0; i < total; i++ {
-		file := filepath.Join(dir, fmt.Sprintf("service_%05d.go", i))
-		if _, err := database.UpsertNode(&db.Node{
+		svcNodes = append(svcNodes, &db.Node{
 			Kind:     db.KindFunction,
 			Name:     "CommonService",
-			File:     file,
+			File:     filepath.Join(dir, fmt.Sprintf("service_%05d.go", i)),
 			Line:     1,
 			Language: "go",
-		}); err != nil {
-			t.Fatal(err)
-		}
+		})
+	}
+	// This fixture never runs a full-text search; dropping the FTS triggers
+	// keeps the 10k-node insert from paying per-row FTS5 maintenance.
+	if err := database.DisableNodesFTSForTest(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.UpsertNodes(svcNodes); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.EnableNodesFTSForTest(); err != nil {
+		t.Fatal(err)
 	}
 
 	// The 10,001st node is in service_10000.go

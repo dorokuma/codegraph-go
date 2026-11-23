@@ -83,14 +83,18 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 	}
 	defer tx.Rollback()
 
-	type parkTarget struct {
-		id   int64
-		kind string
-		name string
+	ph := make([]string, len(inboundParkKinds))
+	kindArgs := make([]interface{}, 0, len(inboundParkKinds))
+	for i, k := range inboundParkKinds {
+		ph[i] = "?"
+		kindArgs = append(kindArgs, k)
 	}
+
 	// Snapshot this file's parkable targets in id-paginated chunks
 	// (ForEachNodeByFileLight's bounding) so memory stays bounded on files
-	// with many nodes; file/module targets never park.
+	// with many nodes; file/module targets never park. Each chunk resolves
+	// its inbound edges with ONE join query (was: a per-node edges query,
+	// which ran tens of thousands of statements on a file with 10k+ nodes).
 	const targetBatchSize = 1000
 	var lastID int64
 	for {
@@ -118,14 +122,9 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 		if len(targets) == 0 {
 			break
 		}
-		for _, t := range targets {
-			lastID = t.id
-			if t.kind == KindFile || t.kind == "module" {
-				continue
-			}
-			if err := parkInboundEdgesForNode(tx, t.id, t.name, file); err != nil {
-				return err
-			}
+		lastID = targets[len(targets)-1].id
+		if err := parkInboundEdgesForTargets(tx, targets, file, strings.Join(ph, ","), kindArgs); err != nil {
+			return err
 		}
 		if len(targets) < targetBatchSize {
 			break
@@ -137,85 +136,116 @@ func (d *DB) ParkInboundRefsForFile(file string) error {
 	return nil
 }
 
-// parkInboundEdgesForNode inserts pending refs for one target node's inbound
-// edges of parkable kinds, skipping edges whose source is gone or lives in
-// the same file (same-file edges are rebuilt by the owning file's index).
-// Runs on the caller's transaction; see ParkInboundRefsForFile for the
-// locking and transaction contract. The insert statement is the same
-// upsert InsertUnresolvedRef uses, so re-parking an existing pending/failed
-// row refreshes it to pending without resetting its attempts count.
-func parkInboundEdgesForNode(tx *sql.Tx, targetID int64, targetName, file string) error {
-	ph := make([]string, len(inboundParkKinds))
-	args := make([]interface{}, 0, len(inboundParkKinds)+1)
-	args = append(args, targetID)
-	for i, k := range inboundParkKinds {
-		ph[i] = "?"
-		args = append(args, k)
+// parkTarget is one parkable node in the parked file (its inbound edges may
+// need rebuilding after the file's own index is replaced).
+type parkTarget struct {
+	id   int64
+	kind string
+	name string
+}
+
+// parkInboundEdgesForTargets resolves and parks the inbound parkable edges
+// for a whole chunk of target nodes in ONE join query (was: one edges query
+// per target node — on a file with 10k+ nodes that ran tens of thousands of
+// statements under a single write lock). The join keeps the source node's
+// file/language and the target's name in the same row, so no per-edge
+// source lookup is needed either. Rows whose source is missing (already
+// cascade-deleted) or lives in the parked file are skipped here exactly as
+// the per-node path did; file/module targets never park. The insert is the
+// same upsert InsertUnresolvedRef uses, so re-parking an existing
+// pending/failed row refreshes it to pending without resetting attempts.
+func parkInboundEdgesForTargets(tx *sql.Tx, targets []parkTarget, file, kindPH string, kindArgs []interface{}) error {
+	// Parkable targets only: file/module nodes never park (same rule as the
+	// per-node path's kind filter).
+	parkable := make([]parkTarget, 0, len(targets))
+	for _, t := range targets {
+		if t.kind == KindFile || t.kind == "module" {
+			continue
+		}
+		parkable = append(parkable, t)
 	}
-	rows, err := tx.Query(`SELECT source_id, kind, file, line, col FROM edges
-		WHERE target_id = ? AND kind IN (`+strings.Join(ph, ",")+`)`, args...)
+	if len(parkable) == 0 {
+		return nil
+	}
+
+	targetPH := strings.TrimSuffix(strings.Repeat("?,", len(parkable)), ",")
+	args := make([]interface{}, 0, len(parkable)+len(kindArgs))
+	for _, t := range parkable {
+		args = append(args, t.id)
+	}
+	args = append(args, kindArgs...)
+
+	// One join: edges -> target node (name) -> source node (file, language).
+	// Sources that were already cascade-deleted produce no nodes row, so the
+	// inner join drops them exactly like the old ErrNoRows skip.
+	rows, err := tx.Query(`
+		SELECT e.source_id, e.kind, e.file, e.line, e.col,
+			tgt.name, src.file, src.language
+		FROM edges e
+		JOIN nodes tgt ON tgt.id = e.target_id
+		JOIN nodes src ON src.id = e.source_id
+		WHERE e.target_id IN (`+targetPH+`) AND e.kind IN (`+kindPH+`)`, args...)
 	if err != nil {
 		return fmt.Errorf("park inbound refs edges: %w", err)
 	}
-	type inboundEdge struct {
+	defer rows.Close()
+
+	type inboundRow struct {
 		sourceID  int64
 		kind      string
 		file      string
 		line, col int
+		tgtName   string
+		srcFile   sql.NullString
+		srcLang   sql.NullString
 	}
-	var edges []inboundEdge
+	var ins *sql.Stmt
+	defer func() {
+		if ins != nil {
+			ins.Close()
+		}
+	}()
 	for rows.Next() {
-		var e inboundEdge
-		var f sql.NullString
+		var r inboundRow
+		var eFile sql.NullString
 		var line, col sql.NullInt64
-		if err := rows.Scan(&e.sourceID, &e.kind, &f, &line, &col); err != nil {
-			rows.Close()
+		if err := rows.Scan(&r.sourceID, &r.kind, &eFile, &line, &col, &r.tgtName, &r.srcFile, &r.srcLang); err != nil {
 			return fmt.Errorf("park inbound refs edges: %w", err)
 		}
-		e.file = f.String
-		e.line = int(line.Int64)
-		e.col = int(col.Int64)
-		edges = append(edges, e)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("park inbound refs edges: %w", err)
-	}
-	rows.Close()
-
-	for _, e := range edges {
-		var srcFile, srcLang sql.NullString
-		err := tx.QueryRow(`SELECT file, language FROM nodes WHERE id = ?`, e.sourceID).Scan(&srcFile, &srcLang)
-		if err == sql.ErrNoRows {
-			continue // source node already gone: nothing to rebuild
+		r.file = eFile.String
+		r.line = int(line.Int64)
+		r.col = int(col.Int64)
+		if !r.srcFile.Valid || r.srcFile.String == file {
+			continue // same-file edge: rebuilt by the owning file's index
 		}
-		if err != nil {
-			return fmt.Errorf("park inbound refs source: %w", err)
-		}
-		if !srcFile.Valid || srcFile.String == file {
-			continue
-		}
-		refFile := e.file
+		refFile := r.file
 		if refFile == "" {
-			refFile = srcFile.String
+			refFile = r.srcFile.String
 		}
-		if _, err := tx.Exec(`
-			INSERT INTO unresolved_refs (
-				from_node, reference_name, reference_kind, line, col,
-				file_path, language, status, name_tail, candidates
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(from_node, reference_name, reference_kind, line, col) DO UPDATE SET
-				file_path = excluded.file_path,
-				language = excluded.language,
-				status = excluded.status,
-				name_tail = excluded.name_tail,
-				candidates = excluded.candidates
-		`, e.sourceID, targetName, e.kind, e.line, e.col,
-			refFile, srcLang.String, "pending", refNameTail(targetName), ""); err != nil {
+		if ins == nil {
+			var perr error
+			ins, perr = tx.Prepare(`
+				INSERT INTO unresolved_refs (
+					from_node, reference_name, reference_kind, line, col,
+					file_path, language, status, name_tail, candidates
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(from_node, reference_name, reference_kind, line, col) DO UPDATE SET
+					file_path = excluded.file_path,
+					language = excluded.language,
+					status = excluded.status,
+					name_tail = excluded.name_tail,
+					candidates = excluded.candidates
+			`)
+			if perr != nil {
+				return fmt.Errorf("park inbound refs prepare: %w", perr)
+			}
+		}
+		if _, err := ins.Exec(r.sourceID, r.tgtName, r.kind, r.line, r.col,
+			refFile, r.srcLang.String, "pending", refNameTail(r.tgtName), ""); err != nil {
 			return fmt.Errorf("park inbound refs insert: %w", err)
 		}
 	}
-	return nil
+	return rows.Err()
 }
 
 // CountUnresolvedRefs returns how many unresolved_refs rows match status
@@ -637,6 +667,61 @@ func (d *DB) MarkUnresolvedFailed(id int64, nameTail string, maxAttempts int) (b
 		return false, fmt.Errorf("mark unresolved_ref failed: %w", err)
 	}
 	return status == "abandoned", nil
+}
+
+// UnresolvedFailedRef is one failed resolution attempt awaiting persistence:
+// the id of the unresolved_ref row plus the name tail to store with it.
+type UnresolvedFailedRef struct {
+	ID       int64
+	NameTail string
+}
+
+// ApplyUnresolvedFailed persists a batch of failed resolution attempts inside
+// ONE transaction, reusing the exact MarkUnresolvedFailed update per row:
+// attempts increments, status flips to 'failed' or — at maxAttempts —
+// 'abandoned'. Resolution passes used to mark each failed ref in its own
+// implicit autocommit transaction, so a large failing backlog committed once
+// per row (each commit an fsync and WAL growth under the single-writer lock);
+// the batched form commits once per pass, matching ApplyResolvedRefs. The
+// result flags which refs this call abandoned, in input order. On error the
+// batch rolls back and the caller falls back to per-ref MarkUnresolvedFailed
+// calls, so the final per-ref state is identical to the per-ref path.
+func (d *DB) ApplyUnresolvedFailed(refs []UnresolvedFailedRef, maxAttempts int) ([]bool, error) {
+	abandoned := make([]bool, len(refs))
+	if len(refs) == 0 {
+		return abandoned, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	for i, r := range refs {
+		var status string
+		err := tx.QueryRow(`
+			UPDATE unresolved_refs SET
+				attempts = attempts + 1,
+				status = CASE WHEN attempts + 1 >= ? THEN 'abandoned' ELSE 'failed' END,
+				name_tail = ?
+			WHERE id = ?
+			RETURNING status
+		`, maxAttempts, r.NameTail, r.ID).Scan(&status)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("mark unresolved_ref failed: %w", err)
+		}
+		abandoned[i] = status == "abandoned"
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return abandoned, nil
 }
 
 // getNodesByFileCap bounds GetNodesByFile results to prevent unbounded reads.

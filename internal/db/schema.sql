@@ -106,6 +106,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
+-- (kind,file): GetImportTargetNames / FindImporters filter imports edges by
+-- file; kind-only indexing scans every imports edge per call.
+CREATE INDEX IF NOT EXISTS idx_edges_kind_file ON edges(kind, file);
 
 -- Agent-accessible fact storage: cross-session findings attached to code symbols.
 CREATE TABLE IF NOT EXISTS facts (
