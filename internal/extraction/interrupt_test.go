@@ -59,7 +59,7 @@ func TestFileDeletionStopsBetweenTransactions(t *testing.T) {
 			case "root":
 				err = orch.DeleteTree(root)
 			case "prune":
-				err = orch.pruneMissingFiles(nil)
+				_, err = orch.pruneMissingFiles(nil)
 			}
 			if !errors.Is(err, ErrIndexInterrupted) || calls.Load() != 1 {
 				t.Fatalf("%s: delete calls=%d err=%v, want one committed unit then interruption", mode, calls.Load(), err)

@@ -55,7 +55,7 @@ func TestReferenceScansCancelDuringSQLiteExecution(t *testing.T) {
 			}
 			if _, err := database.conn.Exec(`CREATE VIEW unresolved_refs AS SELECT
 				id, from_node, ` + function + `(reference_name) AS reference_name,
-				reference_kind, line, col, file_path, language, status, name_tail, candidates
+				reference_kind, line, col, file_path, language, status, name_tail, candidates, attempts
 				FROM cancellation_refs`); err != nil {
 				t.Fatal(err)
 			}

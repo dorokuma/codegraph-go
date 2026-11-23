@@ -42,6 +42,9 @@ supersedes: ""
 - **内容**：67.8 万失败 mark 场景约 150-250MB 常驻至 pass 尾；`failureWriter` 刻意无中刷（中刷无一致性收益）。低内存/`cpu_quota` 受限部署下有 GC/OOM 风险面。
 - **判定**：真实取舍待决（本次范围外）；后续可拍板是否分片 flush（如每 10k marks 一事务）。观察项。
 
+## 补充不变量（perf/mega-workspace-scale S1 修复时登记，Oracle O2）
+- `ForEachUnresolvedRefsContext` 的流式 `failed` 扫描与 `failureWriter.seen` 构成硬不变量：**凡在同一 pass 内将某 ref 置为 `failed`/`abandoned` 的路径，必须经过 `failureWriter.markFailed` 登记 `fw.seen[r.ID]`**。流式扫描（keyset 分页、边扫边处理）会看到本 pass 刚翻转为 failed 的行并重复处理（双计 attempts、双计 Failed/Abandoned）；旧快照读在 pending 循环之前取 failed 集，天然看不到它们。新增任何同 pass 内标记失败的路径时不得绕过 `markFailed`/`seen`。
+
 ## 来源
-- 关联分支：`fix/resolve-perf`（合并后删）；实现 `internal/resolution/resolver.go`、`internal/db/query_refs.go`。
+- 关联分支：`fix/resolve-perf`（合并后删）、`perf/mega-workspace-scale`；实现 `internal/resolution/resolver.go`、`internal/db/query_refs.go`。
 - 门禁报告：`role-oracle-79b3347c`、`role-reviewer`（两轮）、`role-verifier`（两轮）。

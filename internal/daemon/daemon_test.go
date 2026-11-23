@@ -482,6 +482,72 @@ func TestDaemonStopIfIdleDoesNotCutInFlightOrHandshakingSession(t *testing.T) {
 	d.Stop("test cleanup")
 }
 
+// TestDaemonIdleDefersDuringBackgroundWork is the regression for the idle
+// suicide that used to cancel in-flight index passes: with background work
+// tracked, the idle timer must defer until the work releases, while an
+// explicit Stop still cuts immediately. Without the stopIfIdle busy check
+// this test fails at the "still alive" assertion (daemon exits on the
+// first idle window).
+func TestDaemonIdleDefersDuringBackgroundWork(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(CodeGraphDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvIdleTimeoutMS, "150")
+
+	handler := func(ctx context.Context, rwc io.ReadWriteCloser) error {
+		<-ctx.Done()
+		return nil
+	}
+	d := New(root, handler)
+	d.idleAfter = IdleTimeout()
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	release := daemon_TrackBackgroundWorkForTest(t)
+
+	// >2× idle window: without the busy check the daemon would already be
+	// gone. It must still be alive.
+	time.Sleep(400 * time.Millisecond)
+	select {
+	case <-d.ctx.Done():
+		t.Fatal("idle timeout fired while background work was in flight")
+	default:
+	}
+
+	release()
+
+	// After release the next idle window must stop the daemon.
+	done := make(chan struct{})
+	go func() { d.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		d.Stop("test timeout")
+		t.Fatal("daemon did not idle-exit after background work released")
+	}
+}
+
+// daemon_TrackBackgroundWorkForTest wraps TrackBackgroundWork so the test
+// reads one call site; t.Cleanup releases it even on failure (the counter
+// is a package-level atomic shared across tests in this package).
+func daemon_TrackBackgroundWorkForTest(t *testing.T) func() {
+	t.Helper()
+	release := TrackBackgroundWork()
+	var once atomic.Bool
+	t.Cleanup(func() {
+		if once.CompareAndSwap(false, true) {
+			release()
+		}
+	})
+	return func() {
+		if once.CompareAndSwap(false, true) {
+			release()
+		}
+	}
+}
+
 // TestApplyProcessLimitsMaxProcs: GOMAXPROCS capping honours the env-var
 // precedence rule — an explicit GOMAXPROCS always wins over max_procs.
 func TestApplyProcessLimitsMaxProcs(t *testing.T) {

@@ -39,6 +39,16 @@ var noisyRefNames = map[string]struct{}{
 	// Svelte 5 runes
 	"$props": {}, "$state": {}, "$derived": {}, "$effect": {},
 	"$bindable": {}, "$inspect": {}, "$host": {}, "$snippet": {},
+	// Go builtins / very high-frequency stdlib plumbing names. Only names
+	// that are virtually never user-defined project symbols are listed —
+	// park-time checks run BEFORE the file's own nodes are committed, so a
+	// name a project can legitimately define (String/Error/New/len/close/…)
+	// would skip the park and drop a resolvable ref. These entries are
+	// still gated by hasProjectSymbol at scrub time.
+	"panic": {}, "recover": {},
+	"Fatalf": {}, "Errorf": {}, "Fatal": {}, "Sprint": {}, "Sprintf": {},
+	"Stringf": {}, "Printf": {}, "Println": {},
+	"Fprint": {}, "Fprintf": {}, "Fprintln": {},
 }
 
 // IsNoisyRefName reports whether name looks like framework/host plumbing.

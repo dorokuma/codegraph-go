@@ -314,16 +314,19 @@ func (s *Server) startWatcherWithRetry(orch *extraction.Orchestrator, workdir st
 	return nil
 }
 
-func backgroundIndexAndWatch(s *Server, noSync bool) {
-	defer s.BgWg.Done()
+// indexPrimaryWorkdir runs the primary workdir's background index pass:
+// schema-revision check, rebuild-or-index with revision marking, then the
+// optional git-status assist for edits missed while nothing was watching.
+// Returns false when BgDone fired — the caller exits without touching any
+// further workdir or the watcher.
+func indexPrimaryWorkdir(s *Server) bool {
 	database := s.Database
 	orch := s.Orchestrator
 	workdir := s.Workdir
 
-	// --- Primary workdir indexing ---
 	select {
 	case <-s.BgDone:
-		return
+		return false
 	default:
 	}
 
@@ -338,95 +341,255 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		// RebuildAll, no IndexAll, no SetSchemaRevision. The watcher below
 		// still re-syncs on later changes.
 		slog.Error("schema revision check failed; skipping index round", "error", rebuildErr)
-	} else {
-		// serr records a failed SetSchemaRevision; nil means the revision was
-		// stored (or RebuildAll handled the marking internally). It gates the
-		// success Info below: a failed SetSchemaRevision must not be logged
-		// as "indexed … schema=<target>" (SchemaRevision() is the target
-		// constant, not what the DB actually holds).
-		var serr error
-		if rebuild {
-			slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
+		return true
+	}
 
-			select {
-			case <-s.BgDone:
-				return
-			default:
-			}
-			files, nodes, err = orch.RebuildAll()
-			// RebuildAll marks the schema revision only on a complete pass.
-			// An interrupted rebuild returns ErrIndexInterrupted and leaves
-			// the revision at its old value: the next startup sees
-			// NeedsRebuild()==true and re-runs the full rebuild, so a wiped
-			// half index is never presented as current.
-		} else {
-			slog.Info("indexing project in background...")
+	// serr records a failed SetSchemaRevision; nil means the revision was
+	// stored (or RebuildAll handled the marking internally). It gates the
+	// success Info below: a failed SetSchemaRevision must not be logged
+	// as "indexed … schema=<target>" (SchemaRevision() is the target
+	// constant, not what the DB actually holds).
+	var serr error
+	if rebuild {
+		slog.Info("full rebuild", "from", oldVer, "to", db.SchemaRevision())
 
-			select {
-			case <-s.BgDone:
-				return
-			default:
-			}
-			files, nodes, err = orch.IndexAll()
-			if errors.Is(err, extraction.ErrIndexInterrupted) {
-				// Shutdown interrupted the pass: do NOT mark the schema
-				// revision — the half index must not masquerade as current.
-				// Logged as an interruption below, not as success. No retry:
-				// BgDone is closed, so every later step in this goroutine
-				// bails on it.
-			} else if err == nil {
-				// Set the schema revision FIRST, then report partial failures:
-				// "marked current" must only be logged after the revision is
-				// actually stored — a shutdown between the log line and
-				// SetSchemaRevision would claim current for an unmarked index.
-				serr = database.SetSchemaRevision()
-				if serr != nil {
-					slog.Warn("set schema revision", "error", serr)
-				} else if n := orch.PartialFailures(); n > 0 {
-					// M7: extraction failures keep the old index and are retried on
-					// the next pass (M2), so marking the revision is safe — but
-					// surface the partial-failure count so operators see the index
-					// is marked current with gaps. (Panics/H5 and hard errors set
-					// err != nil and never reach here.)
-					slog.Warn("index marked current with extraction failures; will retry", "failed_files", n)
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, extraction.ErrIndexInterrupted) {
-				slog.Warn("index pass interrupted by shutdown, revision not marked")
-			} else {
-				slog.Warn("index warning", "error", err)
-			}
-		} else if serr == nil {
-			slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
-		}
-
-		// Do not start a git probe after shutdown; an already-started probe
-		// retains its existing timeout and non-context API.
 		select {
 		case <-s.BgDone:
-			return
+			return false
 		default:
 		}
-		// Optional git-status assist: catch edits missed while nothing was watching.
-		if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
-			select {
-			case <-s.BgDone:
-				return
-			default:
-			}
-			c, n, gerr := orch.IndexChanges(dirty)
-			if gerr != nil {
-				if errors.Is(gerr, extraction.ErrIndexInterrupted) {
-					slog.Warn("index pass interrupted by shutdown, revision not marked")
-				} else {
-					slog.Warn("git-assist sync", "error", gerr)
-				}
-			} else if c > 0 {
-				slog.Info("git-assist sync", "files", c, "nodes", n)
+		func() {
+			defer daemon.TrackBackgroundWork()()
+			files, nodes, err = orch.RebuildAll()
+		}()
+		// RebuildAll marks the schema revision only on a complete pass.
+		// An interrupted rebuild returns ErrIndexInterrupted and leaves
+		// the revision at its old value: the next startup sees
+		// NeedsRebuild()==true and re-runs the full rebuild, so a wiped
+		// half index is never presented as current.
+	} else {
+		slog.Info("indexing project in background...")
+
+		select {
+		case <-s.BgDone:
+			return false
+		default:
+		}
+		func() {
+			defer daemon.TrackBackgroundWork()()
+			files, nodes, err = orch.IndexAll()
+		}()
+		if errors.Is(err, extraction.ErrIndexInterrupted) {
+			// Shutdown interrupted the pass: do NOT mark the schema
+			// revision — the half index must not masquerade as current.
+			// Logged as an interruption below, not as success. No retry:
+			// BgDone is closed, so every later step in this goroutine
+			// bails on it.
+		} else if err == nil {
+			// Set the schema revision FIRST, then report partial failures:
+			// "marked current" must only be logged after the revision is
+			// actually stored — a shutdown between the log line and
+			// SetSchemaRevision would claim current for an unmarked index.
+			serr = database.SetSchemaRevision()
+			if serr != nil {
+				slog.Warn("set schema revision", "error", serr)
+			} else if n := orch.PartialFailures(); n > 0 {
+				// M7: extraction failures keep the old index and are retried on
+				// the next pass (M2), so marking the revision is safe — but
+				// surface the partial-failure count so operators see the index
+				// is marked current with gaps. (Panics/H5 and hard errors set
+				// err != nil and never reach here.)
+				slog.Warn("index marked current with extraction failures; will retry", "failed_files", n)
 			}
 		}
+	}
+	if err != nil {
+		if errors.Is(err, extraction.ErrIndexInterrupted) {
+			slog.Warn("index pass interrupted by shutdown, revision not marked")
+		} else {
+			slog.Warn("index warning", "error", err)
+		}
+	} else if serr == nil {
+		slog.Info("indexed primary", "files", files, "nodes", nodes, "schema", db.SchemaRevision())
+	}
+
+	// Do not start a git probe after shutdown; an already-started probe
+	// retains its existing timeout and non-context API.
+	select {
+	case <-s.BgDone:
+		return false
+	default:
+	}
+	// Optional git-status assist: catch edits missed while nothing was watching.
+	if dirty := sync.GitDirtySourceFiles(workdir); len(dirty) > 0 {
+		select {
+		case <-s.BgDone:
+			return false
+		default:
+		}
+		var c, n int
+		var gerr error
+		func() {
+			defer daemon.TrackBackgroundWork()()
+			c, n, gerr = orch.IndexChanges(dirty)
+		}()
+		if gerr != nil {
+			if errors.Is(gerr, extraction.ErrIndexInterrupted) {
+				slog.Warn("index pass interrupted by shutdown, revision not marked")
+			} else {
+				slog.Warn("git-assist sync", "error", gerr)
+			}
+		} else if c > 0 {
+			slog.Info("git-assist sync", "files", c, "nodes", n)
+		}
+	}
+	return true
+}
+
+// indexAndWatchExtraWorkdir indexes one additional (secondary) workdir:
+// opens its own DB, runs the same rebuild-or-index revision dance as the
+// primary, then either closes the DB (noSync) or keeps it open under
+// ExtraDBs with a watcher registered — the same auto-sync parity the
+// primary root gets. Returns false when BgDone fired: the caller exits
+// without continuing the loop or starting the primary watcher.
+func indexAndWatchExtraWorkdir(s *Server, wd string, noSync bool) bool {
+	select {
+	case <-s.BgDone:
+		return false
+	default:
+	}
+
+	otherDB, oerr := db.Open(wd)
+	if oerr != nil {
+		slog.Warn("open additional workdir DB", "workdir", wd, "error", oerr)
+		return true
+	}
+	otherOrch := extraction.NewOrchestrator(otherDB, wd)
+	otherOrch.SetDone(s.BgDone)
+	rebuildNeeded, oldVer, rerr := otherDB.NeedsRebuild()
+	if rerr != nil {
+		slog.Warn("schema check", "workdir", wd, "error", rerr)
+		otherDB.Close()
+		return true
+	}
+	var f2, n2 int
+	var err error
+	// Same gate as the primary workdir: serr != nil means the revision
+	// was NOT stored, so skip the success Info (the Warn above already
+	// reported it; NeedsRebuild re-indexes on next startup).
+	var serr error
+	if rebuildNeeded {
+		slog.Info("full rebuild", "workdir", wd, "from", oldVer, "to", db.SchemaRevision())
+		func() {
+			defer daemon.TrackBackgroundWork()()
+			f2, n2, err = otherOrch.RebuildAll()
+		}()
+	} else {
+		slog.Info("indexing", "workdir", wd)
+		func() {
+			defer daemon.TrackBackgroundWork()()
+			f2, n2, err = otherOrch.IndexAll()
+		}()
+		if errors.Is(err, extraction.ErrIndexInterrupted) {
+			// Same rule as the primary workdir: never mark the revision
+			// on an interrupted pass — the next startup rebuilds it.
+		} else if err == nil {
+			// Same ordering as the primary workdir: mark the revision
+			// first, log "marked current" only after it is stored (a
+			// shutdown in between must not claim an unmarked index).
+			serr = otherDB.SetSchemaRevision()
+			if serr != nil {
+				slog.Warn("set schema revision", "workdir", wd, "error", serr)
+			} else if n := otherOrch.PartialFailures(); n > 0 {
+				slog.Warn("index marked current with extraction failures; will retry", "workdir", wd, "failed_files", n)
+			}
+		}
+	}
+	if err != nil {
+		if errors.Is(err, extraction.ErrIndexInterrupted) {
+			slog.Warn("index pass interrupted by shutdown, revision not marked", "workdir", wd)
+		} else {
+			slog.Warn("index warning", "workdir", wd, "error", err)
+		}
+		_ = otherDB.Close()
+		return true
+	}
+	if serr == nil {
+		slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
+	}
+
+	// Keep secondary DB open and watch for changes (parity with primary).
+	if noSync {
+		_ = otherDB.Close()
+		return true
+	}
+	select {
+	case <-s.BgDone:
+		_ = otherDB.Close()
+		return false
+	default:
+	}
+	w2 := s.startWatcherWithRetry(otherOrch, wd)
+	if w2 == nil {
+		select {
+		case <-s.BgDone:
+			_ = otherDB.Close()
+			return false
+		default:
+		}
+		// Retries exhausted: this secondary root keeps its (stale)
+		// index without auto-sync; the DB handle must not leak.
+		// Record the failure per root — the counterpart of the
+		// primary's WatcherStartFailed below — so status can show
+		// "watcher_active: false" for this root instead of leaving
+		// the stale-index state in the startup log only.
+		s.ExtraMu.Lock()
+		if s.ExtraWatcherStartFailed == nil {
+			s.ExtraWatcherStartFailed = map[string]bool{}
+		}
+		s.ExtraWatcherStartFailed[wd] = true
+		s.ExtraMu.Unlock()
+		_ = otherDB.Close()
+		return true
+	}
+	s.ExtraMu.Lock()
+	if s.ExtraDBs == nil {
+		s.ExtraDBs = map[string]*db.DB{}
+	}
+	if s.ExtraWatchers == nil {
+		s.ExtraWatchers = map[string]*sync.Watcher{}
+	}
+	// Drop any stale cross-project cache handle for this root so we
+	// never keep two open connections to the same secondary index.
+	s.ProjectMu.Lock()
+	if e, ok := s.ProjectCache[wd]; ok {
+		delete(s.ProjectCache, wd)
+		s.removeProjectLRU(wd)
+		if atomic.LoadInt32(&e.refs) == 0 {
+			_ = e.db.Close()
+		} else {
+			if s.ProjectPendingClose == nil {
+				s.ProjectPendingClose = map[string]*dbEntry{}
+			}
+			s.ProjectPendingClose[wd] = e
+		}
+	}
+	s.ProjectMu.Unlock()
+	s.ExtraDBs[wd] = otherDB
+	s.ExtraWatchers[wd] = w2
+	s.ExtraMu.Unlock()
+	slog.Info("auto-sync enabled", "workdir", wd)
+	return true
+}
+
+func backgroundIndexAndWatch(s *Server, noSync bool) {
+	defer s.BgWg.Done()
+	orch := s.Orchestrator
+	workdir := s.Workdir
+
+	// --- Primary workdir indexing ---
+	if !indexPrimaryWorkdir(s) {
+		return
 	}
 
 	// --- Additional workdirs indexing (open DB, index, close) ---
@@ -434,124 +597,8 @@ func backgroundIndexAndWatch(s *Server, noSync bool) {
 		if i == 0 {
 			continue // primary already indexed
 		}
-		select {
-		case <-s.BgDone:
+		if !indexAndWatchExtraWorkdir(s, wd, noSync) {
 			return
-		default:
-		}
-
-		otherDB, oerr := db.Open(wd)
-		if oerr != nil {
-			slog.Warn("open additional workdir DB", "workdir", wd, "error", oerr)
-			continue
-		}
-		otherOrch := extraction.NewOrchestrator(otherDB, wd)
-		otherOrch.SetDone(s.BgDone)
-		rebuildNeeded, oldVer, rerr := otherDB.NeedsRebuild()
-		if rerr != nil {
-			slog.Warn("schema check", "workdir", wd, "error", rerr)
-			otherDB.Close()
-			continue
-		}
-		var f2, n2 int
-		// Same gate as the primary workdir: serr != nil means the revision
-		// was NOT stored, so skip the success Info (the Warn above already
-		// reported it; NeedsRebuild re-indexes on next startup).
-		var serr error
-		if rebuildNeeded {
-			slog.Info("full rebuild", "workdir", wd, "from", oldVer, "to", db.SchemaRevision())
-			f2, n2, err = otherOrch.RebuildAll()
-		} else {
-			slog.Info("indexing", "workdir", wd)
-			f2, n2, err = otherOrch.IndexAll()
-			if errors.Is(err, extraction.ErrIndexInterrupted) {
-				// Same rule as the primary workdir: never mark the revision
-				// on an interrupted pass — the next startup rebuilds it.
-			} else if err == nil {
-				// Same ordering as the primary workdir: mark the revision
-				// first, log "marked current" only after it is stored (a
-				// shutdown in between must not claim an unmarked index).
-				serr = otherDB.SetSchemaRevision()
-				if serr != nil {
-					slog.Warn("set schema revision", "workdir", wd, "error", serr)
-				} else if n := otherOrch.PartialFailures(); n > 0 {
-					slog.Warn("index marked current with extraction failures; will retry", "workdir", wd, "failed_files", n)
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, extraction.ErrIndexInterrupted) {
-				slog.Warn("index pass interrupted by shutdown, revision not marked", "workdir", wd)
-			} else {
-				slog.Warn("index warning", "workdir", wd, "error", err)
-			}
-			_ = otherDB.Close()
-			continue
-		}
-		if serr == nil {
-			slog.Info("indexed", "workdir", wd, "files", f2, "nodes", n2)
-		}
-
-		// Keep secondary DB open and watch for changes (parity with primary).
-		if !noSync {
-			select {
-			case <-s.BgDone:
-				_ = otherDB.Close()
-				return
-			default:
-			}
-			w2 := s.startWatcherWithRetry(otherOrch, wd)
-			if w2 == nil {
-				select {
-				case <-s.BgDone:
-					_ = otherDB.Close()
-					return
-				default:
-				}
-				// Retries exhausted: this secondary root keeps its (stale)
-				// index without auto-sync; the DB handle must not leak.
-				// Record the failure per root — the counterpart of the
-				// primary's WatcherStartFailed below — so status can show
-				// "watcher_active: false" for this root instead of leaving
-				// the stale-index state in the startup log only.
-				s.ExtraMu.Lock()
-				if s.ExtraWatcherStartFailed == nil {
-					s.ExtraWatcherStartFailed = map[string]bool{}
-				}
-				s.ExtraWatcherStartFailed[wd] = true
-				s.ExtraMu.Unlock()
-				_ = otherDB.Close()
-				continue
-			}
-			s.ExtraMu.Lock()
-			if s.ExtraDBs == nil {
-				s.ExtraDBs = map[string]*db.DB{}
-			}
-			if s.ExtraWatchers == nil {
-				s.ExtraWatchers = map[string]*sync.Watcher{}
-			}
-			// Drop any stale cross-project cache handle for this root so we
-			// never keep two open connections to the same secondary index.
-			s.ProjectMu.Lock()
-			if e, ok := s.ProjectCache[wd]; ok {
-				delete(s.ProjectCache, wd)
-				s.removeProjectLRU(wd)
-				if atomic.LoadInt32(&e.refs) == 0 {
-					_ = e.db.Close()
-				} else {
-					if s.ProjectPendingClose == nil {
-						s.ProjectPendingClose = map[string]*dbEntry{}
-					}
-					s.ProjectPendingClose[wd] = e
-				}
-			}
-			s.ProjectMu.Unlock()
-			s.ExtraDBs[wd] = otherDB
-			s.ExtraWatchers[wd] = w2
-			s.ExtraMu.Unlock()
-			slog.Info("auto-sync enabled", "workdir", wd)
-		} else {
-			_ = otherDB.Close()
 		}
 	}
 

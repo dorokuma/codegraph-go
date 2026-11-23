@@ -328,10 +328,31 @@ func ShouldSkipDirIn(workdir, path, name string) bool {
 	if _, ok := skipDirNames[name]; ok {
 		return true
 	}
-	// User-configured exclusions (config.yaml exclude_dirs +
-	// CODEGRAPH_EXCLUDE_DIRS). Each rule is either a bare directory name /
-	// glob matched against the base name, or a workdir-relative slash
-	// path matched against the path's rel from the workdir root.
+	// Dispatch worktree siblings of .wt itself: .wt-archive and any future
+	// .wt-<label> container hold duplicated project copies (or stale
+	// archives) that are never project source — same rationale as the bare
+	// .wt entry above, just wider than the exact-name map can express.
+	if strings.HasPrefix(name, ".wt-") {
+		return true
+	}
+	if matchesUserExcludeDirs(workdirAbs, pathAbs, name) {
+		return true
+	}
+	if matchesToolchainOrSkipFragment(workdirAbs, pathAbs, path) {
+		return true
+	}
+	if shouldSkipBroadTopLevel(workdir, workdirAbs, pathAbs, name) {
+		return true
+	}
+	return false
+}
+
+// matchesUserExcludeDirs applies the user-configured exclusions
+// (config.yaml exclude_dirs + CODEGRAPH_EXCLUDE_DIRS). Each rule is either
+// a bare directory name / glob matched against the base name, or a
+// workdir-relative slash path matched against the path's rel from the
+// workdir root.
+func matchesUserExcludeDirs(workdirAbs, pathAbs, name string) bool {
 	for _, raw := range config.ExcludeDirs() {
 		// Same normalizeExcludeRule the rg translation consumes — one
 		// rule, one interpretation on both engines.
@@ -371,14 +392,18 @@ func ShouldSkipDirIn(workdir, path, name string) bool {
 			return true
 		}
 	}
-	// Toolchain / cache path-fragment checks run on the workdir-RELATIVE
-	// path when the target sits inside the workdir: a narrowed workdir
-	// root like /root/go/pkg/mod/foo or /ws/node_modules/pkg must not
-	// get its normal subdirs rejected just because an ANCESTOR segment
-	// happened to contain "/go/pkg/" or "/node_modules/" — the parent
-	// root's walk was already responsible for that exclusion. When
-	// workdir is empty (ShouldSkipDir) or the path escapes it, the full
-	// absolute path is checked as before.
+	return false
+}
+
+// matchesToolchainOrSkipFragment applies the Go-toolchain and
+// skipPathFragments checks. They run on the workdir-RELATIVE path when the
+// target sits inside the workdir: a narrowed workdir root like
+// /root/go/pkg/mod/foo or /ws/node_modules/pkg must not get its normal
+// subdirs rejected just because an ANCESTOR segment happened to contain
+// "/go/pkg/" or "/node_modules/" — the parent root's walk was already
+// responsible for that exclusion. When workdir is empty (ShouldSkipDir) or
+// the path escapes it, the full absolute path is checked as before.
+func matchesToolchainOrSkipFragment(workdirAbs, pathAbs, path string) bool {
 	checkTarget := ""
 	if workdirAbs != "" {
 		if rel, err := filepath.Rel(workdirAbs, pathAbs); err == nil &&
@@ -415,25 +440,30 @@ func ShouldSkipDirIn(workdir, path, name string) bool {
 			}
 		}
 	}
-
-	// Home / broad workdir: only index project-like top-level folders.
-	if workdirAbs != "" && IsBroadWorkdir(workdir) && !homeIndexAll() {
-		rel, err := filepath.Rel(workdirAbs, pathAbs)
-		if err == nil {
-			rel = filepath.ToSlash(rel)
-			// Direct child of workdir only (top-level entry).
-			if rel != "." && !strings.Contains(rel, "/") {
-				// Hidden top-level dirs under home are almost never project roots.
-				if strings.HasPrefix(name, ".") {
-					return true
-				}
-				if !HasProjectMarker(pathAbs) {
-					return true
-				}
-			}
-		}
-	}
 	return false
+}
+
+// shouldSkipBroadTopLevel applies the home / broad workdir rule: only
+// index project-like top-level folders (hidden dirs and non-project
+// folders are skipped) unless CODEGRAPH_GO_HOME_INDEX_ALL=1.
+func shouldSkipBroadTopLevel(workdir, workdirAbs, pathAbs, name string) bool {
+	if workdirAbs == "" || !IsBroadWorkdir(workdir) || homeIndexAll() {
+		return false
+	}
+	rel, err := filepath.Rel(workdirAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	// Direct child of workdir only (top-level entry).
+	if rel == "." || strings.Contains(rel, "/") {
+		return false
+	}
+	// Hidden top-level dirs under home are almost never project roots.
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	return !HasProjectMarker(pathAbs)
 }
 
 // RgExcludeGlob translates ONE user-configured directory-exclusion rule
@@ -1171,6 +1201,10 @@ func BuiltinSkipGlobs(root string) []string {
 	for name := range skipDirNames {
 		add(name)
 	}
+	// .wt-* prefixed dispatch worktree containers, same rule the walker's
+	// HasPrefix check applies (the bare-name glob below is directory-only
+	// for rg, matching the walker's dir-only scope).
+	add(".wt-*")
 	// Single-segment fragments reduce to bare names too
 	// (e.g. "/code_references/" -> "code_references").
 	for _, frag := range skipPathFragments {
