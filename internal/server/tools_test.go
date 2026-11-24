@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/sync"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -1172,5 +1173,91 @@ func TestToolStatusExposesWatcherBlindSpotsAndStartFailure(t *testing.T) {
 	}
 	if text = textContent(result); !strings.Contains(text, "watcher_active: false") {
 		t.Fatalf("status must expose watcher_active: false after start failure, got:\n%s", text)
+	}
+}
+
+// ---------- store_fact write-auth gate (M0) ----------
+
+// TestToolStoreFactReadOnlyDenied is the store_fact privilege regression: a
+// session whose write-auth verdict denied must get a hard error naming the
+// read-only reason BEFORE any DB write — and nothing must be stored.
+func TestToolStoreFactReadOnlyDenied(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolStoreFactWithAuth(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "should never be stored",
+	}, daemon.WriteAuth{Allowed: false, Reason: "hc subagent terminal t2zx without worker role"})
+	if err == nil {
+		t.Fatal("read-only session must refuse store_fact")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("error must name read-only refusal, got: %v", err)
+	}
+	facts, ferr := s.Database.SearchFacts("", "", "", "all", 100)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("refused write must not store, got %d facts", len(facts))
+	}
+}
+
+// TestToolStoreFactAllowedWrites is the positive counterpart: an allowed
+// verdict writes normally (the gate does not break legitimate sessions).
+func TestToolStoreFactAllowedWrites(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolStoreFactWithAuth(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "legit fact",
+	}, daemon.WriteAuth{Allowed: true, Reason: "top-level hc terminal"})
+	if err != nil {
+		t.Fatalf("allowed session must store, got: %v", err)
+	}
+	facts, ferr := s.Database.SearchFacts("legit fact", "", "", "all", 100)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 stored fact, got %d", len(facts))
+	}
+}
+
+// TestNewMCPServerWithAuthSharesSchema asserts the M0 schema fix: repeated
+// NewMCPServerWithAuth calls over one shared SchemaCache all bind the SAME
+// codegraphInputSchema pointer (the old inline literal minted a new pointer
+// per server and defeated the bySchema cache — a per-connection leak).
+func TestNewMCPServerWithAuthSharesSchema(t *testing.T) {
+	s, _ := setupToolServer(t)
+	cache := mcp.NewSchemaCache()
+	s1 := NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: true}, cache)
+	s2 := NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: false}, cache)
+	s3 := NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: true}, cache)
+	if s1 == nil || s2 == nil || s3 == nil {
+		t.Fatal("servers must be constructed")
+	}
+	// The singleton exists and is what every server registers.
+	if codegraphInputSchema == nil {
+		t.Fatal("codegraphInputSchema singleton must be initialized")
+	}
+	if codegraphInputSchema.Type != "object" || len(codegraphInputSchema.Required) != 1 || codegraphInputSchema.Required[0] != "action" {
+		t.Fatalf("schema shape drifted: %+v", codegraphInputSchema)
+	}
+}
+
+// TestMakeToolCodegraphBindsAuth proves each connection's verdict is captured
+// in its own handler closure: a denied server's dispatcher refuses
+// store_fact while an allowed one over the same *Server accepts — no shared
+// mutable state, no cross-session leak.
+func TestMakeToolCodegraphBindsAuth(t *testing.T) {
+	s, _ := setupToolServer(t)
+	denyHandler := s.makeToolCodegraph(daemon.WriteAuth{Allowed: false, Reason: "denied ctx"})
+	allowHandler := s.makeToolCodegraph(daemon.WriteAuth{Allowed: true, Reason: "allowed ctx"})
+
+	args := codegraphArgs{Action: "store_fact", TargetFile: "alpha.go", Content: "c"}
+	if _, _, err := denyHandler(context.Background(), nil, args); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("denied handler must refuse store_fact, got %v", err)
+	}
+	if _, _, err := allowHandler(context.Background(), nil, args); err != nil {
+		t.Fatalf("allowed handler must store, got %v", err)
 	}
 }

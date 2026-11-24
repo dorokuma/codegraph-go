@@ -24,6 +24,13 @@ import (
 // It should block until the session ends.
 type SessionHandler func(ctx context.Context, rwc io.ReadWriteCloser) error
 
+// AuthSessionHandler is SessionHandler plus the per-connection write-auth
+// verdict computed during serveConn's handshake (SO_PEERCRED + /proc
+// ancestry + hc terminal.get). It is bound at accept time — before the MCP
+// session starts — so a store_fact call inside the session sees the verdict
+// for THIS connection and cannot race another session's.
+type AuthSessionHandler func(ctx context.Context, rwc io.ReadWriteCloser, auth WriteAuth) error
+
 // backgroundWork counts in-flight index/sync passes the daemon itself
 // cannot see through its client/inFlight sessions (the server's
 // BgWg-driven IndexAll/RebuildAll and the watcher's IndexChanges run on
@@ -45,9 +52,10 @@ func TrackBackgroundWork() func() {
 
 // Daemon is the shared single-writer MCP process for one project root.
 type Daemon struct {
-	root      string
-	handler   SessionHandler
-	idleAfter time.Duration
+	root        string
+	handler     SessionHandler
+	authHandler AuthSessionHandler
+	idleAfter   time.Duration
 
 	mu      sync.Mutex
 	clients int
@@ -90,6 +98,14 @@ func New(root string, handler SessionHandler) *Daemon {
 		conns:     make(map[net.Conn]struct{}),
 		stopped:   make(chan struct{}),
 	}
+}
+
+// NewWithAuth constructs a Daemon whose session handler receives the
+// per-connection WriteAuth verdict serveConn computes during the handshake.
+func NewWithAuth(root string, handler AuthSessionHandler) *Daemon {
+	d := New(root, nil)
+	d.authHandler = handler
+	return d
 }
 
 // Start binds the first usable socket candidate and accepts connections.
@@ -479,6 +495,13 @@ func (d *Daemon) serveConn(conn net.Conn) {
 		return
 	}
 
+	// Compute the per-connection write verdict BEFORE the session starts so
+	// the handler can bind it to exactly this connection. It runs after the
+	// hello handshake and token check (provenance inputs are ready) and
+	// never blocks a session: the verdict is read-only gating, the session
+	// itself always proceeds — store_fact refuses on !Allowed.
+	auth := VerifyClientWriteAuth(conn, chlo, ok)
+
 	var r io.Reader = br
 	if len(leftover) > 0 {
 		r = io.MultiReader(bytes.NewReader(leftover), br)
@@ -493,6 +516,12 @@ func (d *Daemon) serveConn(conn net.Conn) {
 	defer d.dropClient(conn)
 
 	ctx := d.ctx
+	if d.authHandler != nil {
+		if err := d.authHandler(ctx, rwc, auth); err != nil && ctx.Err() == nil {
+			log.Printf("daemon session: %v", err)
+		}
+		return
+	}
 	if err := d.handler(ctx, rwc); err != nil && ctx.Err() == nil {
 		log.Printf("daemon session: %v", err)
 	}
@@ -668,6 +697,16 @@ func (s *sessionRWC) Close() error { return s.conn.Close() }
 // onReady is called once the socket is listening (index/watcher start here).
 // handler serves each MCP session.
 func RunAsDaemon(root string, handler SessionHandler, onReady func() error) error {
+	return runAsDaemon(root, nil, handler, onReady)
+}
+
+// RunAsDaemonWithAuth is RunAsDaemon with an AuthSessionHandler: each MCP
+// session additionally receives the per-connection WriteAuth verdict.
+func RunAsDaemonWithAuth(root string, handler AuthSessionHandler, onReady func() error) error {
+	return runAsDaemon(root, handler, nil, onReady)
+}
+
+func runAsDaemon(root string, authHandler AuthSessionHandler, handler SessionHandler, onReady func() error) error {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		res, err := TryAcquireLock(root)
@@ -675,7 +714,12 @@ func RunAsDaemon(root string, handler SessionHandler, onReady func() error) erro
 			return err
 		}
 		if res.Kind == "acquired" {
-			d := New(root, handler)
+			var d *Daemon
+			if authHandler != nil {
+				d = NewWithAuth(root, authHandler)
+			} else {
+				d = New(root, handler)
+			}
 			if err := d.Start(); err != nil {
 				// Same removal discipline as cleanupArtifacts: go through the
 				// dir-identity guard instead of deleting through a bare path.

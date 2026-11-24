@@ -157,14 +157,83 @@ var codegraphActions = []string{
 	"status", "affected", "communities", "store_fact", "search_facts",
 }
 
+// codegraphInputSchema is the single shared InputSchema for the aggregated
+// "codegraph" tool. It used to be an inline literal inside NewMCPServer,
+// which meant every daemon connection built a NEW *jsonschema.Schema
+// pointer: mcp.SchemaCache keys pre-defined schemas by pointer identity, so
+// each new pointer defeated the bySchema cache and forced a fresh Resolve —
+// a per-connection memory leak inside the long-lived daemon. A package-level
+// singleton keeps the pointer stable, so one SchemaCache serves every
+// connection (one Resolve total, zero growth).
+var codegraphInputSchema = &jsonschema.Schema{
+	Type: "object",
+	Properties: map[string]*jsonschema.Schema{
+		"action": {
+			Type:        "string",
+			Description: "explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts",
+			Enum:        []interface{}{"explore", "search", "files", "node", "callers", "callees", "impact", "status", "affected", "communities", "store_fact", "search_facts"},
+		},
+		"pattern":      {Type: "string", Description: "search: literal by default (regex=true enables regex); files: glob pattern"},
+		"name":         {Type: "string", Description: "symbol name for node/callers/callees/impact"},
+		"file":         {Type: "string", Description: "file path/basename pin for node/graph actions"},
+		"query":        {Type: "string", Description: "explore/search_facts free text"},
+		"path":         {Type: "string", Description: "subdir or home-mode project name"},
+		"glob":         {Type: "string", Description: "file glob filter"},
+		"max":          {Type: "integer", Description: "result cap"},
+		"max_results":  {Type: "integer", Description: "alias of max"},
+		"ignore_case":  {Type: "boolean", Description: "search: case-insensitive"},
+		"no_ignore":    {Type: "boolean", Description: "search: include .gitignore'd files (default false)"},
+		"regex":        {Type: "boolean", Description: "search: treat pattern as regex (default false: literal)"},
+		"line":         {Type: "integer", Description: "node: pin line"},
+		"includeCode":  {Type: "boolean", Description: "node: include body"},
+		"symbolsOnly":  {Type: "boolean", Description: "node file mode: map only"},
+		"offset":       {Type: "integer", Description: "node file mode start line"},
+		"limit":        {Type: "integer", Description: "node file mode max lines"},
+		"skipCode":     {Type: "boolean", Description: "explore: omit bodies (default true)"},
+		"files":        {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "affected: changed sources"},
+		"depth":        {Type: "integer", Description: "affected depth"},
+		"filter":       {Type: "string", Description: "affected test glob"},
+		"minSize":      {Type: "integer", Description: "communities min size"},
+		"targetFile":   {Type: "string", Description: "store_fact/search_facts file"},
+		"targetSymbol": {Type: "string", Description: "store_fact/search_facts symbol"},
+		"targetLine":   {Type: "integer", Description: "store_fact line"},
+		"content":      {Type: "string", Description: "store_fact content"},
+		"author":       {Type: "string", Description: "store_fact author"},
+		"supersedes":   {Type: "integer", Description: "store_fact supersede id"},
+		"status":       {Type: "string", Description: "search_facts status filter"},
+		"projectPath":  {Type: "string", Description: "absolute path inside project"},
+	},
+	Required: []string{"action"},
+}
+
 // ---------- newMCPServer ----------
 
-// NewMCPServer registers the single aggregated MCP tool and returns the server.
-// Breaking (v0.8+): former top-level tools (explore, search, …) are only available
-// as action= on tool "codegraph".
+// NewMCPServer registers the single aggregated MCP tool and returns the
+// server. Write access defaults to fully allowed (pre-auth-verdict call
+// sites and existing tests); production paths go through
+// NewMCPServerWithAuth with a real per-connection/per-process verdict.
+// Breaking (v0.8+): former top-level tools (explore, search, …) are only
+// available as action= on tool "codegraph".
 func NewMCPServer(s *Server) *mcp.Server {
+	return NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: true, Reason: "default allow"}, nil)
+}
+
+// NewMCPServerWithAuth registers the aggregated tool with an explicit
+// write-auth verdict and an optional shared schema cache.
+//
+//   - auth is bound into the store_fact handler closure for THIS server
+//     instance: a daemon builds one *mcp.Server per connection and passes
+//     that connection's VerifyClientWriteAuth result, so two concurrent
+//     sessions can never share or race a verdict (no Server-level mutable
+//     field — the *Server stays a shared singleton).
+//   - cache, when non-nil, is the shared *mcp.SchemaCache every per-
+//     connection server reuses. Because the tool's InputSchema is now the
+//     stable codegraphInputSchema pointer, the cache resolves the schema
+//     once total instead of once per connection.
+func NewMCPServerWithAuth(s *Server, auth daemon.WriteAuth, cache *mcp.SchemaCache) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "codegraph-go", Version: daemon.PackageVersion}, &mcp.ServerOptions{
 		Instructions: serverInstructions,
+		SchemaCache:  cache,
 	})
 	srv.AddReceivingMiddleware(argUnwrapMiddleware)
 
@@ -177,49 +246,31 @@ func NewMCPServer(s *Server) *mcp.Server {
 			"status, affected(files), communities, store_fact, search_facts. " +
 			"Common: path (home-mode project), projectPath (absolute), max, glob. " +
 			"explore skipCode defaults true (no bodies); set skipCode=false or node includeCode=true to read source.",
-		InputSchema: &jsonschema.Schema{
-			Type: "object",
-			Properties: map[string]*jsonschema.Schema{
-				"action": {
-					Type:        "string",
-					Description: "explore|search|files|node|callers|callees|impact|status|affected|communities|store_fact|search_facts",
-					Enum:        []interface{}{"explore", "search", "files", "node", "callers", "callees", "impact", "status", "affected", "communities", "store_fact", "search_facts"},
-				},
-				"pattern":      {Type: "string", Description: "search: literal by default (regex=true enables regex); files: glob pattern"},
-				"name":         {Type: "string", Description: "symbol name for node/callers/callees/impact"},
-				"file":         {Type: "string", Description: "file path/basename pin for node/graph actions"},
-				"query":        {Type: "string", Description: "explore/search_facts free text"},
-				"path":         {Type: "string", Description: "subdir or home-mode project name"},
-				"glob":         {Type: "string", Description: "file glob filter"},
-				"max":          {Type: "integer", Description: "result cap"},
-				"max_results":  {Type: "integer", Description: "alias of max"},
-				"ignore_case":  {Type: "boolean", Description: "search: case-insensitive"},
-				"no_ignore":    {Type: "boolean", Description: "search: include .gitignore'd files (default false)"},
-				"regex":        {Type: "boolean", Description: "search: treat pattern as regex (default false: literal)"},
-				"line":         {Type: "integer", Description: "node: pin line"},
-				"includeCode":  {Type: "boolean", Description: "node: include body"},
-				"symbolsOnly":  {Type: "boolean", Description: "node file mode: map only"},
-				"offset":       {Type: "integer", Description: "node file mode start line"},
-				"limit":        {Type: "integer", Description: "node file mode max lines"},
-				"skipCode":     {Type: "boolean", Description: "explore: omit bodies (default true)"},
-				"files":        {Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "affected: changed sources"},
-				"depth":        {Type: "integer", Description: "affected depth"},
-				"filter":       {Type: "string", Description: "affected test glob"},
-				"minSize":      {Type: "integer", Description: "communities min size"},
-				"targetFile":   {Type: "string", Description: "store_fact/search_facts file"},
-				"targetSymbol": {Type: "string", Description: "store_fact/search_facts symbol"},
-				"targetLine":   {Type: "integer", Description: "store_fact line"},
-				"content":      {Type: "string", Description: "store_fact content"},
-				"author":       {Type: "string", Description: "store_fact author"},
-				"supersedes":   {Type: "integer", Description: "store_fact supersede id"},
-				"status":       {Type: "string", Description: "search_facts status filter"},
-				"projectPath":  {Type: "string", Description: "absolute path inside project"},
-			},
-			Required: []string{"action"},
-		},
-	}, s.toolCodegraph)
+		InputSchema: codegraphInputSchema,
+	}, s.makeToolCodegraph(auth))
 
 	return srv
+}
+
+// makeToolCodegraph binds the per-connection write-auth verdict into the
+// tool dispatcher. The returned handler is what AddTool registers: because
+// each connection builds its own *mcp.Server via NewMCPServerWithAuth, auth
+// is captured in the closure — no mutable Server field, no cross-session
+// race, and a read-only verdict can never leak into another connection's
+// writable session.
+func (s *Server) makeToolCodegraph(auth daemon.WriteAuth) func(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (*mcp.CallToolResult, any, error) {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (res *mcp.CallToolResult, out any, err error) {
+		return s.toolCodegraphWithAuth(ctx, req, args, auth)
+	}
+}
+
+// toolCodegraph is the permissive dispatcher used by existing tests and any
+// caller that predates the write-auth verdict: it delegates to
+// toolCodegraphWithAuth with an allowed verdict so nothing at this layer
+// changes shape. Production paths never reach it — they are wired through
+// makeToolCodegraph(auth).
+func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (*mcp.CallToolResult, any, error) {
+	return s.toolCodegraphWithAuth(ctx, req, args, daemon.WriteAuth{Allowed: true, Reason: "default allow"})
 }
 
 // toolCodegraph routes action= to the internal handlers (same implementations as pre-0.8 tools).
@@ -228,7 +279,7 @@ func NewMCPServer(s *Server) *mcp.Server {
 // become a single-call MCP error — never a crash of the shared daemon process
 // that serves every session. The daemon's serveConn recover catches panics
 // outside the tool path (transport/hello).
-func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs) (res *mcp.CallToolResult, out any, err error) {
+func (s *Server) toolCodegraphWithAuth(ctx context.Context, req *mcp.CallToolRequest, args codegraphArgs, auth daemon.WriteAuth) (res *mcp.CallToolResult, out any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("tool panic (action=%q): %v\n%s", args.Action, r, debug.Stack())
@@ -296,11 +347,11 @@ func (s *Server) toolCodegraph(ctx context.Context, req *mcp.CallToolRequest, ar
 			Max: cap, MinSize: args.MinSize, Path: args.Path, ProjectPath: args.ProjectPath,
 		})
 	case "store_fact":
-		return s.toolStoreFact(ctx, req, storeFactArgs{
+		return s.toolStoreFactWithAuth(ctx, req, storeFactArgs{
 			TargetFile: args.TargetFile, TargetSymbol: args.TargetSymbol, TargetLine: args.TargetLine,
 			Content: args.Content, Author: args.Author, Supersedes: args.Supersedes,
 			Path: args.Path, ProjectPath: args.ProjectPath,
-		})
+		}, auth)
 	case "search_facts":
 		return s.toolSearchFacts(ctx, req, searchFactsArgs{
 			Query: args.Query, TargetFile: args.TargetFile, TargetSymbol: args.TargetSymbol,
@@ -1004,7 +1055,22 @@ func (s *Server) toolCommunities(ctx context.Context, _ *mcp.CallToolRequest, ar
 
 // ---------- store_fact ----------
 
-func (s *Server) toolStoreFact(ctx context.Context, _ *mcp.CallToolRequest, args storeFactArgs) (*mcp.CallToolResult, any, error) {
+// toolStoreFact is the permissive entry used by existing tests and
+// pre-auth call sites; production dispatch routes through
+// toolStoreFactWithAuth with the connection's real verdict.
+func (s *Server) toolStoreFact(ctx context.Context, req *mcp.CallToolRequest, args storeFactArgs) (*mcp.CallToolResult, any, error) {
+	return s.toolStoreFactWithAuth(ctx, req, args, daemon.WriteAuth{Allowed: true, Reason: "default allow"})
+}
+
+func (s *Server) toolStoreFactWithAuth(ctx context.Context, _ *mcp.CallToolRequest, args storeFactArgs, auth daemon.WriteAuth) (*mcp.CallToolResult, any, error) {
+	// Write gate FIRST — before any validation, timeout work, or DB touch:
+	// a session the write-auth verdict refused must get a hard error naming
+	// the reason, never a silent no-op or a partial write. The verdict is
+	// bound at connection time (daemon SO_PEERCRED + /proc + hc, or direct
+	// mode self-check), so it cannot be forged from inside the session.
+	if !auth.Allowed {
+		return nil, nil, fmt.Errorf("store_fact refused: session is read-only (%s)", auth.Reason)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if args.TargetFile == "" {

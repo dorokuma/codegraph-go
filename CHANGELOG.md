@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Fixed
+- **`store_fact` 共享 daemon 与直连模式正向写鉴权（M0）**：新增 `internal/daemon/writeauth_linux.go` 的每连接/每进程写权限判定，堵死只读角色（scout/planner/researcher/verifier/reviewer/oracle）经共享 daemon 或 `CODEGRAPH_NO_DAEMON=1` 直连路径写入 facts 的越权面。判定链（全部 fail-closed）：`!helloOK` 拒绝；Linux 经 `*net.UnixConn` `SO_PEERCRED` 取内核 `peerPID`（失败/`peerPID<=0`/`chlo.PID!=peerPID` 拒）；`/proc/<peerPID>/environ` 不可读即拒；沿 `/proc` 祖先链（≤32 跳）收集每跳 `pid`/`environ`/原始 `argv`（`cmdline` 仅用 `TrimSuffix` 剥末尾单个 NUL，**保留中间空串**防 `--append-system-prompt ""` 参数移位吞 `--name`）；跨跳互异或畸形 `HC_TERMINAL_ID` 拒。宿主机 `hc` socket `/run/user/0/herdr-core/default.sock`：`os.Stat` 仅 `ErrNotExist` 视为无 hc 环境（其余错误拒）；有 hc 时无合法 `HC_TERMINAL_ID` 拒（封死双 fork 孤儿与普通 SSH），`terminal.get`（1500ms）严格解码 `state=live`/`address`/`pid`（须为祖先链真实 `shell_pid`）/`parent` 显式键（`null`=顶层，非空串=子终端，缺失/`""`/其它型拒），检查区间锚定 `[peerPID..shell_pid]`，先跑 2a 两段式只读再按 `parent` 决断。无 hc 时全链跑 2a。2a 第一段无条件只读（2b 结构化 flag 扫描 `--name/-n`/`--agent` 命中 `role-(scout|…|oracle)`、`CTXMODE_READONLY` 真值、非空 `PI_ROLE`、非空非 worker `CTXMODE_ROLE`），第二段仅当无 hop 声明 `CTXMODE_ROLE=worker` 才拒（`PI_SUBAGENT=1`、argv 含 `/tmp/herdr-role-sessions`/`/tmp/dispatch-`）。`internal/daemon/writeauth_other.go` 为非 Linux fail-closed 桩。`internal/daemon/server.go` 新增 `AuthSessionHandler`/`NewWithAuth`/`RunAsDaemonWithAuth`（旧 `New`/`RunAsDaemon` 保留薄包装），`serveConn` 在 hello/token 检查后计算 `VerifyClientWriteAuth` 绑定到该连接。`internal/server/tools.go` 将内联 `InputSchema` 提为包级单例 `codegraphInputSchema`（消除 `SchemaCache` 按指针缓存失效导致的每连接 resolved-schema 泄漏），新增 `NewMCPServerWithAuth(s, auth, cache)`（旧 `NewMCPServer` 保留），`toolStoreFactWithAuth` 首行 `!auth.Allowed` 拒写；`internal/server/server.go` `RunDaemonProcess` 共享 `mcp.SchemaCache` 每连接 `NewMCPServerWithAuth`（`*Server` 单例共享），`RunDirect` 用 `VerifyDirectWriteAuth()`。回归：`writeauth_linux_test.go`（反移位/flag 扫描/双段 2a/hc 畸形记录/祖先锚定矩阵）、`tools_test.go`（拒写不存 + 放行写 + 每连接 auth 绑定 + schema 单例）。
+
+### Changed
+- Display / daemon wire version **0.9.16**。
+
 ## [0.9.15] - 2026-11-23
 
 ### Added
