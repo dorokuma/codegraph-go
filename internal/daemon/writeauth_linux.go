@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -41,13 +42,21 @@ func deny(reason string) WriteAuth { return WriteAuth{Allowed: false, Reason: re
 // real sockets, or a live herdr-core server. Production code uses
 // defaultPeerAuth; every field is replaceable.
 
-// ProcEntry is one hop of the /proc ancestry chain: the process id, its
-// parsed environment (KEY -> VALUE) and its raw argv (NUL-split cmdline,
-// interior empty strings preserved — see parseProcCmdline).
-type ProcEntry struct {
-	PID     int
-	Environ map[string]string
-	Argv    []string
+// procHop is one fully-recorded hop of the /proc ancestry chain. Every
+// probe result is kept with its own ok flag — collectChain never aborts
+// early on an unreadable ancestor, so the verdict layer can decide per
+// branch (hc present vs absent) exactly how much of the chain must have
+// been readable.
+type procHop struct {
+	PID    int
+	PPID   int
+	UID    int
+	Env    map[string]string
+	EnvOK  bool
+	Argv   []string
+	ArgvOK bool
+	PPIDOK bool
+	UIDOK  bool
 }
 
 // HcTerminalInfo mirrors the strict herdr-core terminal.get fields the
@@ -73,10 +82,20 @@ type PeerAuth struct {
 	// ReadPPID returns the parent pid from /proc/<pid>/stat.
 	ReadPPID func(pid int) (int, bool)
 	// ReadArgv returns the raw argv of /proc/<pid>/cmdline with interior
-	// empty strings preserved (parseProcCmdline semantics).
-	ReadArgv func(pid int) []string
+	// empty strings preserved (parseProcCmdline semantics). ok=false when
+	// the cmdline cannot be read at all — never silently dropped.
+	ReadArgv func(pid int) ([]string, bool)
+	// ReadUID returns the owner uid of /proc/<pid> (syscall.Stat_t.Uid).
+	// ok=false when the process cannot be stat'ed.
+	ReadUID func(pid int) (int, bool)
+	// SelfEUID returns the effective uid of this process (os.Geteuid) —
+	// used to decide whether an EACCES on the root-owned hc socket means
+	// "no hc for us" instead of fail-closed.
+	SelfEUID func() int
 	// StatHcSocket stats the herdr-core socket path. os.ErrNotExist means
-	// "no hc environment" (CI/dev box); any other error fails closed.
+	// "no hc environment" (CI/dev box); under root any other error fails
+	// closed, while a non-root process treats EACCES/EPERM on the
+	// root-owned /run/user/0 path as "hc unreachable for us" too.
 	StatHcSocket func(path string) error
 	// QueryHcTerminal runs terminal.get against the hc socket.
 	QueryHcTerminal func(socketPath, termID string, timeout time.Duration) (HcTerminalInfo, bool)
@@ -105,6 +124,8 @@ func defaultPeerAuth() *PeerAuth {
 		ReadEnviron:     readProcEnviron,
 		ReadPPID:        readProcPPID,
 		ReadArgv:        readProcArgv,
+		ReadUID:         readProcUID,
+		SelfEUID:        os.Geteuid,
 		StatHcSocket:    statHcSocket,
 		QueryHcTerminal: queryHcTerminal,
 		HcSocketPath:    hcSocketFile,
@@ -192,13 +213,25 @@ func readProcPPID(pid int) (int, bool) {
 	return ppid, true
 }
 
-// readProcArgv reads /proc/<pid>/cmdline via parseProcCmdline.
-func readProcArgv(pid int) []string {
+// readProcArgv reads /proc/<pid>/cmdline via parseProcCmdline. ok=false
+// when the file cannot be read — the caller must see the failure, not an
+// empty argv that looks like a kernel thread.
+func readProcArgv(pid int) ([]string, bool) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return parseProcCmdline(data)
+	return parseProcCmdline(data), true
+}
+
+// readProcUID returns the owner uid of /proc/<pid> itself — the same
+// credential the kernel would report for the process.
+func readProcUID(pid int) (int, bool) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(fmt.Sprintf("/proc/%d", pid), &st); err != nil {
+		return 0, false
+	}
+	return int(st.Uid), true
 }
 
 // parseProcCmdline splits a NUL-separated cmdline while preserving interior
@@ -353,7 +386,7 @@ func queryHcTerminal(socketPath, termID string, timeout time.Duration) (HcTermin
 	}
 	info.ParentHasKey = true
 	if parent != nil {
-		if *parent == "" {
+		if strings.TrimSpace(*parent) == "" {
 			return HcTerminalInfo{}, false
 		}
 		info.Parent = parent
@@ -478,11 +511,11 @@ func environTruthy(v string) bool {
 // hopIsUnconditionalReadonly is the FIRST 2a segment: any single hop whose
 // environ or argv proves a dispatched read-only role refuses writes no
 // matter what any other hop says.
-func hopIsUnconditionalReadonly(e ProcEntry) bool {
+func hopIsUnconditionalReadonly(e procHop) bool {
 	if scanArgvReadonly(e.Argv) {
 		return true
 	}
-	env := e.Environ
+	env := e.Env
 	if environTruthy(env["CTXMODE_READONLY"]) {
 		return true
 	}
@@ -496,8 +529,8 @@ func hopIsUnconditionalReadonly(e ProcEntry) bool {
 }
 
 // hopIsWorker reports whether this hop's environ declares a worker role.
-func hopIsWorker(e ProcEntry) bool {
-	v := strings.TrimSpace(e.Environ["CTXMODE_ROLE"])
+func hopIsWorker(e procHop) bool {
+	v := strings.TrimSpace(e.Env["CTXMODE_ROLE"])
 	return v != "" && strings.ToLower(v) == "worker"
 }
 
@@ -505,8 +538,8 @@ func hopIsWorker(e ProcEntry) bool {
 // refuse when NO hop in the checked window declared CTXMODE_ROLE=worker —
 // a dispatched worker launched through a subagent shell keeps those
 // intermediate markers legitimately.
-func hopIsConditionalReadonly(e ProcEntry) bool {
-	if strings.TrimSpace(e.Environ["PI_SUBAGENT"]) == "1" {
+func hopIsConditionalReadonly(e procHop) bool {
+	if strings.TrimSpace(e.Env["PI_SUBAGENT"]) == "1" {
 		return true
 	}
 	for _, a := range e.Argv {
@@ -517,47 +550,67 @@ func hopIsConditionalReadonly(e ProcEntry) bool {
 	return false
 }
 
-// collectChain walks /proc from peerPID upward (bounded by MaxHops),
-// collecting every hop's environ + argv. The walk stops at the first
-// unreadable ppid. Returns the chain plus ok=false when the peer's own
-// environ cannot be read (fail-closed upstream).
-func collectChain(pa *PeerAuth, peerPID int) ([]ProcEntry, bool) {
+// collectChain walks /proc from peerPID upward (bounded by MaxHops) and
+// records EVERY hop's probe results independently — environ, argv, ppid,
+// uid — without dying mid-walk. The walk ends when ppid <= 0, a cycle
+// repeats a pid, or MaxHops is reached (truncated=true). Whether an
+// unreadable hop is fatal is a per-branch decision left to the verdict:
+// hops above the hc shell_pid (herdr-core / PID 1) are legitimately
+// unreadable, while hops inside the checked window must all be readable.
+func collectChain(pa *PeerAuth, peerPID int) (chain []procHop, truncated bool) {
 	hops := pa.MaxHops
 	if hops <= 0 {
 		hops = ancestorMaxHops
 	}
-	var chain []ProcEntry
 	seen := make(map[int]bool)
 	current := peerPID
 	for hop := 0; hop < hops; hop++ {
 		if current <= 0 || seen[current] {
-			break
-		}
-		seen[current] = true
-		env, ok := pa.ReadEnviron(current)
-		if !ok {
-			// The peer's OWN environ unreadable is a hard fail-closed above;
-			// an ancestor's is treated the same — we cannot prove what that
-			// process was, so we cannot prove it was not a read-only role.
 			return chain, false
 		}
-		argv := pa.ReadArgv(current)
-		chain = append(chain, ProcEntry{PID: current, Environ: env, Argv: argv})
-		ppid, ok := pa.ReadPPID(current)
-		if !ok || ppid <= 0 || ppid == current {
-			break
+		seen[current] = true
+		h := procHop{PID: current}
+		h.Env, h.EnvOK = pa.ReadEnviron(current)
+		h.Argv, h.ArgvOK = pa.ReadArgv(current)
+		h.PPID, h.PPIDOK = pa.ReadPPID(current)
+		h.UID, h.UIDOK = pa.ReadUID(current)
+		chain = append(chain, h)
+		switch {
+		case !h.PPIDOK:
+			// Parent unreadable — the chain cannot be walked further; the
+			// caller decides whether that is a safe stop or fail-closed.
+			return chain, false
+		case h.PPID <= 0 || h.PPID == current:
+			return chain, false
 		}
-		current = ppid
+		current = h.PPID
 	}
+	// MaxHops reached without the walk terminating on its own: the window
+	// below may still be fine, but a no-hc verdict must treat this as
+	// fail-closed (a 32-hop-deep caller could otherwise hide its roots).
 	return chain, true
 }
 
-// terminalIDs collects every non-empty HC_TERMINAL_ID across the chain. Any
-// hop whose value is malformed, or two hops disagreeing, fails closed.
-func terminalIDs(chain []ProcEntry) (string, bool) {
+// readablePrefixEnd returns the number of leading chain hops whose environ
+// AND argv are both readable, scanning upward from peerPID. Hop 0 (the
+// peer itself) not fully readable yields 0 — the caller denies
+// unconditionally in that case.
+func readablePrefixEnd(chain []procHop) int {
+	i := 0
+	for i < len(chain) && chain[i].EnvOK && chain[i].ArgvOK {
+		i++
+	}
+	return i
+}
+
+// terminalIDs collects every non-empty HC_TERMINAL_ID across the given
+// hops. Any hop whose value is malformed, or two hops disagreeing, fails
+// closed. Hops the caller did not include (unreadable, outside the
+// collection window) contribute nothing.
+func terminalIDs(chain []procHop) (string, bool) {
 	var id string
 	for _, e := range chain {
-		v := strings.TrimSpace(e.Environ["HC_TERMINAL_ID"])
+		v := strings.TrimSpace(e.Env["HC_TERMINAL_ID"])
 		if v == "" {
 			continue
 		}
@@ -574,10 +627,14 @@ func terminalIDs(chain []ProcEntry) (string, bool) {
 }
 
 // runTwoA applies the two-segment read-only scan over the given window and
-// reports (unconditionalHit, conditionalHit, hasWorkerRole).
-func runTwoA(window []ProcEntry) (uncond, cond, hasWorker bool) {
-	for _, e := range window {
-		if hopIsWorker(e) {
+// reports (unconditionalHit, conditionalHit, hasWorkerRole). The worker
+// role must be declared by a HOST hop (index >= 1) — a bare process that
+// merely exports CTXMODE_ROLE=worker itself (chain[0]) cannot self-elevate;
+// only an ancestor carrying the marker (the dispatch-agent spawned pig/agy/
+// claude-code host) proves a real worker dispatch.
+func runTwoA(window []procHop) (uncond, cond, hasWorker bool) {
+	for i, e := range window {
+		if i >= 1 && hopIsWorker(e) {
 			hasWorker = true
 		}
 		if hopIsUnconditionalReadonly(e) {
@@ -598,12 +655,21 @@ func runTwoA(window []ProcEntry) (uncond, cond, hasWorker bool) {
 //  1. helloOK / peerPID provenance — refuse unauthenticated or mismatched peers.
 //  2. chain collection — unreadable environ anywhere fails closed.
 //  3. HC_TERMINAL_ID collection — malformed or conflicting => fail closed.
-//  4. hc socket stat — ErrNotExist => no-hc branch; any other error => deny.
-//     5a. hc present: need a valid terminal id, a live/matching/parent-keyed
-//     terminal.get record whose shell_pid sits in the chain; then run 2a
-//     over [peerPID..shell_pid]; THEN decide on parent (null => allow;
-//     non-empty => allow only when hasWorkerRole).
-//     5b. hc absent: run 2a over the whole chain.
+//  4. hc socket stat — ErrNotExist => no-hc branch; a non-root process also
+//     treats EACCES/EPERM on the root-owned /run/user/0 path as no-hc;
+//     under root any other error => deny.
+//     5a. hc present: HC_TERMINAL_ID is collected over the readable env+argv
+//     prefix (peer itself must be readable); a live/matching/parent-keyed
+//     terminal.get record must place shell_pid in the chain; the strict
+//     window is then [peerPID..shell_pid] where EVERY hop must be fully
+//     readable (anything above shell_pid — herdr-core, PID 1 — is
+//     ignored); run 2a over the window, THEN decide on parent (null =>
+//     allow; non-empty => allow only when hasWorkerRole).
+//     5b. hc absent: peer must be fully readable; the checked window is the
+//     run of same-UID ancestors (stops safely at PID 1, a different uid,
+//     or an unreadable ppid/uid boundary). Any unreadable hop inside the
+//     window, or a walk that truncated at MaxHops without reaching a
+//     boundary, fails closed. 2a then runs over the window.
 func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) WriteAuth {
 	if !helloOK {
 		return deny("missing client hello")
@@ -618,26 +684,79 @@ func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) 
 		return deny(fmt.Sprintf("client hello pid %d != kernel peer pid %d", helloPID, peerPID))
 	}
 
-	chain, ok := collectChain(pa, peerPID)
-	if !ok || len(chain) == 0 {
-		return deny("cannot read /proc ancestry environ")
+	chain, truncated := collectChain(pa, peerPID)
+	if len(chain) == 0 {
+		return deny("cannot read /proc ancestry")
 	}
-
-	termID, ok := terminalIDs(chain)
-	if !ok {
-		return deny("conflicting or malformed HC_TERMINAL_ID in ancestry")
+	// The peer's own environ + argv are the minimum provable identity —
+	// unreadable means nothing downstream can be trusted.
+	if !chain[0].EnvOK || !chain[0].ArgvOK {
+		return deny("cannot read /proc ancestry environ")
 	}
 
 	statErr := pa.StatHcSocket(pa.HcSocketPath)
 	hcAbsent := errors.Is(statErr, os.ErrNotExist)
+	if !hcAbsent && statErr != nil && pa.SelfEUID() != 0 &&
+		(errors.Is(statErr, os.ErrPermission) || errors.Is(statErr, syscall.EPERM)) {
+		// Non-root cannot stat the root-owned /run/user/0 socket dir
+		// (0700 root:root). That EACCES proves nothing about whether hc
+		// runs — for THIS process hc is simply unreachable, so the no-hc
+		// branch applies rather than a fail-closed deny.
+		hcAbsent = true
+	}
 	if statErr != nil && !hcAbsent {
-		// EACCES/ELOOP/other stat errors cannot prove "no hc" — fail closed.
+		// Root (or a non-permission error): cannot prove "no hc" — deny.
 		return deny(fmt.Sprintf("hc socket stat failed: %v", statErr))
 	}
 
 	if hcAbsent {
-		// No hc environment (CI/dev): the whole collected chain runs 2a.
-		uncond, cond, hasWorker := runTwoA(chain)
+		// No hc environment (CI/dev box, or non-root where the root-owned
+		// hc socket is unreachable): the checked window is the run of
+		// ancestors owned by the SAME uid as the peer, stopping safely at
+		// PID 1, a uid boundary (e.g. non-root shell under root
+		// sshd/systemd), or an unreadable ppid/uid probe. Inside that
+		// window every hop must be fully readable and the walk must have
+		// terminated at a real boundary — a MaxHops truncation cannot
+		// prove what hides above, so it fails closed.
+		if !chain[0].UIDOK {
+			return deny("cannot read /proc peer uid")
+		}
+		window := []procHop{chain[0]}
+		boundaryOK := false
+		for i := 1; i < len(chain); i++ {
+			h := chain[i]
+			if !h.UIDOK {
+				// Cannot determine this ancestor's owner: safe stop — it is
+				// not provably a same-uid ancestor, so it cannot be part of
+				// the checked window.
+				boundaryOK = true
+				break
+			}
+			if h.PID == 1 || h.UID != window[0].UID {
+				// Init / different-owner ancestor (root sshd, systemd):
+				// legitimate stop, its environ is not required.
+				boundaryOK = true
+				break
+			}
+			if !h.EnvOK || !h.ArgvOK || !h.PPIDOK {
+				// Same-uid ancestor inside the window we cannot fully read:
+				// cannot prove it was not a read-only role — fail closed.
+				return deny(fmt.Sprintf("unreadable same-uid ancestor pid %d", h.PID))
+			}
+			window = append(window, h)
+		}
+		if !boundaryOK {
+			// The whole chain entered the window and the loop never found a
+			// uid/PID-1 boundary. If the walk truncated at MaxHops the
+			// caller's real ancestry is unknowable — fail closed. An
+			// untruncated full consumption means collectChain ended on a
+			// genuine termination (ppid <= 0, self-parent or a cycle back
+			// into the same already-checked window) — a safe boundary.
+			if truncated {
+				return deny("ancestry walk truncated before uid boundary")
+			}
+		}
+		uncond, cond, hasWorker := runTwoA(window)
 		if uncond {
 			return deny("read-only role marker in process ancestry")
 		}
@@ -647,8 +766,17 @@ func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) 
 		return allow("no hc environment; no read-only marker in ancestry")
 	}
 
-	// hc present: a session with no provable terminal id can never write —
-	// double-fork orphans and plain ssh shells land here.
+	// hc present: collect HC_TERMINAL_ID over the readable env+argv prefix
+	// only — unreadable ancestors above shell_pid (herdr-core, PID 1)
+	// legitimately carry no environ we can see. Malformed or conflicting
+	// ids inside the readable prefix fail closed.
+	readable := chain[:readablePrefixEnd(chain)]
+	termID, ok := terminalIDs(readable)
+	if !ok {
+		return deny("conflicting or malformed HC_TERMINAL_ID in ancestry")
+	}
+	// A session with no provable terminal id can never write — double-fork
+	// orphans and plain ssh shells land here.
 	if termID == "" {
 		return deny("no HC_TERMINAL_ID in ancestry under a live hc environment")
 	}
@@ -662,11 +790,14 @@ func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) 
 	if info.State != "live" {
 		return deny(fmt.Sprintf("hc terminal %s state=%q not live", termID, info.State))
 	}
-	if info.Address != "" && info.Address != termID {
+	if info.Address != termID {
 		return deny(fmt.Sprintf("hc terminal record address %q != requested %q", info.Address, termID))
 	}
 	if !info.ParentHasKey {
 		return deny(fmt.Sprintf("hc terminal %s record lacks explicit parent key", termID))
+	}
+	if info.Parent != nil && strings.TrimSpace(*info.Parent) == "" {
+		return deny(fmt.Sprintf("hc terminal %s record parent is blank", termID))
 	}
 	// shell_pid must be a real ancestor of peerPID.
 	shellIndex := -1
@@ -679,12 +810,26 @@ func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) 
 	if shellIndex < 0 {
 		return deny(fmt.Sprintf("hc terminal %s shell_pid %d not in ancestry", termID, info.PID))
 	}
-	// Anchor the checked window at [peerPID .. shell_pid] (inclusive) and
-	// run 2a FIRST — a top-level terminal is not automatically writable:
+	// Anchor the checked window at [peerPID .. shell_pid] (inclusive).
+	// EVERY hop inside the window must be fully readable — an unreadable
+	// environ/argv there cannot be proven not to be a read-only role.
+	// Hops ABOVE shell_pid (herdr-core itself, PID 1) are intentionally
+	// ignored: they are outside the session's own ancestry.
+	window := chain[:shellIndex+1]
+	for _, h := range window {
+		if !h.EnvOK || !h.ArgvOK {
+			return deny(fmt.Sprintf("unreadable ancestor pid %d inside session window", h.PID))
+		}
+	}
+	// Cross-hop terminal-id check over the window (same rule as the
+	// readable prefix — defensive, values were already collected there).
+	if _, ok := terminalIDs(window); !ok {
+		return deny("conflicting or malformed HC_TERMINAL_ID in session window")
+	}
+	// Run 2a FIRST — a top-level terminal is not automatically writable:
 	// a scout/researcher role dispatched under a top-level shell still
 	// refuses. Only after 2a passes does `parent` decide top-level vs
 	// worker-subagent.
-	window := chain[:shellIndex+1]
 	uncond, cond, hasWorker := runTwoA(window)
 	if uncond {
 		return deny("read-only role marker in session ancestry")

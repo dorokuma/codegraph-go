@@ -4,8 +4,11 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -17,8 +20,11 @@ type fakeProc struct {
 	ppid   int
 	env    map[string]string
 	argv   []string
+	uid    int
 	noEnv  bool // ReadEnviron fails (ENOENT/EACCES/empty)
 	noStat bool // ReadPPID fails
+	noArgv bool // ReadArgv fails
+	noUID  bool // ReadUID fails
 }
 
 // fakePeerAuth drives verifyPeerWriteAuth without real /proc, sockets or hc.
@@ -31,6 +37,7 @@ type fakePeerAuth struct {
 	hcErr       bool // force query failure
 	peerPID     int
 	peerOK      bool
+	selfEUID    int // fake os.Geteuid result
 	queriedID   string
 	queriedPath string
 }
@@ -53,9 +60,21 @@ func newFakePeerAuth() *fakePeerAuth {
 			}
 			return p.ppid, true
 		},
-		ReadArgv: func(pid int) []string {
-			return f.procs[pid].argv
+		ReadArgv: func(pid int) ([]string, bool) {
+			p, ok := f.procs[pid]
+			if !ok || p.noArgv {
+				return nil, false
+			}
+			return p.argv, true
 		},
+		ReadUID: func(pid int) (int, bool) {
+			p, ok := f.procs[pid]
+			if !ok || p.noUID {
+				return 0, false
+			}
+			return p.uid, true
+		},
+		SelfEUID:     func() int { return f.selfEUID },
 		StatHcSocket: func(string) error { return f.statErr },
 		QueryHcTerminal: func(path, termID string, _ time.Duration) (HcTerminalInfo, bool) {
 			f.queriedPath, f.queriedID = path, termID
@@ -71,6 +90,7 @@ func newFakePeerAuth() *fakePeerAuth {
 	f.peerPID = 1000
 	f.peerOK = true
 	f.statErr = os.ErrNotExist // default: no hc environment (CI shape)
+	// selfEUID defaults to 0 (root) — the production dispatch environment.
 	return f
 }
 
@@ -226,7 +246,10 @@ func TestNoHC_SubagentMarkerWithoutWorkerDenies(t *testing.T) {
 
 func TestNoHC_SubagentMarkerWithWorkerAllows(t *testing.T) {
 	f := newFakePeerAuth()
-	f.chain(map[string]string{"PI_SUBAGENT": "1", "CTXMODE_ROLE": "worker"}, []string{"pig"})
+	// worker marker on the HOST hop (chain[1]): the peer itself is a
+	// subagent child; its pig/agy host declared CTXMODE_ROLE=worker.
+	f.add(1000, 600, map[string]string{"PI_SUBAGENT": "1"}, []string{"pig"})
+	f.add(600, 0, map[string]string{"CTXMODE_ROLE": "worker"}, []string{"bash"})
 	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
 	if !a.Allowed {
 		t.Fatalf("worker under PI_SUBAGENT must allow, got %s", allowMsg(a))
@@ -312,10 +335,11 @@ func TestHC_SubagentWorkerAllows(t *testing.T) {
 	f := newFakePeerAuth()
 	f.statErr = nil
 	parent := "t9top"
-	f.add(1000, 600, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"pig"})
+	f.add(1000, 600, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"pig"})
 	// middle shell_pid 500? No — shell_pid must be an ANCESTOR of peer.
-	// peer(1000) -> pig-host(600) -> shell(500). Put dispatch marker on 600.
-	f.add(600, 500, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"sh", "/tmp/dispatch-run"})
+	// peer(1000) -> pig-host(600) -> shell(500). Put dispatch marker AND the
+	// worker role on the host hop 600 (S2: only chain[1:] may declare it).
+	f.add(600, 500, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"sh", "/tmp/dispatch-run"})
 	f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"})
 	f.hcOK = true
 	f.hcInfo = hcOKInfo(&parent)
@@ -349,11 +373,13 @@ func TestHC_WorkerTaskbookAllows(t *testing.T) {
 	f := newFakePeerAuth()
 	f.statErr = nil
 	parent := "t9top"
+	// peer = worker child process (taskbook argv text); worker role sits on
+	// the host hop chain[1] which is also shell_pid here.
 	f.add(1000, 500,
-		map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"},
+		map[string]string{"HC_TERMINAL_ID": "t2zx"},
 		[]string{"pig", "implement: the --name role-scout and --agent oracle markers are denied to non-workers"},
 	)
-	f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"})
+	f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"bash"})
 	f.hcOK = true
 	f.hcInfo = hcOKInfo(&parent)
 	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
@@ -365,19 +391,26 @@ func TestHC_WorkerTaskbookAllows(t *testing.T) {
 // ---------- malformed terminal.get (should-fix item 2) ----------
 
 func TestHC_MalformedRecordsDeny(t *testing.T) {
+	// The host hop (chain[1]) carries CTXMODE_ROLE=worker so that even a
+	// SUBAGENT-shaped record reaching the parent decision would have been
+	// allowed — any deny below is therefore caused by the malformed record
+	// itself, not by a missing worker role (S1: no false-green).
 	mkShell := func(f *fakePeerAuth) {
 		f.add(1000, 500, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"pig"})
-		f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"})
+		f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"bash"})
 	}
 	cases := []struct {
-		name string
-		info HcTerminalInfo
-		ok   bool
+		name        string
+		info        HcTerminalInfo
+		ok          bool
+		reasonMatch string // substring the deny Reason must contain ("" = skip)
 	}{
-		{"state=finished", HcTerminalInfo{Address: "t2zx", State: "finished", PID: 500, Parent: nil, ParentHasKey: true}, true},
-		{"missing parent key", HcTerminalInfo{Address: "t2zx", State: "live", PID: 500, Parent: nil, ParentHasKey: false}, true},
-		{"parent empty string", HcTerminalInfo{Address: "t2zx", State: "live", PID: 500, Parent: strp(""), ParentHasKey: true}, true},
-		{"query fails", HcTerminalInfo{}, false},
+		{"state=finished", HcTerminalInfo{Address: "t2zx", State: "finished", PID: 500, Parent: nil, ParentHasKey: true}, true, "state"},
+		{"missing parent key", HcTerminalInfo{Address: "t2zx", State: "live", PID: 500, Parent: nil, ParentHasKey: false}, true, "parent"},
+		{"parent empty string", HcTerminalInfo{Address: "t2zx", State: "live", PID: 500, Parent: strp(""), ParentHasKey: true}, true, "parent"},
+		{"parent whitespace", HcTerminalInfo{Address: "t2zx", State: "live", PID: 500, Parent: strp("   "), ParentHasKey: true}, true, "parent"},
+		{"empty address", HcTerminalInfo{Address: "", State: "live", PID: 500, Parent: strp("t9top"), ParentHasKey: true}, true, "address"},
+		{"query fails", HcTerminalInfo{}, false, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -389,6 +422,9 @@ func TestHC_MalformedRecordsDeny(t *testing.T) {
 			a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
 			if a.Allowed {
 				t.Fatalf("%s: malformed record must deny, got %s", c.name, allowMsg(a))
+			}
+			if c.reasonMatch != "" && !strings.Contains(a.Reason, c.reasonMatch) {
+				t.Fatalf("%s: deny reason %q must mention %q", c.name, a.Reason, c.reasonMatch)
 			}
 		})
 	}
@@ -513,10 +549,19 @@ func TestQueryHcTerminalStrictDecode(t *testing.T) {
 	bad := []struct{ name, resp string }{
 		{"state finished", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"finished","pid":500,"parent":null}}`},
 		{"missing state", `{"id":"codegraph-write-auth","result":{"address":"t2zx","pid":500,"parent":null}}`},
+		{"state null", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":null,"pid":500,"parent":null}}`},
 		{"missing parent", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500}}`},
 		{"parent empty", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":""}}`},
+		{"parent whitespace", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":"   "}}`},
+		{"parent number", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":5}}`},
+		{"parent bool", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":true}}`},
+		{"parent object", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":{}}}`},
+		{"parent array", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500,"parent":[]}}`},
+		{"result null", `{"id":"codegraph-write-auth","result":null}`},
 		{"bad address", `{"id":"codegraph-write-auth","result":{"address":"tOTHER","state":"live","pid":500,"parent":null}}`},
 		{"pid zero", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":0,"parent":null}}`},
+		{"pid fractional", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":500.5,"parent":null}}`},
+		{"pid string", `{"id":"codegraph-write-auth","result":{"address":"t2zx","state":"live","pid":"500","parent":null}}`},
 		{"wrong reply id", `{"id":"other","result":{"address":"t2zx","state":"live","pid":500,"parent":null}}`},
 	}
 	for _, b := range bad {
@@ -524,5 +569,232 @@ func TestQueryHcTerminalStrictDecode(t *testing.T) {
 		if _, ok := queryHcTerminal(sock, "t2zx", time.Second); ok {
 			t.Errorf("%s: malformed record accepted", b.name)
 		}
+	}
+}
+
+// ---------- M1: non-root EACCES + unreadable ancestors above shell_pid ----------
+
+// TestNoHC_NonRootEaccesUidBoundaryAllows (M1-a): a non-root process
+// (euid=1000) cannot stat the root-owned /run/user/0 hc socket dir —
+// EACCES must mean "hc unreachable for us" (no-hc branch), not a deny.
+// The ancestry then crosses into root-owned sshd/PID 1, whose environ is
+// unreadable; that uid boundary is a legitimate stop and must allow.
+func TestNoHC_NonRootEaccesUidBoundaryAllows(t *testing.T) {
+	f := newFakePeerAuth()
+	f.selfEUID = 1000
+	f.statErr = os.ErrPermission // stat("/run/user/0/...") as uid 1000
+	// peer(1000, uid 1000) -> shell(900, uid 1000) -> sshd(300, uid 0) ->
+	// init(1, uid 0). The root hops' environ/argv are unreadable to us.
+	f.add(1000, 900, map[string]string{"USER": "dev"}, []string{"codegraph-go"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.add(900, 300, map[string]string{"USER": "dev"}, []string{"bash"})
+	f.procs[900] = withUID(f.procs[900], 1000)
+	f.add(300, 1, nil, nil)
+	f.procs[300] = fakeProc{ppid: 1, uid: 0, noEnv: true, noArgv: true}
+	f.procs[1] = fakeProc{ppid: 0, uid: 0, noEnv: true, noArgv: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if !a.Allowed {
+		t.Fatalf("non-root EACCES + uid boundary must allow, got %s", allowMsg(a))
+	}
+}
+
+func withUID(p fakeProc, uid int) fakeProc { p.uid = uid; return p }
+
+// TestHC_Pid1AboveShellPidUnreadableAllows (M1-b): under a live hc
+// environment the window is [peerPID..shell_pid]; ancestors ABOVE
+// shell_pid (herdr-core as root, PID 1) are legitimately unreadable and
+// must not fail the verdict.
+func TestHC_Pid1AboveShellPidUnreadableAllows(t *testing.T) {
+	f := newFakePeerAuth()
+	f.statErr = nil
+	f.add(1000, 500, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"pig"})
+	f.add(500, 300, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"}) // shell_pid
+	f.procs[300] = fakeProc{ppid: 1, uid: 0, noEnv: true, noArgv: true}            // herdr-core (root)
+	f.procs[1] = fakeProc{ppid: 0, uid: 0, noEnv: true, noArgv: true}              // PID 1
+	f.hcOK = true
+	f.hcInfo = hcOKInfo(nil)
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if !a.Allowed {
+		t.Fatalf("unreadable ancestors above shell_pid must allow, got %s", allowMsg(a))
+	}
+}
+
+// TestHC_UnreadableHopInsideWindowDenies: an unreadable hop INSIDE
+// [peerPID..shell_pid] still fails closed — the above-shell_pid exemption
+// does not leak downward.
+func TestHC_UnreadableHopInsideWindowDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.statErr = nil
+	f.add(1000, 500, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"pig"})
+	// shell_pid hop itself unreadable: cannot prove its identity.
+	f.procs[500] = fakeProc{ppid: 0, uid: 0, noEnv: true, noArgv: true}
+	f.hcOK = true
+	f.hcInfo = hcOKInfo(nil)
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable hop inside window must deny, got %s", allowMsg(a))
+	}
+}
+
+// ---------- M2: no-hc fail-closed gaps ----------
+
+// TestNoHC_TruncatedChainDenies (M2-a): a chain reaching MaxHops without
+// arriving at ppid<=0 or crossing a uid boundary cannot prove what hides
+// above — fail closed (defeats the 32-hop burial bypass).
+func TestNoHC_TruncatedChainDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	// 32 hops all same-uid readable, none terminates the walk.
+	pid := f.peerPID
+	for i := 0; i < ancestorMaxHops; i++ {
+		next := pid + 1
+		f.add(pid, next, map[string]string{"USER": "u"}, []string{"sh"})
+		f.procs[pid] = withUID(f.procs[pid], 1000)
+		pid = next
+	}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("MaxHops-truncated ancestry must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_SameUIDAncestorUnreadableDenies (M2-b): a same-uid ancestor
+// whose environ is unreadable sits inside the checked window — cannot
+// prove it was not a read-only role.
+func TestNoHC_SameUIDAncestorUnreadableDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.procs[600] = fakeProc{ppid: 0, uid: 1000, noEnv: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable same-uid ancestor must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_SameUIDAncestorUnreadableArgvDenies (M2-b): same-uid ancestor
+// argv unreadable — ReadArgv failure is no longer silently dropped.
+func TestNoHC_SameUIDAncestorUnreadableArgvDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.procs[600] = fakeProc{ppid: 0, uid: 1000, env: map[string]string{"USER": "u"}, noArgv: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable same-uid ancestor argv must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_SameUIDAncestorUnreadablePPIDDenies (M2-b): same-uid ancestor
+// whose ppid is unreadable prevents finding where the window ends — fail
+// closed instead of silently treating the walk as finished.
+func TestNoHC_SameUIDAncestorUnreadablePPIDDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.procs[600] = fakeProc{uid: 1000, env: map[string]string{"USER": "u"}, argv: []string{"sh"}, noStat: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable same-uid ancestor ppid must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_PeerUnreadableArgvDenies (M2-b): even hop 0's argv failure is
+// fail-closed now (previously a nil argv slipped through the 2a scan).
+func TestNoHC_PeerUnreadableArgvDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.procs[1000] = fakeProc{ppid: 0, uid: 1000, env: map[string]string{"USER": "u"}, noArgv: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable peer argv must deny, got %s", allowMsg(a))
+	}
+}
+
+// ---------- S2: worker role cannot be self-declared by chain[0] ----------
+
+// TestHC_Chain0SelfDeclaredWorkerDenies (S2): a bare `hc run --bg` child
+// that exports CTXMODE_ROLE=worker itself — with no ancestor carrying the
+// marker — must NOT self-elevate on a subagent terminal.
+func TestHC_Chain0SelfDeclaredWorkerDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.statErr = nil
+	parent := "t9top"
+	f.add(1000, 500, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"codegraph-go"})
+	f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"})
+	f.hcOK = true
+	f.hcInfo = hcOKInfo(&parent)
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("self-declared worker on chain[0] must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestHC_HostWorkerAllows (S2 positive): CTXMODE_ROLE=worker on chain[1]
+// (the dispatch-agent spawned host) under a subagent terminal allows.
+func TestHC_HostWorkerAllows(t *testing.T) {
+	f := newFakePeerAuth()
+	f.statErr = nil
+	parent := "t9top"
+	f.add(1000, 600, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"codegraph-go"})
+	f.add(600, 500, map[string]string{"HC_TERMINAL_ID": "t2zx", "CTXMODE_ROLE": "worker"}, []string{"pig"})
+	f.add(500, 0, map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"bash"})
+	f.hcOK = true
+	f.hcInfo = hcOKInfo(&parent)
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if !a.Allowed {
+		t.Fatalf("ancestor-declared worker must allow, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_Chain0SelfDeclaredWorkerPI_SubagentDenies (S2 no-hc shape): a
+// lone PI_SUBAGENT=1 + CTXMODE_ROLE=worker process cannot self-elevate
+// without an ancestor worker marker.
+func TestNoHC_Chain0SelfDeclaredWorkerPI_SubagentDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.chain(map[string]string{"PI_SUBAGENT": "1", "CTXMODE_ROLE": "worker"}, []string{"pig"})
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("self-declared worker under PI_SUBAGENT must deny, got %s", allowMsg(a))
+	}
+}
+
+// ---------- M1 stat policy edge ----------
+
+// TestHC_RootEaccesStillDenies: under euid 0 an EACCES/EPERM on the hc
+// socket is NOT excused — only non-root gets the unreachable-socket
+// exemption.
+func TestHC_RootEaccesStillDenies(t *testing.T) {
+	f := newFakePeerAuth() // selfEUID defaults to 0
+	f.statErr = os.ErrPermission
+	f.chain(map[string]string{"HC_TERMINAL_ID": "t2zx"}, []string{"pig"})
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("root EACCES stat must deny, got %s", allowMsg(a))
+	}
+}
+
+// TestNoHC_NonRootEpermTreatedAbsent: EPERM from a non-root stat is the
+// same unreachable-root-socket shape as EACCES.
+func TestNoHC_NonRootEpermTreatedAbsent(t *testing.T) {
+	f := newFakePeerAuth()
+	f.selfEUID = 1000
+	f.statErr = syscall.EPERM
+	f.chain(map[string]string{"USER": "u"}, []string{"bash"})
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if !a.Allowed {
+		t.Fatalf("non-root EPERM stat must enter no-hc branch, got %s", allowMsg(a))
+	}
+}
+
+// TestHC_NonRootOtherStatErrorDenies: a non-root stat error that is NOT a
+// permission failure (e.g. ELOOP) still fails closed — it cannot be
+// explained by the root-owned socket dir.
+func TestHC_NonRootOtherStatErrorDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.selfEUID = 1000
+	f.statErr = fmt.Errorf("stat: %w", syscall.ELOOP)
+	f.chain(map[string]string{"USER": "u"}, []string{"bash"})
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("non-root non-permission stat error must deny, got %s", allowMsg(a))
 	}
 }
