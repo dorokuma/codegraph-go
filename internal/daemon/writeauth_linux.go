@@ -628,10 +628,11 @@ func terminalIDs(chain []procHop) (string, bool) {
 
 // runTwoA applies the two-segment read-only scan over the given window and
 // reports (unconditionalHit, conditionalHit, hasWorkerRole). The worker
-// role must be declared by a HOST hop (index >= 1) — a bare process that
-// merely exports CTXMODE_ROLE=worker itself (chain[0]) cannot self-elevate;
-// only an ancestor carrying the marker (the dispatch-agent spawned pig/agy/
-// claude-code host) proves a real worker dispatch.
+// role only counts when declared by a HOST hop (index >= 1): this blocks
+// chain[0] from directly self-declaring CTXMODE_ROLE=worker. It is not a
+// proof of real dispatch provenance — a wrapper shell that exports the
+// marker into its own descendants still satisfies the check; the hc
+// parent record is the actual subagent/top-level arbiter.
 func runTwoA(window []procHop) (uncond, cond, hasWorker bool) {
 	for i, e := range window {
 		if i >= 1 && hopIsWorker(e) {
@@ -665,11 +666,15 @@ func runTwoA(window []procHop) (uncond, cond, hasWorker bool) {
 //     readable (anything above shell_pid — herdr-core, PID 1 — is
 //     ignored); run 2a over the window, THEN decide on parent (null =>
 //     allow; non-empty => allow only when hasWorkerRole).
-//     5b. hc absent: peer must be fully readable; the checked window is the
-//     run of same-UID ancestors (stops safely at PID 1, a different uid,
-//     or an unreadable ppid/uid boundary). Any unreadable hop inside the
-//     window, or a walk that truncated at MaxHops without reaching a
-//     boundary, fails closed. 2a then runs over the window.
+//     5b. hc absent: the peer itself must be fully readable (env, argv,
+//     uid AND ppid — an unreadable peer stat means the real parent can
+//     never be proven absent); the checked window is the run of same-UID
+//     ancestors (stops safely at PID 1 — provable by pid alone — or a
+//     different uid, e.g. non-root shell under root sshd/systemd). An
+//     ancestor whose uid cannot be read at all fails closed (it could
+//     hide a role marker), as does any unreadable hop inside the window
+//     or a walk that truncated at MaxHops without reaching a boundary.
+//     2a then runs over the window.
 func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) WriteAuth {
 	if !helloOK {
 		return deny("missing client hello")
@@ -713,27 +718,39 @@ func verifyPeerWriteAuth(pa *PeerAuth, peerPID int, helloOK bool, helloPID int) 
 		// No hc environment (CI/dev box, or non-root where the root-owned
 		// hc socket is unreachable): the checked window is the run of
 		// ancestors owned by the SAME uid as the peer, stopping safely at
-		// PID 1, a uid boundary (e.g. non-root shell under root
-		// sshd/systemd), or an unreadable ppid/uid probe. Inside that
-		// window every hop must be fully readable and the walk must have
-		// terminated at a real boundary — a MaxHops truncation cannot
-		// prove what hides above, so it fails closed.
+		// PID 1 or a uid boundary (e.g. non-root shell under root
+		// sshd/systemd). Inside that window every hop must be fully
+		// readable and the walk must have terminated at a real boundary —
+		// a MaxHops truncation cannot prove what hides above, so it fails
+		// closed.
 		if !chain[0].UIDOK {
 			return deny("cannot read /proc peer uid")
+		}
+		if !chain[0].PPIDOK {
+			// The peer's own /proc/<pid>/stat could not be read: the real
+			// parent is unknowable, so the ancestry can never be proven
+			// free of role markers — fail closed.
+			return deny("cannot read /proc peer ppid")
 		}
 		window := []procHop{chain[0]}
 		boundaryOK := false
 		for i := 1; i < len(chain); i++ {
 			h := chain[i]
-			if !h.UIDOK {
-				// Cannot determine this ancestor's owner: safe stop — it is
-				// not provably a same-uid ancestor, so it cannot be part of
-				// the checked window.
+			if h.PID == 1 {
+				// Init is identified by pid alone — its uid never needs to
+				// be read (PID 1 is root on every real system; /proc pids
+				// are kernel facts that cannot be spoofed mid-chain).
 				boundaryOK = true
 				break
 			}
-			if h.PID == 1 || h.UID != window[0].UID {
-				// Init / different-owner ancestor (root sshd, systemd):
+			if !h.UIDOK {
+				// Cannot determine this ancestor's owner: it may be a
+				// same-uid ancestor hiding a role marker — fail closed
+				// instead of treating the unreadable hop as a boundary.
+				return deny(fmt.Sprintf("cannot read uid of ancestor pid %d", h.PID))
+			}
+			if h.UID != window[0].UID {
+				// Different-owner ancestor (root sshd, systemd):
 				// legitimate stop, its environ is not required.
 				boundaryOK = true
 				break

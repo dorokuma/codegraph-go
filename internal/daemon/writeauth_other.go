@@ -5,7 +5,6 @@ package daemon
 import (
 	"net"
 	"os"
-	"strings"
 )
 
 // WriteAuth is the per-connection (or per-process) verdict on whether
@@ -19,36 +18,12 @@ type WriteAuth struct {
 	Reason  string
 }
 
-// envTruthyOther mirrors the Linux environTruthy truth-value set
-// ("1/true/yes/on", case-insensitive, whitespace-trimmed).
-func envTruthyOther(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}
-
 // selfEnvWriteAuth applies the platform-independent read-only markers to
-// the current process's own environment. A process that carries an
-// explicit marker denies; anything else allows — off Linux there is no
-// ancestry provenance to consult, so the marker set is the only provable
-// signal and a clean environment must not break normal development.
+// the current process's own environment — the decision logic lives in
+// writeauth_selfenv.go (no build tag) so unit tests run on every platform;
+// this file only wires os.Getenv.
 func selfEnvWriteAuth() WriteAuth {
-	if envTruthyOther(os.Getenv("CTXMODE_READONLY")) {
-		return WriteAuth{Allowed: false, Reason: "CTXMODE_READONLY set"}
-	}
-	if strings.TrimSpace(os.Getenv("PI_ROLE")) != "" {
-		return WriteAuth{Allowed: false, Reason: "PI_ROLE set"}
-	}
-	if v := strings.TrimSpace(os.Getenv("CTXMODE_ROLE")); v != "" && strings.ToLower(v) != "worker" {
-		return WriteAuth{Allowed: false, Reason: "CTXMODE_ROLE=" + v}
-	}
-	if strings.TrimSpace(os.Getenv("PI_SUBAGENT")) == "1" &&
-		strings.ToLower(strings.TrimSpace(os.Getenv("CTXMODE_ROLE"))) != "worker" {
-		return WriteAuth{Allowed: false, Reason: "PI_SUBAGENT without worker role"}
-	}
-	return WriteAuth{Allowed: true, Reason: "non-linux: no read-only marker in own environment"}
+	return selfEnvWriteAuthFrom(os.Getenv)
 }
 
 // VerifyClientWriteAuth on non-Linux falls back to the process's own

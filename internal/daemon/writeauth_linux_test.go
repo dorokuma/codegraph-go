@@ -798,3 +798,91 @@ func TestHC_NonRootOtherStatErrorDenies(t *testing.T) {
 		t.Fatalf("non-root non-permission stat error must deny, got %s", allowMsg(a))
 	}
 }
+
+// ---------- R2: unreadable ancestor uid / peer ppid fail-closed ----------
+
+// TestNoHC_VanishedAncestorDenies: an intermediate ancestor (pid 600)
+// exited mid-walk — ALL four probes fail. The hop cannot be proven a
+// same-uid ancestor and cannot be proven a boundary either; the only
+// honest verdict is fail-closed deny.
+func TestNoHC_VanishedAncestorDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	// pid 600 vanished: environ/stat/cmdline/uid all unreadable.
+	f.procs[600] = fakeProc{noEnv: true, noStat: true, noArgv: true, noUID: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("vanished mid-chain ancestor must deny, got %s", allowMsg(a))
+	}
+	if !strings.Contains(a.Reason, "cannot read uid") {
+		t.Fatalf("deny reason %q must mention unreadable uid", a.Reason)
+	}
+}
+
+// TestNoHC_UnreadableUIDWithScoutEnvDenies: an ancestor whose environ
+// carries CTXMODE_ROLE=scout but whose /proc/<pid> uid cannot be read.
+// Previously the UID check ran before the boundary checks and quietly
+// treated the hop as a "safe stop" — letting the hidden scout marker
+// slip past the 2a scan. Now the unreadable uid itself is fatal.
+func TestNoHC_UnreadableUIDWithScoutEnvDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.procs[600] = fakeProc{
+		ppid:  1,
+		env:   map[string]string{"CTXMODE_ROLE": "scout"},
+		argv:  []string{"bash"},
+		noUID: true, // uid probe fails — owner cannot be determined
+	}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("ancestor with unreadable uid must deny, got %s", allowMsg(a))
+	}
+	if !strings.Contains(a.Reason, "cannot read uid") {
+		t.Fatalf("deny reason %q must mention unreadable uid", a.Reason)
+	}
+}
+
+// TestNoHC_PeerUnreadablePPIDDenies: the peer's own /proc/<pid>/stat
+// cannot be read (noStat), so collectChain cannot walk past hop 0 — the
+// REAL parent (600, carrying CTXMODE_ROLE=scout) is unreachable and can
+// never be proven absent. Previously the single-hop window passed 2a
+// cleanly and allowed; now an unreadable peer ppid fails closed.
+func TestNoHC_PeerUnreadablePPIDDenies(t *testing.T) {
+	f := newFakePeerAuth()
+	// ppid=600 is recorded for realism but ReadPPID(1000) fails (noStat),
+	// so the walk stops at hop 0 and 600 is never reached.
+	f.procs[1000] = fakeProc{
+		ppid:   600,
+		env:    map[string]string{"USER": "u"},
+		argv:   []string{"pig"},
+		uid:    1000,
+		noStat: true,
+	}
+	f.add(600, 1, map[string]string{"CTXMODE_ROLE": "scout"}, []string{"bash"})
+	f.procs[600] = withUID(f.procs[600], 1000)
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if a.Allowed {
+		t.Fatalf("unreadable peer ppid must deny, got %s", allowMsg(a))
+	}
+	if !strings.Contains(a.Reason, "peer") {
+		t.Fatalf("deny reason %q must mention the peer", a.Reason)
+	}
+}
+
+// TestNoHC_PID1UnreadableUIDAllows (guard): PID 1's identity is proven
+// by its pid alone — a uid probe failure on init must still be a
+// legitimate boundary stop, not a deny.
+func TestNoHC_PID1UnreadableUIDAllows(t *testing.T) {
+	f := newFakePeerAuth()
+	f.add(1000, 600, map[string]string{"USER": "u"}, []string{"pig"})
+	f.procs[1000] = withUID(f.procs[1000], 1000)
+	f.add(600, 1, map[string]string{"USER": "u"}, []string{"bash"})
+	f.procs[600] = withUID(f.procs[600], 1000)
+	f.procs[1] = fakeProc{ppid: 0, noEnv: true, noArgv: true, noUID: true}
+	a := verifyPeerWriteAuth(f.PeerAuth, f.peerPID, true, f.peerPID)
+	if !a.Allowed {
+		t.Fatalf("PID 1 with unreadable uid must remain a safe stop and allow, got %s", allowMsg(a))
+	}
+}
