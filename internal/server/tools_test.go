@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 
+	"github.com/dorokuma/codegraph-go/internal/daemon"
 	"github.com/dorokuma/codegraph-go/internal/db"
 	"github.com/dorokuma/codegraph-go/internal/sync"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -1172,5 +1176,174 @@ func TestToolStatusExposesWatcherBlindSpotsAndStartFailure(t *testing.T) {
 	}
 	if text = textContent(result); !strings.Contains(text, "watcher_active: false") {
 		t.Fatalf("status must expose watcher_active: false after start failure, got:\n%s", text)
+	}
+}
+
+// ---------- store_fact write-auth gate (M0) ----------
+
+// TestToolStoreFactReadOnlyDenied is the store_fact privilege regression: a
+// session whose write-auth verdict denied must get a hard error naming the
+// read-only reason BEFORE any DB write — and nothing must be stored.
+func TestToolStoreFactReadOnlyDenied(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolStoreFactWithAuth(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "should never be stored",
+	}, daemon.WriteAuth{Allowed: false, Reason: "hc subagent terminal t2zx without worker role"})
+	if err == nil {
+		t.Fatal("read-only session must refuse store_fact")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("error must name read-only refusal, got: %v", err)
+	}
+	facts, ferr := s.Database.SearchFacts("", "", "", "all", 100)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("refused write must not store, got %d facts", len(facts))
+	}
+}
+
+// TestToolStoreFactAllowedWrites is the positive counterpart: an allowed
+// verdict writes normally (the gate does not break legitimate sessions).
+func TestToolStoreFactAllowedWrites(t *testing.T) {
+	s, _ := setupToolServer(t)
+	_, _, err := s.toolStoreFactWithAuth(context.Background(), nil, storeFactArgs{
+		TargetFile: "alpha.go",
+		Content:    "legit fact",
+	}, daemon.WriteAuth{Allowed: true, Reason: "top-level hc terminal"})
+	if err != nil {
+		t.Fatalf("allowed session must store, got: %v", err)
+	}
+	facts, ferr := s.Database.SearchFacts("legit fact", "", "", "all", 100)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 stored fact, got %d", len(facts))
+	}
+}
+
+// TestNewMCPServerWithAuthSharesSchema asserts the M0 schema fix: repeated
+// NewMCPServerWithAuth calls over one shared SchemaCache all bind the SAME
+// codegraphInputSchema pointer (the old inline literal minted a new pointer
+// per server and defeated the bySchema cache — a per-connection leak).
+//
+// The assertions go through reflect on the SDK's unexported layout rather
+// than trusting the singleton's existence: each server must register a tool
+// whose InputSchema IS the singleton pointer, and the shared cache's bySchema
+// map must hold exactly that one key — so a regression to a per-connection
+// &jsonschema.Schema{} literal fails on pointer identity, not just shape.
+func TestNewMCPServerWithAuthSharesSchema(t *testing.T) {
+	s, _ := setupToolServer(t)
+	cache := mcp.NewSchemaCache()
+	servers := []*mcp.Server{
+		NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: true}, cache),
+		NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: false}, cache),
+		NewMCPServerWithAuth(s, daemon.WriteAuth{Allowed: true}, cache),
+	}
+
+	// The singleton exists and keeps its shape.
+	if codegraphInputSchema == nil {
+		t.Fatal("codegraphInputSchema singleton must be initialized")
+	}
+	if codegraphInputSchema.Type != "object" || len(codegraphInputSchema.Required) != 1 || codegraphInputSchema.Required[0] != "action" {
+		t.Fatalf("schema shape drifted: %+v", codegraphInputSchema)
+	}
+
+	// Every server's registered tool must bind the SAME *jsonschema.Schema
+	// pointer as the package singleton — pointer identity, not equality.
+	for i, srv := range servers {
+		got := registeredCodegraphInputSchema(t, srv)
+		if got != codegraphInputSchema {
+			t.Fatalf("server %d registered InputSchema %p, want singleton %p (per-connection schema literal regressed)", i, got, codegraphInputSchema)
+		}
+	}
+
+	// The shared cache must have resolved the schema exactly once, keyed by
+	// the singleton pointer. A fresh schema pointer per server would store one
+	// bySchema entry EACH and never hit this key.
+	bySchemaField := reflect.ValueOf(cache).Elem().FieldByName("bySchema")
+	if !bySchemaField.IsValid() || !bySchemaField.CanAddr() {
+		t.Fatal("mcp.SchemaCache no longer has a bySchema field — SDK layout changed")
+	}
+	// sync.Map value reached via an unexported field is flagRO: restore a
+	// writable view so its methods are callable.
+	bySchema := reflect.NewAt(bySchemaField.Type(), unsafe.Pointer(bySchemaField.UnsafeAddr())).Elem()
+	rangeFn := bySchema.Addr().MethodByName("Range")
+	if !rangeFn.IsValid() {
+		t.Fatal("mcp.SchemaCache.bySchema is no longer a sync.Map — SDK layout changed")
+	}
+	var cached []*jsonschema.Schema
+	rangeFn.Call([]reflect.Value{reflect.ValueOf(func(k, v any) bool {
+		if s, ok := k.(*jsonschema.Schema); ok {
+			cached = append(cached, s)
+		}
+		return true
+	})})
+	if len(cached) != 1 {
+		t.Fatalf("bySchema cache must hold exactly 1 schema entry after %d registrations, got %d", len(servers), len(cached))
+	}
+	if cached[0] != codegraphInputSchema {
+		t.Fatalf("bySchema cached schema %p, want singleton %p (per-connection schema literal regressed)", cached[0], codegraphInputSchema)
+	}
+}
+
+// registeredCodegraphInputSchema returns the *jsonschema.Schema pointer the
+// server actually registered for the "codegraph" tool — the real
+// Tool.InputSchema stored in the SDK's feature set, not a declared constant.
+// The SDK exposes tools only through the marshaling tools/list path (which
+// loses pointer identity), so this navigates its unexported layout via
+// reflect+unsafe (test-only; every step fails loudly if the SDK layout
+// changes). deref unwraps read-only flagRO values reached through unexported
+// fields: Pointer() is allowed on them, NewAt restores a writable view.
+func registeredCodegraphInputSchema(t *testing.T, srv *mcp.Server) *jsonschema.Schema {
+	t.Helper()
+	if srv == nil {
+		t.Fatal("server must be constructed")
+	}
+	derefPtr := func(v reflect.Value) reflect.Value {
+		return reflect.NewAt(v.Type().Elem(), unsafe.Pointer(v.Pointer())).Elem()
+	}
+	tools := reflect.ValueOf(srv).Elem().FieldByName("tools") // *featureSet[*serverTool]
+	if !tools.IsValid() || tools.IsNil() {
+		t.Fatal("mcp.Server no longer has a tools field — SDK layout changed")
+	}
+	features := derefPtr(tools).FieldByName("features") // map[string]*serverTool
+	if !features.IsValid() {
+		t.Fatal("mcp.Server.tools no longer has a features map — SDK layout changed")
+	}
+	entry := features.MapIndex(reflect.ValueOf("codegraph")) // *serverTool
+	if !entry.IsValid() {
+		t.Fatal("server registered no \"codegraph\" tool")
+	}
+	toolPtr := derefPtr(entry).FieldByName("tool") // *mcp.Tool
+	if !toolPtr.IsValid() || toolPtr.IsNil() {
+		t.Fatal("serverTool no longer has a tool field — SDK layout changed")
+	}
+	field := derefPtr(toolPtr).FieldByName("InputSchema") // exported field of mcp.Tool
+	schema, ok := field.Interface().(*jsonschema.Schema)
+	if !ok || schema == nil {
+		t.Fatalf("codegraph tool InputSchema is not a non-nil *jsonschema.Schema: %T", field.Interface())
+	}
+	return schema
+}
+
+// TestMakeToolCodegraphBindsAuth proves each connection's verdict is captured
+// in its own handler closure: a denied server's dispatcher refuses
+// store_fact while an allowed one over the same *Server accepts — no shared
+// mutable state, no cross-session leak.
+func TestMakeToolCodegraphBindsAuth(t *testing.T) {
+	s, _ := setupToolServer(t)
+	denyHandler := s.makeToolCodegraph(daemon.WriteAuth{Allowed: false, Reason: "denied ctx"})
+	allowHandler := s.makeToolCodegraph(daemon.WriteAuth{Allowed: true, Reason: "allowed ctx"})
+
+	args := codegraphArgs{Action: "store_fact", TargetFile: "alpha.go", Content: "c"}
+	if _, _, err := denyHandler(context.Background(), nil, args); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("denied handler must refuse store_fact, got %v", err)
+	}
+	if _, _, err := allowHandler(context.Background(), nil, args); err != nil {
+		t.Fatalf("allowed handler must store, got %v", err)
 	}
 }

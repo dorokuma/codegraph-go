@@ -102,7 +102,11 @@ func RunDirect(cfg config.Config) error {
 	}
 	defer cleanup()
 
-	srv := NewMCPServer(s)
+	// Direct mode gets the same write-auth verdict as a daemon session —
+	// CODEGRAPH_NO_DAEMON=1 must not be a store_fact backdoor: the process
+	// verifies its own /proc ancestry (+ hc terminal when present) exactly
+	// like a socket peer. No shared SchemaCache here (one server total).
+	srv := NewMCPServerWithAuth(s, daemon.VerifyDirectWriteAuth(), nil)
 	// PPID watchdog (B3): cancel the session context so srv.Run returns and
 	// the deferred cleanup runs (WAL checkpoint stop, connection close) —
 	// no os.Exit, so defers are honored.
@@ -130,24 +134,30 @@ func RunDaemonProcess(cfg config.Config) error {
 		stateOnce stdsync.Once
 		s         *Server
 		cleanup   func()
-		mcpSrv    *mcp.Server
 		stateErr  error
 	)
+	// One SchemaCache shared across every per-connection *mcp.Server: the
+	// tool's InputSchema is the stable codegraphInputSchema pointer, so the
+	// cache resolves it once total instead of once per connection (the old
+	// inline literal minted a new pointer per NewMCPServer and defeated the
+	// bySchema cache — a per-connection resolved-schema leak).
+	schemaCache := mcp.NewSchemaCache()
 	ensure := func() error {
 		stateOnce.Do(func() {
 			s, cleanup, stateErr = OpenServerState(cfg.Workdir, cfg.Workdirs, cfg.NoSync)
-			if stateErr != nil {
-				return
-			}
-			mcpSrv = NewMCPServer(s)
 		})
 		return stateErr
 	}
-	handler := func(ctx context.Context, rwc io.ReadWriteCloser) error {
+	handler := func(ctx context.Context, rwc io.ReadWriteCloser, auth daemon.WriteAuth) error {
 		if err := ensure(); err != nil {
 			return err
 		}
-		// Each connection is one MCP session sharing tools/DB/watcher.
+		// Each connection is one MCP session over the shared Server
+		// (DB/watcher/project cache stay singleton). The per-connection
+		// *mcp.Server carries THIS connection's write-auth verdict into the
+		// store_fact handler, so concurrent sessions each see their own
+		// verdict — a read-only client can never ride a writable one.
+		mcpSrv := NewMCPServerWithAuth(s, auth, schemaCache)
 		// IOTransport closes Reader and Writer separately — once-wrap so the
 		// underlying conn is closed exactly once.
 		oc := &onceRWC{ReadWriteCloser: rwc}
@@ -163,7 +173,7 @@ func RunDaemonProcess(cfg config.Config) error {
 	onReady := func() error {
 		return ensure()
 	}
-	if err := daemon.RunAsDaemon(cfg.Workdir, handler, onReady); err != nil {
+	if err := daemon.RunAsDaemonWithAuth(cfg.Workdir, handler, onReady); err != nil {
 		if cleanup != nil {
 			cleanup()
 		}
